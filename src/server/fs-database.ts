@@ -186,10 +186,12 @@ export class FileSystemDatabaseManager {
               ...service,
               apiKey: typeof service.apiKey === 'string' ? service.apiKey : '',
               inheritVendorApiKey: service.inheritVendorApiKey === true,
+              inheritVendorApiBaseUrl: service.inheritVendorApiBaseUrl === true,
             };
             if (
               normalizedService.apiKey !== service.apiKey ||
-              normalizedService.inheritVendorApiKey !== service.inheritVendorApiKey
+              normalizedService.inheritVendorApiKey !== service.inheritVendorApiKey ||
+              normalizedService.inheritVendorApiBaseUrl !== service.inheritVendorApiBaseUrl
             ) {
               needSave = true;
             }
@@ -1010,6 +1012,7 @@ export class FileSystemDatabaseManager {
     const newVendor: Vendor = {
       ...vendor,
       apiKey: typeof vendor.apiKey === 'string' ? vendor.apiKey : '',
+      apiBaseUrl: typeof vendor.apiBaseUrl === 'string' ? vendor.apiBaseUrl : '',
       id,
       services: vendor.services || [],  // 确保 services 字段存在
       createdAt: now,
@@ -1033,6 +1036,9 @@ export class FileSystemDatabaseManager {
       apiKey: typeof vendor.apiKey === 'string'
         ? vendor.apiKey
         : (this.vendors[index].apiKey || ''),
+      apiBaseUrl: typeof vendor.apiBaseUrl === 'string'
+        ? vendor.apiBaseUrl
+        : (this.vendors[index].apiBaseUrl || ''),
       // 供应商服务应通过 create/update/deleteAPIService 单独维护，避免编辑供应商时误覆盖
       services: this.vendors[index].services,
       updatedAt: now,
@@ -1133,6 +1139,7 @@ export class FileSystemDatabaseManager {
       ...serviceData,
       apiKey: typeof serviceData.apiKey === 'string' ? serviceData.apiKey : '',
       inheritVendorApiKey: serviceData.inheritVendorApiKey === true,
+      inheritVendorApiBaseUrl: serviceData.inheritVendorApiBaseUrl === true,
       id,
       createdAt: now,
       updatedAt: now
@@ -1173,6 +1180,9 @@ export class FileSystemDatabaseManager {
       inheritVendorApiKey: service.inheritVendorApiKey !== undefined
         ? service.inheritVendorApiKey === true
         : vendor.services![index].inheritVendorApiKey === true,
+      inheritVendorApiBaseUrl: service.inheritVendorApiBaseUrl !== undefined
+        ? service.inheritVendorApiBaseUrl === true
+        : vendor.services![index].inheritVendorApiBaseUrl === true,
       updatedAt: now,
     };
 
@@ -2081,7 +2091,9 @@ export class FileSystemDatabaseManager {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 name 字段` };
       }
       if (!service.apiUrl || typeof service.apiUrl !== 'string') {
-        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 apiUrl 字段` };
+        if (service.inheritVendorApiBaseUrl !== true) {
+          return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 apiUrl 字段` };
+        }
       }
       if (!service.apiKey || typeof service.apiKey !== 'string') {
         if (service.inheritVendorApiKey !== true) {
@@ -2090,6 +2102,9 @@ export class FileSystemDatabaseManager {
       }
       if (service.inheritVendorApiKey !== undefined && typeof service.inheritVendorApiKey !== 'boolean') {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiKey 必须是布尔值` };
+      }
+      if (service.inheritVendorApiBaseUrl !== undefined && typeof service.inheritVendorApiBaseUrl !== 'boolean') {
+        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiBaseUrl 必须是布尔值` };
       }
     }
     return { valid: true };

@@ -2602,6 +2602,20 @@ export class ProxyServer {
     return vendor.apiKey || '';
   }
 
+  private resolveEffectiveApiUrl(service: APIService): string {
+    if (service.inheritVendorApiBaseUrl !== true) {
+      return service.apiUrl;
+    }
+
+    const vendor = this.dbManager.getVendorByServiceId(service.id);
+    if (!vendor || !vendor.apiBaseUrl) {
+      console.warn(`[Proxy] Service ${service.id} is set to inherit vendor API base URL, but vendor/url is missing`);
+      return service.apiUrl;
+    }
+
+    return vendor.apiBaseUrl;
+  }
+
   private copyResponseHeaders(responseHeaders: Record<string, any>, res: Response) {
     Object.keys(responseHeaders).forEach((key) => {
       if (!['content-encoding', 'transfer-encoding', 'connection', 'content-length'].includes(key.toLowerCase())) {
@@ -3603,7 +3617,7 @@ export class ProxyServer {
 
       // 使用 mapRequestPathToUpstreamUrl 统一构建上游 URL
       const model = rule.targetModel || requestBody?.model;
-      const apiUrl = service.apiUrl;
+      const apiUrl = this.resolveEffectiveApiUrl(service);
       const upstreamUrl = this.mapRequestPathToUpstreamUrl(
         route.targetType,
         sourceType,

@@ -4,6 +4,7 @@ export interface Vendor {
   name: string;
   description?: string;
   apiKey?: string;
+  apiBaseUrl?: string;  // 供应商默认 API Base URL
   sortOrder?: number;
   services: APIService[];  // 供应商的 API 服务列表
   createdAt: number;
@@ -88,6 +89,7 @@ export interface APIService {
   apiUrl: string;
   apiKey: string;
   inheritVendorApiKey?: boolean;
+  inheritVendorApiBaseUrl?: boolean;  // 是否继承供应商的 API Base URL
   sourceType?: SourceType;
   authType?: AuthType; // 认证方式（ AUTH_TOKEN/API_KEY/G_API_KEY），默认为 AUTH_TOKEN
   supportedModels?: string[];

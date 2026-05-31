@@ -145,6 +145,7 @@ function VendorsPage() {
   // 当前选择的认证方式（用于动态显示认证方式提示）
   const [currentAuthType, setCurrentAuthType] = useState<AuthType>(AuthType.AUTH_TOKEN);
   const [inheritVendorApiKey, setInheritVendorApiKey] = useState(true);
+  const [inheritVendorApiBaseUrl, setInheritVendorApiBaseUrl] = useState(true);
 
   // 处理数据源类型变化，自动设置合适的认证方式
   const handleSourceTypeChange = (sourceType: SourceType) => {
@@ -283,6 +284,7 @@ function VendorsPage() {
       name: formData.get('name') as string,
       description: formData.get('description') as string,
       apiKey: (formData.get('apiKey') as string) || '',
+      apiBaseUrl: (formData.get('apiBaseUrl') as string) || '',
       sortOrder: parseInt(formData.get('sortOrder') as string) || 0
     };
 
@@ -323,6 +325,7 @@ function VendorsPage() {
     setCurrentSourceType('openai-chat');
     setCurrentAuthType(AuthType.AUTH_TOKEN);
     setInheritVendorApiKey(true);
+    setInheritVendorApiBaseUrl(true);
     setShowServiceModal(true);
   };
 
@@ -366,6 +369,7 @@ function VendorsPage() {
     }
 
     setInheritVendorApiKey(service.inheritVendorApiKey === true);
+    setInheritVendorApiBaseUrl(service.inheritVendorApiBaseUrl === true);
 
     setShowServiceModal(true);
   };
@@ -434,7 +438,11 @@ function VendorsPage() {
 
     const formData = new FormData(e.currentTarget);
     const sourceType = formData.get('sourceType') as SourceType;
-    const apiUrl = (formData.get('apiUrl') as string).trim();
+    const shouldInheritVendorApiBaseUrl = formData.get('inheritVendorApiBaseUrl') === 'on';
+    const inputApiUrl = ((formData.get('apiUrl') as string) || '').trim();
+    const finalApiUrl = shouldInheritVendorApiBaseUrl
+      ? (editingService?.apiUrl || '')
+      : inputApiUrl;
     const shouldInheritVendorApiKey = formData.get('inheritVendorApiKey') === 'on';
     const inputApiKey = (formData.get('apiKey') as string) || '';
     const finalApiKey = shouldInheritVendorApiKey
@@ -452,9 +460,10 @@ function VendorsPage() {
     const service = {
       vendorId: selectedVendor!.id,
       name: formData.get('name') as string,
-      apiUrl,
+      apiUrl: finalApiUrl,
       apiKey: finalApiKey,
       inheritVendorApiKey: shouldInheritVendorApiKey,
+      inheritVendorApiBaseUrl: shouldInheritVendorApiBaseUrl,
       sourceType,
       authType: formData.get('authType') as AuthType || undefined,
       supportedModels: finalModels.length > 0 ? finalModels : undefined,
@@ -491,6 +500,7 @@ function VendorsPage() {
     setRequestResetInterval(undefined);
     setRequestResetBaseTime(undefined);
     setInheritVendorApiKey(true);
+    setInheritVendorApiBaseUrl(true);
     // 重新加载供应商（服务已自动包含）
     const updatedVendors = await loadVendors();
     if (selectedVendor) {
@@ -581,6 +591,7 @@ function VendorsPage() {
           apiUrl: serviceConfig.apiUrl,
           apiKey: '',
           inheritVendorApiKey: true,
+          inheritVendorApiBaseUrl: false,
           sourceType: serviceConfig.sourceType,
           authType: serviceConfig.authType,
           supportedModels: serviceConfig.models ? serviceConfig.models.split(',').map(m => m.trim()) : undefined,
@@ -778,6 +789,10 @@ function VendorsPage() {
                 <input type="password" name="apiKey" defaultValue={editingVendor ? (editingVendor.apiKey || '') : ''} placeholder="可选：供应商默认API密钥" />
               </div>
               <div className="form-group">
+                <label>API Base URL</label>
+                <input type="text" name="apiBaseUrl" defaultValue={editingVendor ? (editingVendor.apiBaseUrl || '') : ''} placeholder="可选：供应商默认API Base URL" />
+              </div>
+              <div className="form-group">
                 <label>排序 <small>数值越大越靠前</small></label>
                 <input type="number" name="sortOrder" defaultValue={editingVendor ? editingVendor.sortOrder || 0 : 0} min="0" />
               </div>
@@ -830,7 +845,19 @@ function VendorsPage() {
               </div>
               <div className="form-group">
                 <label>供应商API地址</label>
-                <input type="url" name="apiUrl" defaultValue={editingService ? editingService.apiUrl : ''} required />
+                <label style={{ display: 'flex', alignItems: 'center', marginBottom: '8px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    name="inheritVendorApiBaseUrl"
+                    checked={inheritVendorApiBaseUrl}
+                    onChange={(e) => setInheritVendorApiBaseUrl(e.target.checked)}
+                    style={{ marginRight: '8px', cursor: 'pointer', width: '16px', height: '16px' }}
+                  />
+                  <span>使用供应商全局配置的API地址</span>
+                </label>
+                {!inheritVendorApiBaseUrl && (
+                  <input type="url" name="apiUrl" defaultValue={editingService ? editingService.apiUrl : ''} required />
+                )}
               </div>
               <div className="form-group">
                 <label>供应商API密钥</label>
