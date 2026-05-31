@@ -147,6 +147,9 @@ export default function RoutesPage() {
   const [claudeDefaultModelInput, setClaudeDefaultModelInput] = useState<string>('');
   const [claudeDefaultModelDirty, setClaudeDefaultModelDirty] = useState(false);
   const [isUpdatingClaudeDefaultModel, setIsUpdatingClaudeDefaultModel] = useState(false);
+  const [autocompactPctInput, setAutocompactPctInput] = useState<string>('');
+  const [autocompactPctDirty, setAutocompactPctDirty] = useState(false);
+  const [isUpdatingAutocompactPct, setIsUpdatingAutocompactPct] = useState(false);
   const [codexDefaultModelInput, setCodexDefaultModelInput] = useState<string>('');
   const [codexDefaultModelDirty, setCodexDefaultModelDirty] = useState(false);
   const [isUpdatingCodexDefaultModel, setIsUpdatingCodexDefaultModel] = useState(false);
@@ -281,6 +284,8 @@ export default function RoutesPage() {
       setAppConfig(data);
       setClaudeDefaultModelInput(data.claudeDefaultModel || '');
       setClaudeDefaultModelDirty(false);
+      setAutocompactPctInput(data.autocompactPctOverride != null ? String(data.autocompactPctOverride) : '');
+      setAutocompactPctDirty(false);
       setCodexDefaultModelInput(data.codexDefaultModel || '');
       setCodexDefaultModelDirty(false);
       setRuleGlobalTimeout(
@@ -656,6 +661,49 @@ export default function RoutesPage() {
       toast.error('保存失败: ' + error.message);
     } finally {
       setIsUpdatingClaudeDefaultModel(false);
+    }
+  };
+
+  const handleSaveAutocompactPct = async () => {
+    const trimmed = autocompactPctInput.trim();
+    if (trimmed === '') {
+      // 清除设置
+      try {
+        setIsUpdatingAutocompactPct(true);
+        const current = appConfig || {};
+        await api.updateConfig({
+          ...current,
+          autocompactPctOverride: undefined,
+        });
+        toast.success('自动压缩百分比已清除（重启 Claude Code 后生效）');
+        setAutocompactPctDirty(false);
+        await loadAppConfig();
+      } catch (error: any) {
+        toast.error('保存失败: ' + error.message);
+      } finally {
+        setIsUpdatingAutocompactPct(false);
+      }
+      return;
+    }
+    const num = Number(trimmed);
+    if (!Number.isInteger(num) || num < 1 || num > 100) {
+      toast.error('自动压缩百分比必须为 1-100 的整数');
+      return;
+    }
+    try {
+      setIsUpdatingAutocompactPct(true);
+      const current = appConfig || {};
+      await api.updateConfig({
+        ...current,
+        autocompactPctOverride: num,
+      });
+      toast.success('自动压缩百分比已保存（重启 Claude Code 后生效）');
+      setAutocompactPctDirty(false);
+      await loadAppConfig();
+    } catch (error: any) {
+      toast.error('保存失败: ' + error.message);
+    } finally {
+      setIsUpdatingAutocompactPct(false);
     }
   };
 
@@ -1611,6 +1659,54 @@ export default function RoutesPage() {
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置后写入 ~/.claude/settings.json 的 model 字段，重启 Claude Code 后生效。留空则不写入。
+            </div>
+          </div>
+          <div style={{ marginTop: '20px' }}>
+            <div
+              className="form-group"
+              style={{
+                marginBottom: '0',
+                maxWidth: '420px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+              }}
+            >
+              <label
+                htmlFor="claude-autocompact-pct"
+                style={{ marginBottom: 0, minWidth: '100px', whiteSpace: 'nowrap' }}
+              >
+                Autocompact PCT
+              </label>
+              <input
+                id="claude-autocompact-pct"
+                type="number"
+                min="1"
+                max="100"
+                value={autocompactPctInput}
+                onChange={(e) => {
+                  setAutocompactPctInput(e.target.value);
+                  setAutocompactPctDirty(e.target.value !== (appConfig?.autocompactPctOverride != null ? String(appConfig.autocompactPctOverride) : ''));
+                }}
+                placeholder="1-100"
+                style={{ flex: 1, minWidth: 0 }}
+              />
+              <button
+                onClick={handleSaveAutocompactPct}
+                disabled={isUpdatingAutocompactPct}
+                className="btn btn-primary"
+                style={{ whiteSpace: 'nowrap' }}
+              >
+                保存
+              </button>
+              {autocompactPctDirty && (
+                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
+                  未保存
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
+              设置自动压缩百分比阈值（1-100），写入 ~/.claude/settings.json 的 env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE，重启 Claude Code 后生效。留空则不写入。
             </div>
           </div>
         </div>

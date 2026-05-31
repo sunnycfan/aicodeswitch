@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### 2026-05-31
+
+#### Features
+* **新增 Claude Code 自动压缩百分比阈值配置（CLAUDE_AUTOCOMPACT_PCT_OVERRIDE）**，支持在 UI 中设置 1-100 的整数值，写入 `~/.claude/settings.json` 的 `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 字段
+
 ### 2026-05-15
 
 #### Bug Fixes

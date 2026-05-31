@@ -241,6 +241,7 @@ export interface AppConfig {
   enableAgentTeams?: boolean;  // Claude Code Agent Teams（全局）
   enableBypassPermissionsSupport?: boolean;  // Claude Code bypassPermissions 支持（全局）
   claudeEffortLevel?: ClaudeEffortLevel;  // Claude Code effort level（全局）
+  autocompactPctOverride?: number;  // Claude Code 自动压缩百分比阈值（1-100，全局）
   claudeDefaultModel?: string;  // Claude Code 默认模型（全局）
   codexModelReasoningEffort?: CodexReasoningEffort;  // Codex reasoning effort（全局）
   codexDefaultModel?: string;  // Codex 默认模型（全局）

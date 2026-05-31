@@ -151,22 +151,6 @@ export default {
             },
         ]
     },
-    aicodewith: {
-        name: 'AICodeWith',
-        description: '稳定的第三方中转 https://aicodewith.com/login?tab=register&invitation=QCA74W',
-        services: [
-            {
-                name: 'Claude 标准接口',
-                sourceType: 'claude',
-                apiUrl: 'https://api.aicodewith.com',
-            },
-            {
-                name: 'Responses 标准接口',
-                sourceType: 'openai',
-                apiUrl: 'https://api.aicodewith.com/chatgpt',
-            },
-        ],
-    },
     openai: {
         name: 'OpenAI',
         description: 'OpenAI 官方 API https://platform.openai.com',

@@ -282,6 +282,10 @@ aicos version            # Show current version information
   - **Effort Level (Claude Code only)**: Controls the effort level for Claude Code
     - Options: `low`, `medium`, `high` (default: `medium`)
     - Sets `effortLevel` in `~/.claude/settings.json`
+  - **Autocompact PCT Override (Claude Code only)**: Controls auto-compaction percentage threshold
+    - Value range: 1-100 (integer)
+    - Sets `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as string in `~/.claude/settings.json`
+    - Leave empty to not write this field
   - **Reasoning Effort (Codex only)**: Controls the reasoning effort level
     - Options: `low`, `medium`, `high`, `xhigh` (default: `high`)
     - Sets `model_reasoning_effort` in `~/.codex/config.toml`
@@ -442,6 +446,7 @@ aicos version            # Show current version information
   - `env.API_TIMEOUT_MS`
   - `env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
   - `env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`（可选）
+  - `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`（可选）
   - `permissions.defaultMode`（可选）
   - `skipDangerousModePermissionPrompt`（可选）
   - `effortLevel`（可选）

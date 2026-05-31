@@ -153,12 +153,17 @@ const isClaudeEffortLevel = (value: unknown): value is ClaudeEffortLevel => {
   return typeof value === 'string' && VALID_CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel);
 };
 
+const isValidAutocompactPct = (v: unknown): v is number => {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100;
+};
+
 const writeClaudeConfig = async (
   dbManager: FileSystemDatabaseManager,
   enableAgentTeams?: boolean,
   enableBypassPermissionsSupport?: boolean,
   effortLevel?: ClaudeEffortLevel,
   defaultModel?: string,
+  autocompactPctOverride?: number,
   options: ToolConfigWriteOptions = {}
 ): Promise<boolean> => {
   try {
@@ -249,6 +254,11 @@ const writeClaudeConfig = async (
     // 如果设置了默认模型，添加对应的配置项
     if (defaultModel && typeof defaultModel === 'string' && defaultModel.trim()) {
       proxySettings.model = defaultModel.trim();
+    }
+
+    // 如果设置了自动压缩百分比阈值，添加对应的配置项
+    if (isValidAutocompactPct(autocompactPctOverride)) {
+      claudeSettingsEnv.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(autocompactPctOverride);
     }
 
     // 使用智能合并：将代理配置的管理字段写入，保留当前配置的非管理字段
@@ -701,7 +711,8 @@ const syncConfigsOnServerStartup = async (dbManager: FileSystemDatabaseManager):
     config.enableAgentTeams,
     config.enableBypassPermissionsSupport,
     claudeEffortLevel,
-    config.claudeDefaultModel
+    config.claudeDefaultModel,
+    config.autocompactPctOverride
   );
   console.log(`[Startup Config Sync] Claude Code config ${claudeWritten ? 'written' : 'skipped'}`);
 
@@ -728,6 +739,7 @@ const syncConfigsOnGlobalConfigUpdate = async (dbManager: FileSystemDatabaseMana
     config.enableBypassPermissionsSupport,
     claudeEffortLevel,
     config.claudeDefaultModel,
+    config.autocompactPctOverride,
     { allowOverwriteRefresh: true }
   );
   console.log(`[Config Update Sync] Claude Code config ${claudeUpdated ? 'written' : 'skipped'}`);
@@ -2014,7 +2026,14 @@ ${instruction}
       const enableBypassPermissionsSupport = typeof requestedBypass === 'boolean'
         ? requestedBypass
         : appConfig.enableBypassPermissionsSupport;
-      const result = await writeClaudeConfig(dbManager, enableAgentTeams, enableBypassPermissionsSupport, undefined, appConfig.claudeDefaultModel);
+      const result = await writeClaudeConfig(
+        dbManager,
+        enableAgentTeams,
+        enableBypassPermissionsSupport,
+        undefined,
+        appConfig.claudeDefaultModel,
+        appConfig.autocompactPctOverride
+      );
       res.json(result);
     })
   );
