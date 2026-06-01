@@ -2145,7 +2145,7 @@ export class FileSystemDatabaseManager {
     if (!rule.routeId || typeof rule.routeId !== 'string') {
       return { valid: false, error: `规则[${index}](${rule.id}) 缺少有效的 routeId 字段` };
     }
-    const validContentTypes = ['default', 'background', 'thinking', 'long-context', 'image-understanding', 'model-mapping', 'high-iq'];
+    const validContentTypes = ['default', 'background', 'thinking', 'long-context', 'image-understanding', 'model-mapping', 'high-iq', 'compact'];
     if (!rule.contentType || !validContentTypes.includes(rule.contentType)) {
       return { valid: false, error: `规则[${index}](${rule.id}) 的 contentType 无效` };
     }

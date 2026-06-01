@@ -51,6 +51,7 @@ import {
 } from './mcp-image-handler';
 import { normalizeSourceType } from './type-migration';
 import { readOriginalConfig } from './original-config-reader';
+import { isLastMessageCompact } from './utils';
 
 type ContentTypeDetector = {
   type: ContentType;
@@ -1676,6 +1677,13 @@ export class ProxyServer {
   private getContentTypeDetectors(): ContentTypeDetector[] {
     return [
       {
+        type: 'compact',
+        match: (_req, body) => {
+          const messages = this.extractConversationMessages(body);
+          return isLastMessageCompact(messages);
+        },
+      },
+      {
         type: 'image-understanding',
         match: (_req, body) => this.containsImageContentInLatestMessage(body.messages) || this.containsImageContent(body.input),
       },
@@ -1765,6 +1773,10 @@ export class ProxyServer {
       image_understanding: 'image-understanding',
       'image-understanding': 'image-understanding',
       vision: 'image-understanding',
+      compact: 'compact',
+      compaction: 'compact',
+      summarize: 'compact',
+      summary: 'compact',
     };
 
     return mapping[normalized] || null;

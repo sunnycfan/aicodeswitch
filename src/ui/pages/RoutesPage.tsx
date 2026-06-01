@@ -7,6 +7,7 @@ import { toast } from '../components/Toast';
 import { useRulesStatus } from '../hooks/useRulesStatus';
 
 const CONTENT_TYPE_OPTIONS = [
+  { value: 'compact', label: '压缩对话', icon: '📦' },
   { value: 'image-understanding', label: '图像理解', icon: '🖼' },
   { value: 'high-iq', label: '高智商', icon: '🧠' },
   { value: 'long-context', label: '长上下文', icon: '📄' },
@@ -18,6 +19,7 @@ const CONTENT_TYPE_OPTIONS = [
 
 // 类型排序权重（数值越小越靠前）
 const CONTENT_TYPE_ORDER: Record<string, number> = {
+  'compact': 0,
   'image-understanding': 1,
   'high-iq': 2,
   'long-context': 3,
@@ -29,6 +31,7 @@ const CONTENT_TYPE_ORDER: Record<string, number> = {
 
 // 类型到图标的映射
 const CONTENT_TYPE_ICONS: Record<string, string> = {
+  'compact': '📦',
   'background': '🧱',
   'thinking': '💭',
   'high-iq': '🧠',
@@ -1435,7 +1438,7 @@ export default function RoutesPage() {
                   <div style={{ marginTop: '6px' }}>
                     • 先创建一条 <strong>默认</strong> 规则作为兜底，避免请求无规则可走<br />
                     • 再按你的实际场景增加规则：如图像理解、长上下文、思考、高智商等<br />
-                    • 按类型匹配顺序：<strong>图像理解 → 高智商 → 长上下文 → 思考 → 后台 → 模型顶替 → 默认</strong><br />
+                    • 按类型匹配顺序：<strong>压缩对话 → 图像理解 → 高智商 → 长上下文 → 思考 → 后台 → 模型顶替 → 默认</strong><br />
                     • 如果要“指定模型走指定服务”，再加 <strong>模型顶替</strong> 规则<br />
                     • 同一类型可配多条：<strong>把主力服务放上面（优先级更大），备用服务放下面</strong><br />
                     • 开启智能故障切换后，系统会在主力不可用时自动切到下一个可用规则<br />

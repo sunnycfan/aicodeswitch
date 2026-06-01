@@ -159,7 +159,7 @@ export interface Rule {
   updatedAt: number;
 }
 
-export type ContentType = 'default' | 'background' | 'thinking' | 'long-context' | 'image-understanding' | 'model-mapping' | 'high-iq';
+export type ContentType = 'default' | 'background' | 'thinking' | 'long-context' | 'image-understanding' | 'model-mapping' | 'high-iq' | 'compact';
 
 export interface RequestLog {
   id: string;
