@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file. See [standa
 * **Claude Code Compact 请求 tool_use/tool_result 未配对**：增强 compact 消息清理逻辑；除补齐”下一条 user 消息缺失的 `tool_result`”外，新增”下一条消息不是 user 时自动插入合成 user(tool_result) 消息”，兼容 `user.content` 为字符串的场景，并将 `tool_result` 从携带 compact 文本的 user 消息中拆分为独立的下一条消息；同时在请求发送到上游前对最终 `requestBody.messages` 再执行一次兜底清理，避免中间转换/覆盖步骤重新引入未配对消息，减少 DeepSeek/Claude 标准接口 400（`tool_use` 未紧邻 `tool_result`）
 * **compact 请求识别逻辑统一收口到 conversions**：将 Claude Code compact 消息识别和 Codex `/v1/responses/compact` 路径识别迁移到 `src/server/conversions/compact.ts` 统一管理，`utils.ts` 仅保留兼容转发导出
 * **Completions→Responses 流式转换文本丢失**：修复 Codex 向 Chat Completions 类上游发起请求时，`response.completed`/`response.content_part.done`/`response.output_item.done` 事件中 text 始终为空字符串的 bug，导致 Codex 报错 "stream disconnected before completion: stream closed before response.completed"
+* **Completions→Responses 流缺少 `[DONE]` 终止信号**：修复 `CompletionsToResponsesConverter.flush()` 未发送 `data: [DONE]` 导致 Codex 流式响应断开（499 状态码、token 用量为 0）的问题；同步清理 `proxy-server.ts` 中两个未使用的 import
 * **API URL 版本路径兼容**：修复供应商 apiUrl 包含版本路径（如 /v1、/v3、/v4）时，系统拼接后出现双重版本路径的问题（如 /v1/v1/messages），新增 url-normalizer 工具智能检测和处理版本路径
 * **Responses→Chat Completions 工具过滤**：修复 Codex 请求第三方 Chat API 时因非标准工具类型（tool_search/web_search/custom 等）缺少 `name` 字段导致上游 API 返回 400 参数错误的问题，转换时仅保留 `type: "function"` 的标准工具
 * **Provider-aware reasoning 配置**：激活 `getReasoningConfig`/`applyReasoningConfig` 到代理请求后处理流程，根据供应商能力自动清理不支持的 `reasoning_effort` 参数并注入 provider 特有的 thinking 参数；同时清理已知第三方提供商不支持的 `stream_options`

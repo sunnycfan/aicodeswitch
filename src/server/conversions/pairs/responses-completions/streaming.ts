@@ -258,6 +258,7 @@ export class CompletionsToResponsesConverter implements StreamConverter {
     }
 
     events.push(this.makeSSE('response.completed', { response: responseObj }));
+    events.push({ data: '[DONE]', event: '' });
 
     return events;
   }

@@ -33,9 +33,7 @@ import {
   isLastClaudeMessageCompact,
   sanitizeClaudeMessagesForCompact,
   countUnpairedClaudeToolUses,
-  collectClaudeToolUseDiagnostics,
   flattenClaudeToolBlocksForCompact,
-  collectCompactPayloadDebugInfo,
   normalizeClaudeCompactRequestBody,
   stripClaudeCompactResponseContent,
 } from './conversions/compact';
