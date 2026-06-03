@@ -20,6 +20,7 @@ import type {
   MCPServer,
   TargetType,
   CodexReasoningEffort,
+  ClaudeEffortLevel,
 } from '../types';
 import { migrateSourceType, isLegacySourceType, normalizeSourceType } from './type-migration';
 
@@ -41,8 +42,19 @@ const VALID_CODEX_REASONING_EFFORTS: CodexReasoningEffort[] = ['low', 'medium', 
 const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = 'high';
 const DEFAULT_FAILOVER_RECOVERY_SECONDS = 30;
 
+const VALID_CLAUDE_EFFORT_LEVELS: ClaudeEffortLevel[] = ['low', 'medium', 'high', 'max'];
+const DEFAULT_CLAUDE_EFFORT_LEVEL: ClaudeEffortLevel = 'medium';
+
 const isCodexReasoningEffort = (value: unknown): value is CodexReasoningEffort => {
   return typeof value === 'string' && VALID_CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort);
+};
+
+const isClaudeEffortLevel = (value: unknown): value is ClaudeEffortLevel => {
+  return typeof value === 'string' && VALID_CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel);
+};
+
+const isValidAutocompactPct = (v: unknown): v is number => {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100;
 };
 
 const normalizeFailoverRecoverySeconds = (value: unknown): number => {
@@ -894,26 +906,44 @@ export class FileSystemDatabaseManager {
 
   private async ensureDefaultConfig() {
     const current = this.config;
-    this.config = {
-      enableLogging: current?.enableLogging ?? true,
-      logRetentionDays: current?.logRetentionDays ?? 30,
-      maxLogSize: current?.maxLogSize ?? 100000,
-      apiKey: current?.apiKey ?? '',
-      enableFailover: current?.enableFailover ?? true,
-      failoverRecoverySeconds: normalizeFailoverRecoverySeconds(current?.failoverRecoverySeconds),
-      ruleGlobalTimeout: typeof current?.ruleGlobalTimeout === 'number' && current.ruleGlobalTimeout > 0
-        ? current.ruleGlobalTimeout
-        : undefined,
-      enableAgentTeams: current?.enableAgentTeams ?? false,
-      enableBypassPermissionsSupport: current?.enableBypassPermissionsSupport ?? false,
-      codexModelReasoningEffort: isCodexReasoningEffort(current?.codexModelReasoningEffort)
-        ? current!.codexModelReasoningEffort
-        : DEFAULT_CODEX_REASONING_EFFORT,
-      proxyEnabled: current?.proxyEnabled ?? false,
-      proxyUrl: current?.proxyUrl ?? '',
-      proxyUsername: current?.proxyUsername ?? '',
-      proxyPassword: current?.proxyPassword ?? '',
+    const defaults: AppConfig = {
+      enableLogging: true,
+      logRetentionDays: 30,
+      maxLogSize: 100000,
+      apiKey: '',
+      enableFailover: true,
+      failoverRecoverySeconds: DEFAULT_FAILOVER_RECOVERY_SECONDS,
+      ruleGlobalTimeout: undefined,
+      enableAgentTeams: false,
+      enableBypassPermissionsSupport: false,
+      claudeEffortLevel: DEFAULT_CLAUDE_EFFORT_LEVEL,
+      autocompactPctOverride: undefined,
+      claudeDefaultModel: undefined,
+      codexModelReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+      codexDefaultModel: undefined,
+      proxyEnabled: false,
+      proxyUrl: '',
+      proxyUsername: '',
+      proxyPassword: '',
     };
+
+    // spread: current 覆盖 defaults，未来新增字段自动保留
+    this.config = { ...defaults, ...current };
+
+    // 校验归一化（与 updateConfig 保持一致）
+    if (!isCodexReasoningEffort(this.config.codexModelReasoningEffort)) {
+      this.config.codexModelReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+    }
+    if (!isClaudeEffortLevel(this.config.claudeEffortLevel)) {
+      this.config.claudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL;
+    }
+    if (typeof this.config.autocompactPctOverride !== 'undefined' && !isValidAutocompactPct(this.config.autocompactPctOverride)) {
+      this.config.autocompactPctOverride = undefined;
+    }
+    this.config.failoverRecoverySeconds = normalizeFailoverRecoverySeconds(this.config.failoverRecoverySeconds);
+    if (typeof this.config.ruleGlobalTimeout !== 'number' || this.config.ruleGlobalTimeout <= 0) {
+      this.config.ruleGlobalTimeout = undefined;
+    }
 
     // 仅在首次创建或存在字段补齐时落盘
     if (!current || JSON.stringify(current) !== JSON.stringify(this.config)) {
@@ -2040,8 +2070,15 @@ export class FileSystemDatabaseManager {
       ...config,
     };
 
+    // 校验归一化（与 ensureDefaultConfig 保持一致）
     if (!isCodexReasoningEffort(merged.codexModelReasoningEffort)) {
       merged.codexModelReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+    }
+    if (!isClaudeEffortLevel(merged.claudeEffortLevel)) {
+      merged.claudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL;
+    }
+    if (typeof merged.autocompactPctOverride !== 'undefined' && !isValidAutocompactPct(merged.autocompactPctOverride)) {
+      merged.autocompactPctOverride = undefined;
     }
     merged.failoverRecoverySeconds = normalizeFailoverRecoverySeconds(merged.failoverRecoverySeconds);
     if (typeof merged.ruleGlobalTimeout !== 'number' || merged.ruleGlobalTimeout <= 0) {
@@ -2756,8 +2793,8 @@ export class FileSystemDatabaseManager {
    * 检查日志是否属于指定 session
    */
   private isLogBelongsToSession(log: RequestLog, sessionId: string): boolean {
-    // 检查 headers 中的 session_id（Codex）
-    if (log.headers?.['session_id'] === sessionId) {
+    // 检查 headers 中的 session-id 或 session_id（Codex，兼容新旧版本）
+    if (log.headers?.['session-id'] === sessionId || log.headers?.['session_id'] === sessionId) {
       return true;
     }
     // 检查 body 中的 metadata.user_id（Claude Code）
@@ -2791,12 +2828,12 @@ export class FileSystemDatabaseManager {
 
   /**
    * 从日志条目中提取 sessionId（用于索引）
-   * Codex: headers['session_id']
+   * Codex: headers['session-id']（新版）或 headers['session_id']（旧版）
    * Claude Code: body.metadata.user_id（兼容新旧格式）
    */
   private extractSessionIdFromLog(log: RequestLog): string | null {
-    // Codex: headers 中的 session_id
-    const headerSessionId = log.headers?.['session_id'];
+    // Codex: headers 中的 session-id 或 session_id（兼容新旧版本）
+    const headerSessionId = log.headers?.['session-id'] || log.headers?.['session_id'];
     if (typeof headerSessionId === 'string') return headerSessionId;
 
     // Claude Code: body 中的 metadata.user_id

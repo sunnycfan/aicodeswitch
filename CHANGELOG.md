@@ -2,10 +2,50 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
-### 2026-06-01
+### 2026-06-03
+
+#### Refactor
+* **迁移 proxy-server 从 transformers/ 到 conversions/ 统一格式转换系统**：将请求转换、响应转换、流式转换、token 用量提取全部迁移到 `conversions/` 模块，删除 `transformers/transformers.ts`（~2000 行）和 `streaming.ts` 中 9 个未使用的 Transform 类（~2800 行），移除 4 个已废弃的 legacy SSE 分支（~440 行）
 
 #### Bug Fixes
+* **Claude Code compact 响应残留 thinking/tool 块**：对 `compact` 类型的 Claude Code 请求新增请求体归一化，发送到上游前主动移除 `thinking`、`tools`、`tool_choice`、`mcp_servers`，避免 compact 摘要阶段继续触发推理或工具调用；同时在流式/非流式 Claude 响应下发前过滤 `thinking` 与 `tool_use` block，只保留纯文本摘要，修复 compact 成功后客户端仍继续弹出多条错误恢复请求的问题
+* **Claude Code Compact 请求 server_tool_use 未配对 tool_result**：修复 compact 消息清理逻辑仅检查 `tool_use` 类型而遗漏 `server_tool_use`（Claude Code 内置工具如 webReader）的 bug，导致 DeepSeek 等第三方 Claude 兼容 API 返回 400 错误；同步更新 `sanitizeClaudeMessagesForCompact`、`flattenClaudeToolBlocksForCompact`、`countUnpairedClaudeToolUses`、`collectClaudeToolUseDiagnostics` 四个函数，统一通过 `isToolUseBlock()` 辅助函数识别两种工具调用类型
+* **Claude Code Compact 请求 tool_use/tool_result 未配对**：增强 compact 消息清理逻辑；除补齐”下一条 user 消息缺失的 `tool_result`”外，新增”下一条消息不是 user 时自动插入合成 user(tool_result) 消息”，兼容 `user.content` 为字符串的场景，并将 `tool_result` 从携带 compact 文本的 user 消息中拆分为独立的下一条消息；同时在请求发送到上游前对最终 `requestBody.messages` 再执行一次兜底清理，避免中间转换/覆盖步骤重新引入未配对消息，减少 DeepSeek/Claude 标准接口 400（`tool_use` 未紧邻 `tool_result`）
+* **compact 请求识别逻辑统一收口到 conversions**：将 Claude Code compact 消息识别和 Codex `/v1/responses/compact` 路径识别迁移到 `src/server/conversions/compact.ts` 统一管理，`utils.ts` 仅保留兼容转发导出
+* **Completions→Responses 流式转换文本丢失**：修复 Codex 向 Chat Completions 类上游发起请求时，`response.completed`/`response.content_part.done`/`response.output_item.done` 事件中 text 始终为空字符串的 bug，导致 Codex 报错 "stream disconnected before completion: stream closed before response.completed"
+* **API URL 版本路径兼容**：修复供应商 apiUrl 包含版本路径（如 /v1、/v3、/v4）时，系统拼接后出现双重版本路径的问题（如 /v1/v1/messages），新增 url-normalizer 工具智能检测和处理版本路径
+* **Responses→Chat Completions 工具过滤**：修复 Codex 请求第三方 Chat API 时因非标准工具类型（tool_search/web_search/custom 等）缺少 `name` 字段导致上游 API 返回 400 参数错误的问题，转换时仅保留 `type: "function"` 的标准工具
+* **Provider-aware reasoning 配置**：激活 `getReasoningConfig`/`applyReasoningConfig` 到代理请求后处理流程，根据供应商能力自动清理不支持的 `reasoning_effort` 参数并注入 provider 特有的 thinking 参数；同时清理已知第三方提供商不支持的 `stream_options`
+
+#### Features
+* **供应商配置 link 字段分离**：将 vendors.ts 中 description 内的链接提取为独立 link 字段，一键配置界面仅展示 `https://{domain}` 并可点击跳转
+
+#### Fixes
+* **Codex session 为空**：兼容新版 Codex CLI 的 `session-id`（横线）header，同时保留对旧版 `session_id`（下划线）的支持，修复 session 追踪丢失的问题
+* **Responses API 非标准 tool 类型转发报错**：当 Codex 通过非 OpenAI 上游（如火山方舟）发送请求时，过滤掉 `custom`、`tool_search`、`web_search` 等 OpenAI 私有 tool 类型，避免上游返回 "unknown tool type: custom" 400 错误
+* **Responses API OpenAI 私有字段转发报错**：过滤掉 `text`（verbosity）、`prompt_cache_key`、`client_metadata` 等 OpenAI 私有请求字段，避免非 OpenAI 上游返回 "unknown field" 400 错误
+* **Responses API content 格式兼容**：修复降级兼容模式下将 `content` 数组错误展平为字符串导致火山方舟等第三方提供商返回 `Mismatch type []*responses.ContentItem` 400 错误的问题，改为保持数组格式，并对字符串 content 自动转换为 ContentItem 数组
+
+#### Features
+* **API 服务新增 `isDowngradeCompatibility` 配置**：标记服务是否需要降级兼容处理。开启后同格式 passthrough 会清理私有扩展字段/工具类型，并转换 input 消息格式（developer→system、content 数组展平、补全 status），确保与非原始提供商（火山方舟/豆包等）的兼容性。由用户在服务配置中显式开启。
+
+### 2026-06-01
+
+#### Refactoring
+* **接入 conversions 统一转换系统替换 legacy transformers**：proxy-server.ts 的请求/响应/SSE 转换全面切换到 `src/server/conversions/` 模块，消除对旧 `transformers.ts` 和 `streaming.ts` 的依赖
+* **SSEEvent.data 类型改为 any**：conversions 类型系统中 SSEEvent.data 从 `string` 改为 `any`，与 legacy SSEParserTransform 的对象输出一致，消除双重序列化
+* **修复 sourceTypeToFormat 映射**：`openai` → `responses`（原错误映射为 `completions`），补齐 `claude-chat`、`gemini-chat`、`deepseek-reasoning-chat` 三种 SourceType
+
+#### Features
+* **Codex `/v1/responses/compact` 接入 compact API**：使用 `conversions/compact.ts` 的对话压缩流程（提取文本 → 构建压缩请求 → 调用上游 → 提取摘要 → 返回 compact 响应），替代原来走普通 proxy 管道的方式
+* **DeepSeek 格式独立支持**：`deepseek-reasoning-chat` 不再被当作 `openai-chat` 处理，使用 `deepseek` 格式专属转换器正确处理 `reasoning_content`
+
+#### Bug Fixes
+* **修复 autocompactPctOverride 等全局配置重启后丢失**：`ensureDefaultConfig` 重建配置时遗漏了 `autocompactPctOverride`、`claudeEffortLevel`、`claudeDefaultModel`、`codexDefaultModel` 四个字段，导致服务重启后这些配置被清除
 * **补充 Codex compact 对话识别**：新增 `/v1/responses/compact` 路径检测逻辑，`compact` 内容类型判定现在同时支持 Claude Code 指令型 compact 与 Codex Responses compact 请求
+
+#### Refactoring
+* **统一 AppConfig 字段验证与默认值逻辑**：重构 `ensureDefaultConfig` 为 spread 模式（`{ ...defaults, ...current }`），彻底杜绝新增字段遗漏；`updateConfig` 补全 `claudeEffortLevel` 和 `autocompactPctOverride` 服务端校验，与 `ensureDefaultConfig` 保持一致
 
 #### Features
 * **一键配置供应商新增 DeepSeek 官方**，支持 Chat Completions、Claude 标准接口和 Reasoning Chat 三种服务类型，包含 deepseek-v4-flash 和 deepseek-v4-pro 模型

@@ -502,7 +502,7 @@ export default function RoutesPage() {
   // 统一的规则恢复处理（同时清除黑名单和 WebSocket 实时状态）
   const handleRuleRecovery = async (ruleId: string) => {
     try {
-      const promises: Promise<void>[] = [];
+      const promises: Promise<any>[] = [];
 
       // 清除黑名单状态
       if (blacklistStatuses[ruleId]?.isBlacklisted) {
@@ -1127,7 +1127,7 @@ export default function RoutesPage() {
                       const contentTypeLabel = CONTENT_TYPE_OPTIONS.find(opt => opt.value === rule.contentType)?.label;
                       return (
                         <tr key={rule.id}>
-                          <td className="col-priority">
+                          <td className="col-priority" style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div className='col-priority-box'>
                               <span>{rule.sortOrder || 0}</span>
                               <button
@@ -1146,7 +1146,7 @@ export default function RoutesPage() {
                               </button>
                             </div>
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div style={{ fontSize: '12px', whiteSpace: 'nowrap' }}>
                               {/* 为非默认类型添加图标 */}
                               {rule.contentType !== 'default' && CONTENT_TYPE_ICONS[rule.contentType] && (
@@ -1208,7 +1208,7 @@ export default function RoutesPage() {
                               )}
                             </div>
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div className='vendor-sevices-col' style={{ fontSize: '0.6em' }}>
                               {rule.useMCP ? (
                                 <>
@@ -1224,7 +1224,7 @@ export default function RoutesPage() {
                               )}
                             </div>
                           </td>
-                          <td style={{ whiteSpace: 'nowrap' }}>
+                          <td style={{ whiteSpace: 'nowrap', ...(rule.isDisabled ? { opacity: 0.4 } : {}) }}>
                             {/* 新增：状态列 */}
                             {(() => {
                               const ruleStatus = getRuleStatus(rule);
@@ -1343,7 +1343,7 @@ export default function RoutesPage() {
                               );
                             })()}
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             {/* 当 tokenLimit 和 requestCountLimit 都不限制时，不显示用量情况 */}
                             {(rule.tokenLimit || rule.requestCountLimit) ? (
                             <div style={{ fontSize: '13px' }}>
@@ -1709,7 +1709,7 @@ export default function RoutesPage() {
               )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
-              设置自动压缩百分比阈值（1-100），写入 ~/.claude/settings.json 的 env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE，重启 Claude Code 后生效。留空则不写入。
+              设置自动压缩百分比阈值（1-100），写入 ~/.claude/settings.json 的 env 字段，重启 Claude Code 后生效。留空则不写入。
             </div>
           </div>
         </div>

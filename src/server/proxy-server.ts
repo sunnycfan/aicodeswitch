@@ -1,45 +1,22 @@
 import express, { Request, Response, NextFunction } from 'express';
 import axios, { AxiosRequestConfig } from 'axios';
-import { pipeline } from 'stream';
-import type { Transform } from 'stream';
+import { pipeline, Transform } from 'stream';
 import crypto from 'crypto';
 import type { FileSystemDatabaseManager } from './fs-database';
 import {
-  ClaudeToOpenAIChatEventTransform,
-  OpenAIToClaudeEventTransform,
-  ChatCompletionsToResponsesEventTransform,
-  GeminiToClaudeEventTransform,
-  GeminiToOpenAIChatEventTransform,
-  ClaudeToResponsesEventTransform,
-  GeminiToResponsesEventTransform,
-  ChatCompletionsToClaudeEventTransform,
-  ResponsesToClaudeEventTransform,
   SSEParserTransform,
   SSESerializerTransform,
 } from './transformers/streaming';
 import { ChunkCollectorTransform, SSEEventCollectorTransform, type SSEEvent } from './transformers/chunk-collector';
 import { rulesStatusBroadcaster } from './rules-status-service';
 import {
-  // 请求转换函数，将工具发起的请求，转化为API服务接口需要的请求数据结构
-  transformRequestFromClaudeToGemini,
-  transformRequestFromClaudeToChatCompletions,
-  transformRequestFromClaudeToResponses,
-  transformRequestFromResponsesToChatCompletions,
-  transformRequestFromResponsesToGemini,
-  transformRequestFromResponsesToClaude,
-  // 响应转换函数，将API服务接口吐出的数据，转化为工具需要的数据结构
-  transformResponseFromChatCompletionsToClaude,
-  transformResponseFromGeminiToClaude,
-  transformResponseFromResponsesToClaude,
-  transformResponseFromClaudeToResponses,
-  transformResponseFromChatCompletionsToResponses,
-  transformResponseFromGeminiToResponses,
-  // 辅助函数
-  applyPayloadOverride,
-  extractTokenUsageFromGeminiUsage,
-  extractTokenUsageFromOpenAIUsage,
-  extractTokenUsageFromClaudeUsage,
-} from './transformers/transformers';
+  transformRequest as convertRequest,
+  transformResponse as convertResponse,
+  createStreamConverter,
+  sourceTypeToFormat,
+} from './conversions/index';
+import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
+import type { Format } from './conversions/types';
 import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, TokenUsage, ContentType, RequestLog } from '../types';
 import { AuthType } from '../types';
 import {
@@ -51,7 +28,17 @@ import {
 } from './mcp-image-handler';
 import { normalizeSourceType } from './type-migration';
 import { readOriginalConfig } from './original-config-reader';
-import { isCodexCompactRequest, isLastMessageCompact } from './utils';
+import {
+  isCodexCompactRequest,
+  isLastClaudeMessageCompact,
+  sanitizeClaudeMessagesForCompact,
+  countUnpairedClaudeToolUses,
+  collectClaudeToolUseDiagnostics,
+  flattenClaudeToolBlocksForCompact,
+  collectCompactPayloadDebugInfo,
+  normalizeClaudeCompactRequestBody,
+  stripClaudeCompactResponseContent,
+} from './conversions/compact';
 
 type ContentTypeDetector = {
   type: ContentType;
@@ -83,6 +70,65 @@ type HighIqInferenceResult = {
   shouldUseHighIq: boolean;
   decisionSource: 'human' | 'fallback' | 'none';
 };
+
+class ClaudeCompactResponseSanitizer extends Transform {
+  private skippedBlockIndexes = new Set<number>();
+  private filteredToolUse = false;
+
+  constructor() {
+    super({ objectMode: true });
+  }
+
+  _transform(event: SSEEvent, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    const data: any = event?.data;
+
+    if (!data || typeof data !== 'object') {
+      this.push(event);
+      callback();
+      return;
+    }
+
+    if (data.type === 'content_block_start') {
+      const blockType = data.content_block?.type;
+      if (blockType === 'thinking' || blockType === 'tool_use') {
+        if (typeof data.index === 'number') {
+          this.skippedBlockIndexes.add(data.index);
+        }
+        if (blockType === 'tool_use') {
+          this.filteredToolUse = true;
+        }
+        callback();
+        return;
+      }
+    }
+
+    if ((data.type === 'content_block_delta' || data.type === 'content_block_stop') && this.skippedBlockIndexes.has(data.index)) {
+      if (data.type === 'content_block_stop') {
+        this.skippedBlockIndexes.delete(data.index);
+      }
+      callback();
+      return;
+    }
+
+    if (data.type === 'message_delta' && this.filteredToolUse && data.delta?.stop_reason === 'tool_use') {
+      this.push({
+        ...event,
+        data: {
+          ...(data || {}),
+          delta: {
+            ...(data?.delta || {}),
+            stop_reason: 'end_turn',
+          },
+        } as any,
+      });
+      callback();
+      return;
+    }
+
+    this.push(event);
+    callback();
+  }
+}
 
 export class ProxyServer {
   private app: express.Application;
@@ -1683,7 +1729,7 @@ export class ProxyServer {
             return true;
           }
           const messages = this.extractConversationMessages(body);
-          return isLastMessageCompact(messages);
+          return isLastClaudeMessageCompact(messages);
         },
       },
       {
@@ -2399,11 +2445,6 @@ export class ProxyServer {
     return sourceType === 'claude' || sourceType === 'claude-code';
   }
 
-  /** 判断是否为 Claude Chat 类型 */
-  private isClaudeChatSource(sourceType: SourceType | string) {
-    return sourceType === 'claude-chat';
-  }
-
   private isOpenAISource(sourceType: SourceType | string) {
     // 向下兼容：支持旧类型 'openai-responses'
     return sourceType === 'openai' || sourceType === 'openai-responses';
@@ -2412,11 +2453,6 @@ export class ProxyServer {
   /** 判断是否为 OpenAI Chat 类型 */
   private isOpenAIChatSource(sourceType: SourceType | string) {
     return sourceType === 'openai-chat' || sourceType === 'deepseek-reasoning-chat';
-  }
-
-  /** 判断是否为 OpenAI 类型（包括 OpenAI Chat 和 OpenAI Responses） */
-  private isOpenAIType(sourceType: SourceType | string) {
-    return sourceType === 'openai' || sourceType === 'openai-chat' || sourceType === 'openai-responses' || sourceType === 'deepseek-reasoning-chat';
   }
 
   /** 判断是否为 Gemini 类型 */
@@ -2729,6 +2765,8 @@ export class ProxyServer {
     }
   }
 
+
+
   private isEmptyResponse(data: any): boolean {
     if (data === null || data === undefined) return true;
     if (typeof data === 'string' && data.trim() === '') return true;
@@ -2952,55 +2990,21 @@ export class ProxyServer {
    * @returns 转换后往服务商API接口的数据
    */
   private transformRequestToUpstream(tool: ToolType, source: SourceType, payloadData: any, targetModel: string): any {
-    // Claude Code 发起的请求
-    if (tool === 'claude-code') {
-      // claudecode向claude发送的请求，无需转换，但需要应用模型覆盖
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return applyPayloadOverride(payloadData, targetModel);
-      }
+    const clientFormat: Format = tool === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(source);
 
-      // claudecode发送给gemini
-      if (this.isGeminiChatSource(source) || this.isGeminiSource(source)) {
-        return transformRequestFromClaudeToGemini(payloadData, targetModel);
-      }
+    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData });
+    const body = result.body;
 
-      // claudecode发送给openai chat completion接口
-      if (this.isOpenAIChatSource(source)) {
-        return transformRequestFromClaudeToChatCompletions(payloadData, targetModel);
-      }
-
-      // claudecode发送给openai responses接口
-      if (this.isOpenAISource(source)) {
-        return transformRequestFromClaudeToResponses(payloadData, targetModel);
+    // 模型覆盖：OpenAI 模型族保持原样，其余覆盖为 targetModel
+    if (targetModel) {
+      const isOpenAIModel = /^gpt-|o[123]/i.test(targetModel);
+      if (!isOpenAIModel) {
+        body.model = targetModel;
       }
     }
 
-    // Codex 发起的请求（仅支持 Responses API 格式）
-    if (tool === 'codex') {
-      // Codex 发送给 OpenAI Responses
-      if (this.isOpenAISource(source)) {
-        return applyPayloadOverride(payloadData, targetModel);
-      }
-
-      // Codex 发送给 OpenAI Chat
-      if (this.isOpenAIChatSource(source)) {
-        // 将 responses 格式转换为 chat completions 格式
-        return transformRequestFromResponsesToChatCompletions(payloadData, targetModel);
-      }
-
-      // Codex 发送给 Gemini
-      if (this.isGeminiChatSource(source) || this.isGeminiSource(source)) {
-        return transformRequestFromResponsesToGemini(payloadData, targetModel);
-      }
-
-      // Codex 发送给 Claude
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return transformRequestFromResponsesToClaude(payloadData, targetModel);
-      }
-    }
-
-    // 默认: 直接返回原始数据（如果需要，应用模型覆盖）
-    return applyPayloadOverride(payloadData, targetModel);
+    return body;
   }
 
   /**
@@ -3010,177 +3014,112 @@ export class ProxyServer {
    * @param responseData
    */
   private transformResponseToTool(tool: ToolType, source: SourceType, responseData: any): any {
-    if (tool === 'claude-code') {
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return responseData;
-      }
-      if (this.isOpenAIChatSource(source)) {
-        return transformResponseFromChatCompletionsToClaude(responseData);
-      }
-      if (this.isOpenAISource(source)) {
-        return transformResponseFromResponsesToClaude(responseData);
-      }
-      if (this.isGeminiSource(source) || this.isGeminiChatSource(source)) {
-        return transformResponseFromGeminiToClaude(responseData);
-      }
-    }
-
-    if (tool === 'codex') {
-      // Codex 仅支持 Responses API 格式
-      // Codex 接收来自 OpenAI Responses 的响应
-      if (this.isOpenAISource(source)) {
-        return responseData;
-      }
-
-      // Codex 接收来自 OpenAI Chat 的响应（转换为 Responses 格式）
-      if (this.isOpenAIChatSource(source)) {
-        return transformResponseFromChatCompletionsToResponses(responseData);
-      }
-
-      // Codex 接收来自 Claude 的响应（转换为 Responses 格式）
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return transformResponseFromClaudeToResponses(responseData);
-      }
-
-      // Codex 接收来自 Gemini 的响应（转换为 Responses 格式）
-      if (this.isGeminiSource(source) || this.isGeminiChatSource(source)) {
-        return transformResponseFromGeminiToResponses(responseData);
-      }
-    }
+    const clientFormat: Format = tool === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(source);
+    return convertResponse({ fromFormat: upstreamFormat, toFormat: clientFormat, response: responseData });
   }
 
   /**
    * 获取流式响应转换器
    * @param targetType 目标工具类型
    * @param sourceType 数据源类型
-   * @param model 模型名称
    * @returns 转换器实例和相关信息
    */
-  private transformSSEToTool(targetType: ToolType, sourceType: SourceType, model?: string): {
+  private transformSSEToTool(targetType: ToolType, sourceType: SourceType): {
     converter: Transform | null;
     extractUsage?: (usage: any) => any;
   } {
-    // Claude Code 接收流式响应
-    if (targetType === 'claude-code') {
-      // Claude Code 接收来自 OpenAI Chat 的响应
-      if (this.isOpenAIChatSource(sourceType)) {
-        console.log('[Proxy] Using OpenAI Chat -> Claude API stream converter');
-        return {
-          converter: new ChatCompletionsToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
+    const clientFormat: Format = targetType === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(sourceType);
 
-      // Claude Code 接收来自 OpenAI Responses 的响应
-      if (this.isOpenAISource(sourceType)) {
-        console.log('[Proxy] Using Responses API -> Claude API stream converter');
-        return {
-          converter: new ResponsesToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
-
-      // Claude Code 接收来自 Gemini 的响应
-      if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-        return {
-          converter: new GeminiToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
+    if (upstreamFormat === clientFormat) {
+      return { converter: null };
     }
 
-    // Codex 接收流式响应
-    if (targetType === 'codex') {
-      // Codex 接收来自 Claude 的响应
-      if (this.isClaudeSource(sourceType) || this.isClaudeChatSource(sourceType)) {
-        console.log('[Proxy] Using Claude -> Responses API stream converter');
-        return {
-          converter: new ClaudeToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
+    const streamConverter = createStreamConverter({ fromFormat: upstreamFormat, toFormat: clientFormat });
+    const adapter = new StreamConverterAdapter(streamConverter);
 
-      // Codex 接收来自 OpenAI Chat 的响应
-      if (this.isOpenAIChatSource(sourceType)) {
-        console.log('[Proxy] Using OpenAI Chat -> Responses API stream converter');
-        return {
-          converter: new ChatCompletionsToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
+    const extractUsage = clientFormat === 'claude'
+      ? (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+        })
+      : (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
+        });
 
-      // Codex 接收来自 Gemini 的响应
-      if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-        console.log('[Proxy] Using Gemini -> Responses API stream converter');
-        return {
-          converter: new GeminiToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
-    }
-
-    // 默认：返回空转换器（不需要转换）
-    return { converter: null };
+    return { converter: adapter, extractUsage };
   }
 
   private extractTokenUsageFromResponse(responseData: any, sourceType: SourceType) {
     if (!responseData) return undefined;
 
-    // Gemini 使用 usageMetadata 字段
-    if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-      return extractTokenUsageFromGeminiUsage(responseData?.usageMetadata);
+    const format = sourceTypeToFormat(sourceType);
+
+    if (format === 'gemini') {
+      const usage = responseData?.usageMetadata;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage.promptTokenCount,
+        outputTokens: usage.candidatesTokenCount,
+        totalTokens: usage.totalTokenCount,
+        cacheReadInputTokens: usage.cachedContentTokenCount,
+      };
     }
 
-    // OpenAI 使用 usage 字段
-    if (this.isOpenAIChatSource(sourceType) || this.isOpenAISource(sourceType)) {
-      return extractTokenUsageFromOpenAIUsage(responseData.usage);
+    if (format === 'completions' || format === 'responses') {
+      const usage = responseData?.usage;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage?.input_tokens || usage?.prompt_tokens || 0,
+        outputTokens: usage?.output_tokens || usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        cacheReadInputTokens: usage?.cached_tokens || usage?.cache_read_input_tokens || 0,
+      };
     }
 
-    // Claude：responseData 可能是 usage 对象本身，也可能包含 usage 字段
-    if (this.isClaudeSource(sourceType) || this.isClaudeChatSource(sourceType)) {
-      // 如果 responseData 直接包含 input_tokens/output_tokens，说明它本身就是 usage 对象
+    if (format === 'claude') {
       if (typeof responseData?.input_tokens === 'number' || typeof responseData?.output_tokens === 'number') {
-        return extractTokenUsageFromClaudeUsage(responseData);
+        return {
+          inputTokens: responseData?.input_tokens || 0,
+          outputTokens: responseData?.output_tokens || 0,
+          totalTokens: (responseData?.input_tokens ?? 0) + (responseData?.output_tokens ?? 0) || undefined,
+          cacheReadInputTokens: responseData?.cache_read_input_tokens || 0,
+        };
       }
-      // 否则尝试从 usage 字段提取
-      return extractTokenUsageFromClaudeUsage(responseData.usage);
+      const usage = responseData?.usage;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
+        totalTokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0) || undefined,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
+    // 通用 fallback
     const usage = responseData.usage;
     if (!usage) return undefined;
 
-    // OpenAI 使用 prompt_tokens 和 completion_tokens
     if (typeof usage?.prompt_tokens === 'number' || typeof usage?.completion_tokens === 'number') {
-      return extractTokenUsageFromOpenAIUsage(usage);
+      return {
+        inputTokens: usage?.prompt_tokens || 0,
+        outputTokens: usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
-    // Claude 使用 input_tokens 和 output_tokens
     if (typeof usage?.input_tokens === 'number' || typeof usage?.output_tokens === 'number') {
-      return extractTokenUsageFromClaudeUsage(usage);
+      return {
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
+        totalTokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0) || undefined,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
     return undefined;
@@ -3208,11 +3147,32 @@ export class ProxyServer {
     const forwardedToServiceName = options?.forwardedToServiceName;
     const useOriginalConfig = options?.useOriginalConfig === true;
     let relayedForLog = !useOriginalConfig;
-    const originalToolRequestBody = this.cloneRequestBody(req.body || {});
+    let originalToolRequestBody = this.cloneRequestBody(req.body || {});
     let requestBody: any = this.cloneRequestBody(originalToolRequestBody) || {};
     let usageForLog: TokenUsage | undefined;
     let logged = false;
     const extraTagsForLog: string[] = [];
+
+    // Compact 请求消息清理：确保 tool_use/tool_result 配对完整
+    if (rule.contentType === 'compact' && targetType === 'claude-code') {
+      if (Array.isArray(originalToolRequestBody?.messages)) {
+        originalToolRequestBody.messages = sanitizeClaudeMessagesForCompact(originalToolRequestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          originalToolRequestBody.messages = flattenClaudeToolBlocksForCompact(originalToolRequestBody.messages);
+        }
+      }
+      originalToolRequestBody = normalizeClaudeCompactRequestBody(originalToolRequestBody);
+      if (Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+      if (Array.isArray(originalToolRequestBody?.messages)) {
+        console.log('[Compact-Sanitize] initial unpaired tool_use count:', countUnpairedClaudeToolUses(originalToolRequestBody.messages));
+      }
+    }
 
     // MCP 图像理解处理
     let tempImageFiles: string[] = [];
@@ -3611,6 +3571,17 @@ export class ProxyServer {
       const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string);
       requestBody = transformedRequestBody ?? this.cloneRequestBody(originalToolRequestBody) ?? {};
 
+      // 对最终即将发送到上游的 Claude compact 请求再做一次兜底清理，
+      // 避免中间转换/覆盖步骤重新引入未配对的 tool_use。
+      if (rule.contentType === 'compact' && targetType === 'claude-code' && Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+        requestBody = normalizeClaudeCompactRequestBody(requestBody);
+        console.log('[Compact-Sanitize] final unpaired tool_use count:', countUnpairedClaudeToolUses(requestBody.messages));
+      }
+
       // 应用 max_output_tokens 限制
       requestBody = this.applyMaxOutputTokensLimit(requestBody, service);
 
@@ -3734,456 +3705,18 @@ export class ProxyServer {
 
       if (isEventStream && response.data) {
         res.status(response.status);
-        // 统一走默认流式链路（transformSSEToTool + 统一断连保护），避免历史分支行为不一致
-        const useLegacySpecialSSEBranches = false;
-
-        if (useLegacySpecialSSEBranches && targetType === 'claude-code' && this.isOpenAIType(sourceType)) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new OpenAIToClaudeEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          // 收集响应头
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          // 监听事件收集器的完成事件，确保所有chunks都被收集
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            console.log('[Proxy] Claude Code stream: converter usage:', usage);
-            if (usage) {
-              usageForLog = extractTokenUsageFromClaudeUsage(usage);
-              console.log('[Proxy] Claude Code stream: usageForLog from converter:', usageForLog);
-            }
-
-            // 尝试从event collector中提取usage（作为补充）
-            const extractedUsage = eventCollector.extractUsage();
-            console.log('[Proxy] Claude Code stream: extracted usage from eventCollector:', extractedUsage);
-            if (!usageForLog && extractedUsage) {
-              usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              console.log('[Proxy] Claude Code stream: usageForLog from eventCollector:', usageForLog);
-            }
-
-            // 收集stream chunks（每个chunk是一个完整的SSE事件）
-            streamChunksForLog = eventCollector.getChunks();
-            // 将所有 chunks 合并成完整的响应体用于日志记录
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Stream request finished, collected chunks:', streamChunksForLog?.length || 0);
-            console.log('[Proxy] Response body length:', responseBodyForLog?.length || 0);
-            console.log('[Proxy] Claude Code stream: final usageForLog before finalizeLog:', usageForLog);
-            void finalizeLog(res.statusCode);
-          };
-
-          // 在pipeline完成且eventCollector flush后执行
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished, collecting chunks...');
-            finalizeChunks();
-          });
-
-          // 备用：如果eventCollector的finish没有触发，监听res的finish
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          // 监听 res 的错误事件
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for claude-code:', error);
-
-              // 记录到错误日志 - 包含请求详情和实际转发信息
-              try {
-                // 获取供应商信息
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  // 添加请求详情
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              // 尝试向客户端发送错误事件
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `event: error\ndata: ${JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'api_error',
-                      message: 'Stream processing error occurred'
-                    }
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        if (useLegacySpecialSSEBranches && targetType === 'codex' && this.isClaudeSource(sourceType)) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new ClaudeToOpenAIChatEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          // 监听事件收集器的完成事件，确保所有chunks都被收集
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            console.log('[Proxy] Codex stream: converter usage:', usage);
-            if (usage) {
-              usageForLog = extractTokenUsageFromOpenAIUsage(usage);
-              console.log('[Proxy] Codex stream: usageForLog from converter:', usageForLog);
-            }
-
-            // 尝试从event collector中提取usage（作为补充）
-            const extractedUsage = eventCollector.extractUsage();
-            console.log('[Proxy] Codex stream: extracted usage from eventCollector:', extractedUsage);
-            if (!usageForLog && extractedUsage) {
-              usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              console.log('[Proxy] Codex stream: usageForLog from eventCollector:', usageForLog);
-            }
-
-            streamChunksForLog = eventCollector.getChunks();
-            // 将所有 chunks 合并成完整的响应体用于日志记录
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Codex stream request finished, collected chunks:', streamChunksForLog?.length || 0);
-            console.log('[Proxy] Response body length:', responseBodyForLog?.length || 0);
-            console.log('[Proxy] Codex stream: final usageForLog before finalizeLog:', usageForLog);
-            void finalizeLog(res.statusCode);
-          };
-
-          // 在pipeline完成且eventCollector flush后执行
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (codex), collecting chunks...');
-            finalizeChunks();
-          });
-
-          // 备用：如果eventCollector的finish没有触发，监听res的finish
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (codex)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          // 监听 res 的错误事件
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for codex:', error);
-
-              // 记录到错误日志 - 包含请求详情和实际转发信息
-              try {
-                // 获取供应商信息
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  // 添加请求详情
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              // 尝试向客户端发送错误事件
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `data: ${JSON.stringify({
-                    error: 'Stream processing error occurred'
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        // Gemini / Gemini Chat -> Claude Code 流式转换
-        if (useLegacySpecialSSEBranches && targetType === 'claude-code' && (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType))) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new GeminiToClaudeEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            if (usage) {
-              usageForLog = {
-                inputTokens: usage?.input_tokens || 0,
-                outputTokens: usage?.output_tokens || 0,
-                cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-              };
-            } else {
-              const extractedUsage = eventCollector.extractUsage();
-              if (extractedUsage) {
-                usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              }
-            }
-            streamChunksForLog = eventCollector.getChunks();
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Gemini stream request finished (claude-code), collected chunks:', streamChunksForLog?.length || 0);
-            void finalizeLog(res.statusCode);
-          };
-
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (gemini->claude-code), collecting chunks...');
-            finalizeChunks();
-          });
-
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (gemini->claude-code)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for gemini->claude-code:', error);
-
-              try {
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `event: error\ndata: ${JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'api_error',
-                      message: 'Stream processing error occurred'
-                    }
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        // Gemini / Gemini Chat -> Codex 流式转换
-        if (useLegacySpecialSSEBranches && targetType === 'codex' && (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType))) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new GeminiToOpenAIChatEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            if (usage) {
-              usageForLog = {
-                inputTokens: usage.prompt_tokens,
-                outputTokens: usage.completion_tokens,
-                totalTokens: usage.total_tokens,
-              };
-            } else {
-              const extractedUsage = eventCollector.extractUsage();
-              if (extractedUsage) {
-                usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              }
-            }
-            streamChunksForLog = eventCollector.getChunks();
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Gemini stream request finished (codex), collected chunks:', streamChunksForLog?.length || 0);
-            void finalizeLog(res.statusCode);
-          };
-
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (gemini->codex), collecting chunks...');
-            finalizeChunks();
-          });
-
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (gemini->codex)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for gemini->codex:', error);
-
-              try {
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `data: ${JSON.stringify({
-                    error: 'Stream processing error occurred'
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
         // 默认stream处理(无转换)
         const parser = new SSEParserTransform();
         const eventCollector = new SSEEventCollectorTransform();
         const serializer = new SSESerializerTransform();
         const downstreamChunkCollector = new ChunkCollectorTransform();
+        const compactResponseSanitizer = rule.contentType === 'compact' && targetType === 'claude-code'
+          ? new ClaudeCompactResponseSanitizer()
+          : null;
         responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
 
         // 使用 transformSSEToTool 方法选择转换器
-        const { converter, extractUsage } = this.transformSSEToTool(targetType, sourceType, requestBody?.model);
+        const { converter, extractUsage } = this.transformSSEToTool(targetType, sourceType);
 
         this.copyResponseHeaders(responseHeaders, res);
 
@@ -4222,7 +3755,12 @@ export class ProxyServer {
           ensureResponseWritable();
           return await new Promise<void>((resolve, reject) => {
             if (converter) {
-              pipeline(response.data, parser, eventCollector, converter, serializer, downstreamChunkCollector, res, (error) => {
+              const streamStages: any[] = [response.data, parser, eventCollector, converter];
+              if (compactResponseSanitizer) {
+                streamStages.push(compactResponseSanitizer);
+              }
+              streamStages.push(serializer, downstreamChunkCollector, res);
+              pipeline(streamStages[0], streamStages[1], streamStages[2], streamStages[3], ...(streamStages.slice(4) as any[]), (error) => {
                 if (error) {
                   reject(error);
                   return;
@@ -4232,7 +3770,12 @@ export class ProxyServer {
               return;
             }
 
-            pipeline(response.data, parser, eventCollector, serializer, downstreamChunkCollector, res, (error) => {
+            const streamStages: any[] = [response.data, parser, eventCollector];
+            if (compactResponseSanitizer) {
+              streamStages.push(compactResponseSanitizer);
+            }
+            streamStages.push(serializer, downstreamChunkCollector, res);
+            pipeline(streamStages[0], streamStages[1], streamStages[2], ...(streamStages.slice(3) as any[]), (error) => {
               if (error) {
                 reject(error);
                 return;
@@ -4361,6 +3904,9 @@ export class ProxyServer {
 
       // 使用统一的响应转换方法
       const converted = this.transformResponseToTool(targetType, sourceType, responseData);
+      const normalizedConverted = rule.contentType === 'compact' && targetType === 'claude-code'
+        ? stripClaudeCompactResponseContent(converted)
+        : converted;
 
       // 提取 token usage（从原始响应数据中提取）
       usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
@@ -4368,11 +3914,11 @@ export class ProxyServer {
 
       this.copyResponseHeaders(responseHeaders, res);
 
-      if (converted && converted !== responseData) {
+      if (normalizedConverted && normalizedConverted !== responseData) {
         // 非流式：responseBody 记录上游原始响应，downstreamResponseBody 记录转换后下发内容
         responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
-        downstreamResponseBodyForLog = JSON.stringify(converted);
-        res.status(response.status).json(converted);
+        downstreamResponseBodyForLog = JSON.stringify(normalizedConverted);
+        res.status(response.status).json(normalizedConverted);
       } else {
         // 没有转换，使用原始数据
         responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);

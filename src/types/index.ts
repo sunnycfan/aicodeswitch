@@ -95,6 +95,8 @@ export interface APIService {
   supportedModels?: string[];
   modelLimits?: Record<string, number>; // 模型名 -> 最大输出tokens映射
   enableProxy?: boolean; // 是否启用代理
+  isDowngradeCompatibility?: boolean; // 是否开启降级兼容。开启后同格式 passthrough 会清理私有扩展字段/工具类型，
+                                       // 确保与非原始提供商（如火山方舟/豆包）的兼容性。默认 false（不清理）。
 
   // 新增：Token超量配置
   enableTokenLimit?: boolean;          // 是否启用Token超量限制
@@ -325,7 +327,7 @@ export interface LoginResponse {
 
 /** Session 会话信息 */
 export interface Session {
-  id: string;              // session ID (对于Claude Code是metadata.user_id，对于Codex是headers.session_id)
+  id: string;              // session ID (对于Claude Code是metadata.user_id，对于Codex是headers.session-id或headers.session_id)
   targetType: ToolType;  // 客户端类型 (claude-code 或 codex)
   title?: string;          // 会话标题（从第一条消息内容提取）
   firstRequestAt: number;  // 第一次请求时间

@@ -142,6 +142,7 @@ function VendorsPage() {
 
   // 当前选择的数据源类型（用于动态显示API地址提示）
   const [currentSourceType, setCurrentSourceType] = useState<SourceType>('openai-chat');
+  const [isDowngradeCompatibility, setIsDowngradeCompatibility] = useState(false);
   // 当前选择的认证方式（用于动态显示认证方式提示）
   const [currentAuthType, setCurrentAuthType] = useState<AuthType>(AuthType.AUTH_TOKEN);
   const [inheritVendorApiKey, setInheritVendorApiKey] = useState(true);
@@ -176,13 +177,26 @@ function VendorsPage() {
   const recommendMd = useRecomandVendors();
 
   const constantVendors = useMemo(() => {
-    const overseaVendors = Object.keys(vendorsConfig).filter(key => vendorsConfig[key].is_oversea).map((key) => ({ ...vendorsConfig[key], key }));
-    const insideVendors = Object.keys(vendorsConfig).filter(key => !vendorsConfig[key].is_oversea).map((key) => ({ ...vendorsConfig[key], key }));
-    return [
-      ...insideVendors,
-      null,
-      ...overseaVendors,
-    ];
+    const vendorKeys = Object.keys(vendorsConfig);
+    const sortedGroupValues = [...new Set(vendorKeys.map(key => vendorsConfig[key].sortedGroup || 0))].sort((a, b) => a - b);
+    const sortedGroups = sortedGroupValues.map((group) => {
+      const groupItems = vendorKeys.filter((key) => {
+        if (group === 0) {
+          return !vendorsConfig[key].sortedGroup;
+        }
+        return vendorsConfig[key].sortedGroup === group;
+      }).map(key => ({ ...vendorsConfig[key], key }));
+      return groupItems;
+    });
+
+    const results: any[] = [];
+    sortedGroups.forEach((group, i) => {
+      if (i > 0) {
+        results.push(null);
+      }
+      results.push(...group);
+    });
+    return results;
   }, []);
 
   useEffect(() => {
@@ -326,6 +340,7 @@ function VendorsPage() {
     setCurrentAuthType(AuthType.AUTH_TOKEN);
     setInheritVendorApiKey(true);
     setInheritVendorApiBaseUrl(true);
+    setIsDowngradeCompatibility(false);
     setShowServiceModal(true);
   };
 
@@ -370,6 +385,7 @@ function VendorsPage() {
 
     setInheritVendorApiKey(service.inheritVendorApiKey === true);
     setInheritVendorApiBaseUrl(service.inheritVendorApiBaseUrl === true);
+    setIsDowngradeCompatibility(service.isDowngradeCompatibility === true);
 
     setShowServiceModal(true);
   };
@@ -469,6 +485,8 @@ function VendorsPage() {
       supportedModels: finalModels.length > 0 ? finalModels : undefined,
       modelLimits: Object.keys(finalModelLimits).length > 0 ? finalModelLimits : undefined,
       enableProxy: formData.get('enableProxy') === 'on',
+      // 降级兼容
+      isDowngradeCompatibility: currentSourceType === 'openai' ? isDowngradeCompatibility : undefined,
       // Token超量配置
       enableTokenLimit,
       tokenLimit,
@@ -501,6 +519,7 @@ function VendorsPage() {
     setRequestResetBaseTime(undefined);
     setInheritVendorApiKey(true);
     setInheritVendorApiBaseUrl(true);
+    setIsDowngradeCompatibility(false);
     // 重新加载供应商（服务已自动包含）
     const updatedVendors = await loadVendors();
     if (selectedVendor) {
@@ -842,6 +861,23 @@ function VendorsPage() {
                 <small style={{ display: 'block', marginTop: '4px', color: 'var(--text-muted)' }}>
                   {SOURCE_TYPE_MESSAGE[currentSourceType] || ''}
                 </small>
+                {currentSourceType === 'openai' && (
+                  <label style={{ display: 'flex', alignItems: 'flex-start', marginTop: '10px', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={isDowngradeCompatibility}
+                      onChange={(e) => setIsDowngradeCompatibility(e.target.checked)}
+                      style={{ marginRight: '8px', cursor: 'pointer', width: '16px', height: '16px', marginTop: '2px' }}
+                    />
+                    <span>
+                      <span style={{ fontWeight: 500 }}>降级兼容</span>
+                      <br />
+                      <small style={{ color: 'var(--text-muted)' }}>
+                        通过降级请求格式来确保非 OpenAI 官方的 Responses 接口可以被 Codex 正确使用。
+                      </small>
+                    </span>
+                  </label>
+                )}
               </div>
               <div className="form-group">
                 <label>供应商API地址</label>
@@ -1360,7 +1396,27 @@ function VendorsPage() {
                 </select>
               </div>
               {vendorsConfig[quickSetupVendorKey]?.description ? (
-                <div style={{fontSize:'.8em',marginBottom:16,marginTop:-16}}>{vendorsConfig[quickSetupVendorKey].description}</div>
+                <div style={{fontSize:'.8em',marginBottom:16,marginTop:-16}}>
+                  {vendorsConfig[quickSetupVendorKey].description}
+                  {vendorsConfig[quickSetupVendorKey].link && (
+                    <>
+                      {' '}
+                      <a
+                        href={vendorsConfig[quickSetupVendorKey].link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: 'var(--accent-primary)' }}
+                      >
+                        {(() => {
+                          try {
+                            const url = new URL(vendorsConfig[quickSetupVendorKey].link!);
+                            return url.protocol + '//' + url.hostname;
+                          } catch { return vendorsConfig[quickSetupVendorKey].link; }
+                        })()}
+                      </a>
+                    </>
+                  )}
+                </div>
               ) : null}
               <div className="form-group">
                 <label>源类型 <small style={{ color: 'var(--text-muted)', fontWeight: 'normal' }}>可选择多个</small></label>

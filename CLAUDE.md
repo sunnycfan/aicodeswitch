@@ -137,9 +137,10 @@ aicos version            # Show current version information
 
 #### 2. Proxy Server - `server/proxy-server.ts`
 - **Route Matching**: Finds active route based on target type (claude-code/codex)
-- **Rule Matching**: Determines content type from request (image-understanding/thinking/long-context/background/default)
+- **Rule Matching**: Determines content type from request (image-understanding/thinking/long-context/background/default/compact)
 - **Request Transformation**: Converts between different API formats (Claude ↔ OpenAI Chat)
 - **Streaming**: Handles SSE (Server-Sent Events) streaming responses with real-time transformation
+- **Claude Code Compact Guardrails**: Compact requests sanitize dangling tool history and strip `thinking`/`tools` capabilities before upstream forwarding; compact responses are reduced to plain text before being returned downstream
 - **Logging**: Tracks requests, responses, and errors
 
 #### 3. Transformers - `server/transformers/`
@@ -286,6 +287,10 @@ aicos version            # Show current version information
     - Value range: 1-100 (integer)
     - Sets `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` as string in `~/.claude/settings.json`
     - Leave empty to not write this field
+  - **Compact Routing Note (Claude Code only)**: compact summaries are forwarded as plain-text-only requests
+    - Proxy sanitizes unmatched `tool_use/server_tool_use` history before forwarding
+    - Proxy removes `thinking`, `tools`, `tool_choice`, and `mcp_servers` from compact upstream requests
+    - Proxy filters `thinking` / `tool_use` blocks from compact responses before sending them back to Claude Code
   - **Reasoning Effort (Codex only)**: Controls the reasoning effort level
     - Options: `low`, `medium`, `high`, `xhigh` (default: `high`)
     - Sets `model_reasoning_effort` in `~/.codex/config.toml`
@@ -875,3 +880,7 @@ npm 发布成功后，自动触发 Tauri 应用构建：
 * currentDate: Today's date is 2026-02-20.
 
 **注意，codex已经不再支持 `wire_api = "chat"` 的设置了，因此，由codex发起的请求，一定是和 Responses API 的请求数据一致。**
+
+## 禁止执行
+
+- 禁止使用 git 命令来恢复代码，避免手动修改的代码被恢复后功能丢失
