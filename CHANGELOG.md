@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file. See [standa
 
 ### 2026-06-03
 
+#### Refactor
+* **移除 DeepSeek 独立类型，合并到 OpenAI-Chat/Completions**：将 `deepseek-reasoning-chat` SourceType 和 `deepseek` Format 移除，合并到 `openai-chat`/`completions`。激活 `thinking/providers.ts` 中的 `getReasoningConfig`/`applyReasoningConfig` 系统，通过 provider config 驱动 request body 后处理（thinking 参数注入、reasoning 历史修复、stream_options 剥离）。删除 8 个 DeepSeek pair 目录（24 文件）。启动时 migration 自动将已有 `deepseek-reasoning-chat` 服务转为 `openai-chat`。Streaming/Response 转换无需改动（completions converter 已完整覆盖 `reasoning_content` 处理）。
+
 #### Bug Fixes
 * **Codex → Completions 对话直接结束，无法执行任务**：修复 `CompletionsToResponsesConverter` 流式转换器在 `response.completed` 和 `response.output_item.done` 事件中 function_call 项缺少 `arguments` 字段的 bug，导致 Codex SDK 无法获取工具调用参数；同步修复 delta 事件缺少 `output_index`/`content_index` 索引字段、`responsesToCompletions` 中 `tool_choice: "required"` 被错误映射为 `"any"` 而非 `"required"` 的问题；同步修复 `ClaudeToResponsesConverter` 中同样的 arguments 缺失和缺失 `[DONE]` 事件问题
 * **日志并发写入导致文件损坏和数据丢失**：`addLog` 中 `loadLogShard` → `push` → `saveLogShard` 存在 read-modify-write 竞争条件，并发请求可能导致日志文件被空字节填充而损坏，进而导致 UI 日志页面无法正确显示（包括 Codex 请求日志丢失）。修复方案：添加分片级别写入锁防止并发竞争；`saveLogShard` 使用临时文件+重命名实现原子写入；`loadLogShard` 增加空字节损坏容错；`getLogs` 使用实际加载数据数量计算偏移量；启动时自动校验并修复索引与实际数据的不一致

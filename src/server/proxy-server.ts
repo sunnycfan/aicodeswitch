@@ -14,6 +14,7 @@ import {
   transformResponse as convertResponse,
   createStreamConverter,
   sourceTypeToFormat,
+  getReasoningConfig,
 } from './conversions/index';
 import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
 import type { Format } from './conversions/types';
@@ -2450,7 +2451,7 @@ export class ProxyServer {
 
   /** 判断是否为 OpenAI Chat 类型 */
   private isOpenAIChatSource(sourceType: SourceType | string) {
-    return sourceType === 'openai-chat' || sourceType === 'deepseek-reasoning-chat';
+    return sourceType === 'openai-chat';
   }
 
   /** 判断是否为 Gemini 类型 */
@@ -2604,7 +2605,7 @@ export class ProxyServer {
         headers['anthropic-version'] = headers['anthropic-version'] || '2023-06-01';
       }
     }
-    // 使用 Authorization 认证（适用于 openai-chat, openai-responses, deepseek-reasoning-chat 等）
+    // 使用 Authorization 认证（适用于 openai-chat, openai-responses 等）
     else {
       headers.authorization = `Bearer ${effectiveApiKey}`;
     }
@@ -2987,11 +2988,11 @@ export class ProxyServer {
    * @param targetModel 目标模型名称（可选）
    * @returns 转换后往服务商API接口的数据
    */
-  private transformRequestToUpstream(tool: ToolType, source: SourceType, payloadData: any, targetModel: string): any {
+  private transformRequestToUpstream(tool: ToolType, source: SourceType, payloadData: any, targetModel: string, providerConfig?: any): any {
     const clientFormat: Format = tool === 'codex' ? 'responses' : 'claude';
     const upstreamFormat = sourceTypeToFormat(source);
 
-    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData });
+    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData, providerConfig });
     const body = result.body;
 
     // 模型覆盖：OpenAI 模型族保持原样，其余覆盖为 targetModel
@@ -3566,7 +3567,11 @@ export class ProxyServer {
     try {
       // 使用统一的请求转换方法
       const payloadForTransform = this.cloneRequestBody(originalToolRequestBody);
-      const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string);
+      // 获取 provider config 用于驱动 request body 后处理（thinking 参数注入、reasoning 历史修复等）
+      const effectiveApiUrl = this.resolveEffectiveApiUrl(service);
+      const effectiveModel = rule.targetModel || requestBody?.model;
+      const providerConfig = getReasoningConfig(service.name || '', effectiveApiUrl || '', effectiveModel || '');
+      const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string, providerConfig);
       requestBody = transformedRequestBody ?? this.cloneRequestBody(originalToolRequestBody) ?? {};
 
       // 对最终即将发送到上游的 Claude compact 请求再做一次兜底清理，

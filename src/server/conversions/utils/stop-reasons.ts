@@ -96,7 +96,3 @@ export function responsesToCompletionsFinishReason(status: string | null | undef
   return 'stop';
 }
 
-// --- DeepSeek (same as OpenAI Chat) ---
-
-export const deepseekToClaudeStopReason = completionsToClaudeStopReason;
-export const claudeToDeepseekStopReason = claudeToCompletionsStopReason;

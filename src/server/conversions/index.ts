@@ -1,22 +1,25 @@
 /**
  * AICodingBus Unified Format Conversion System
  *
- * Provides conversion between 5 API formats:
+ * Provides conversion between 4 API formats:
  * 1. Claude Messages API
  * 2. OpenAI Responses API
  * 3. OpenAI Chat Completions API
  * 4. Gemini GenerateContent API
- * 5. DeepSeek Reasoning API
  *
- * 20 unidirectional pairs cover all client→upstream combinations.
+ * 12 unidirectional pairs cover all client→upstream combinations.
  * Naming: pairs/{client}-{upstream}/ — left=client, right=upstream.
+ *
+ * Provider-specific post-processing (thinking params, reasoning history fix)
+ * is driven by the ReasoningConfig passed through TransformRequestOptions.
  */
 
 import type { TransformResult, StreamConverter, TransformRequestOptions, TransformResponseOptions, StreamConverterOptions } from './types.js';
 export type { Format, TransformResult, StreamConverter, SSEEvent, TransformRequestOptions, TransformResponseOptions, StreamConverterOptions, ReasoningConfig } from './types.js';
 
 export { detectRequestFormat, sourceTypeToFormat } from './detector.js';
-export { getReasoningConfig, applyReasoningConfig } from './thinking/providers.js';
+export { getReasoningConfig } from './thinking/providers.js';
+import { applyReasoningConfig } from './thinking/providers.js';
 
 // --- Compact API ---
 export {
@@ -49,10 +52,6 @@ import { claudeToGemini } from './pairs/claude-gemini/request.js';
 import { geminiToClaudeResponse } from './pairs/claude-gemini/response.js';
 import { GeminiToClaudeConverter } from './pairs/claude-gemini/streaming.js';
 
-import { claudeToDeepSeek } from './pairs/claude-deepseek/request.js';
-import { deepseekToClaudeResponse } from './pairs/claude-deepseek/response.js';
-import { DeepseekToClaudeConverter } from './pairs/claude-deepseek/streaming.js';
-
 // --- completions client → * upstream ---
 import { completionsToClaude } from './pairs/completions-claude/request.js';
 import { claudeResponseToCompletions } from './pairs/completions-claude/response.js';
@@ -66,10 +65,6 @@ import { completionsToGemini } from './pairs/completions-gemini/request.js';
 import { geminiToCompletionsResponse } from './pairs/completions-gemini/response.js';
 import { GeminiToCompletionsConverter } from './pairs/completions-gemini/streaming.js';
 
-import { completionsToDeepseek } from './pairs/completions-deepseek/request.js';
-import { deepseekToCompletionsResponse } from './pairs/completions-deepseek/response.js';
-import { DeepseekToCompletionsConverter } from './pairs/completions-deepseek/streaming.js';
-
 // --- responses client → * upstream ---
 import { responsesToClaude } from './pairs/responses-claude/request.js';
 import { claudeToResponsesResponse } from './pairs/responses-claude/response.js';
@@ -82,10 +77,6 @@ import { CompletionsToResponsesConverter } from './pairs/responses-completions/s
 import { responsesToGeminiRequest } from './pairs/responses-gemini/request.js';
 import { geminiToResponsesResponse } from './pairs/responses-gemini/response.js';
 import { GeminiToResponsesConverter } from './pairs/responses-gemini/streaming.js';
-
-import { responsesToDeepseekRequest } from './pairs/responses-deepseek/request.js';
-import { deepseekToResponsesResponse } from './pairs/responses-deepseek/response.js';
-import { DeepseekToResponsesConverter } from './pairs/responses-deepseek/streaming.js';
 
 // --- responses → responses (同格式降级兼容) ---
 import { downgradeResponsesRequest } from './pairs/responses-responses/request.js';
@@ -103,26 +94,9 @@ import { geminiToResponsesRequest } from './pairs/gemini-responses/request.js';
 import { responsesToGeminiResponse } from './pairs/gemini-responses/response.js';
 import { ResponsesToGeminiConverter } from './pairs/gemini-responses/streaming.js';
 
-import { geminiToDeepseek } from './pairs/gemini-deepseek/request.js';
-import { deepseekToGeminiResponse } from './pairs/gemini-deepseek/response.js';
-import { DeepseekToGeminiConverter } from './pairs/gemini-deepseek/streaming.js';
-
-// --- deepseek client → * upstream ---
-import { deepseekToClaude } from './pairs/deepseek-claude/request.js';
-import { claudeToDeepSeekResponse } from './pairs/deepseek-claude/response.js';
-import { ClaudeToDeepseekConverter } from './pairs/deepseek-claude/streaming.js';
-
-import { deepseekToCompletions } from './pairs/deepseek-completions/request.js';
-import { completionsToDeepseekResponse } from './pairs/deepseek-completions/response.js';
-import { CompletionsToDeepseekConverter } from './pairs/deepseek-completions/streaming.js';
-
-import { deepseekToResponsesRequest } from './pairs/deepseek-responses/request.js';
-import { responsesToDeepseekResponse } from './pairs/deepseek-responses/response.js';
-import { ResponsesToDeepseekConverter } from './pairs/deepseek-responses/streaming.js';
-
-import { deepseekToGemini } from './pairs/deepseek-gemini/request.js';
-import { geminiToDeepseekResponse } from './pairs/deepseek-gemini/response.js';
-import { GeminiToDeepseekConverter } from './pairs/deepseek-gemini/streaming.js';
+// --- Provider-driven post-processing ---
+import { fixThinkingHistory } from './thinking/mapper.js';
+import { claudeThinkingToReasoningEffort } from './thinking/effort.js';
 
 // ============================================================
 // Public API: Request Transformation
@@ -132,9 +106,9 @@ import { GeminiToDeepseekConverter } from './pairs/deepseek-gemini/streaming.js'
  * Transform a request body from one format to another.
  */
 export function transformRequest(options: TransformRequestOptions): TransformResult {
-  const { fromFormat, toFormat, body, sanitizeBody } = options;
+  const { fromFormat, toFormat, body, sanitizeBody, providerConfig } = options;
 
-  const targetBody = buildTargetBody({ fromFormat, toFormat, body, sanitizeBody });
+  const targetBody = buildTargetBody({ fromFormat, toFormat, body, sanitizeBody, providerConfig });
 
   return { body: targetBody, headers: {} };
 }
@@ -164,8 +138,6 @@ export function transformResponse(options: TransformResponseOptions): any {
       return claudeToResponsesResponse(response);
     case 'claude->gemini':
       return claudeToGeminiResponse(response);
-    case 'claude->deepseek':
-      return claudeToDeepSeekResponse(response);
 
     // --- upstream responses → client * ---
     case 'responses->claude':
@@ -174,8 +146,6 @@ export function transformResponse(options: TransformResponseOptions): any {
       return responsesToCompletionsResponse(response);
     case 'responses->gemini':
       return responsesToGeminiResponse(response);
-    case 'responses->deepseek':
-      return responsesToDeepseekResponse(response);
 
     // --- upstream completions → client * ---
     case 'completions->claude':
@@ -184,8 +154,6 @@ export function transformResponse(options: TransformResponseOptions): any {
       return completionsToResponsesResponse(response);
     case 'completions->gemini':
       return completionsToGeminiResponse(response);
-    case 'completions->deepseek':
-      return completionsToDeepseekResponse(response);
 
     // --- upstream gemini → client * ---
     case 'gemini->claude':
@@ -194,18 +162,6 @@ export function transformResponse(options: TransformResponseOptions): any {
       return geminiToCompletionsResponse(response);
     case 'gemini->responses':
       return geminiToResponsesResponse(response);
-    case 'gemini->deepseek':
-      return geminiToDeepseekResponse(response);
-
-    // --- upstream deepseek → client * ---
-    case 'deepseek->claude':
-      return deepseekToClaudeResponse(response);
-    case 'deepseek->completions':
-      return deepseekToCompletionsResponse(response);
-    case 'deepseek->responses':
-      return deepseekToResponsesResponse(response);
-    case 'deepseek->gemini':
-      return deepseekToGeminiResponse(response);
 
     default:
       return response;
@@ -233,8 +189,6 @@ export function createStreamConverter(options: StreamConverterOptions): StreamCo
     // --- upstream → claude client ---
     case 'completions->claude':
       return new CompletionsToClaudeConverter();
-    case 'deepseek->claude':
-      return new DeepseekToClaudeConverter();
     case 'gemini->claude':
       return new GeminiToClaudeConverter();
     case 'responses->claude':
@@ -243,8 +197,6 @@ export function createStreamConverter(options: StreamConverterOptions): StreamCo
     // --- upstream → responses client ---
     case 'completions->responses':
       return new CompletionsToResponsesConverter();
-    case 'deepseek->responses':
-      return new DeepseekToResponsesConverter();
     case 'gemini->responses':
       return new GeminiToResponsesConverter();
     case 'claude->responses':
@@ -253,8 +205,6 @@ export function createStreamConverter(options: StreamConverterOptions): StreamCo
     // --- upstream → completions client ---
     case 'claude->completions':
       return new ClaudeToCompletionsConverter();
-    case 'deepseek->completions':
-      return new DeepseekToCompletionsConverter();
     case 'gemini->completions':
       return new GeminiToCompletionsConverter();
     case 'responses->completions':
@@ -267,18 +217,6 @@ export function createStreamConverter(options: StreamConverterOptions): StreamCo
       return new CompletionsToGeminiConverter();
     case 'responses->gemini':
       return new ResponsesToGeminiConverter();
-    case 'deepseek->gemini':
-      return new DeepseekToGeminiConverter();
-
-    // --- upstream → deepseek client ---
-    case 'claude->deepseek':
-      return new ClaudeToDeepseekConverter();
-    case 'completions->deepseek':
-      return new CompletionsToDeepseekConverter();
-    case 'responses->deepseek':
-      return new ResponsesToDeepseekConverter();
-    case 'gemini->deepseek':
-      return new GeminiToDeepseekConverter();
 
     default:
       return new PassthroughConverter();
@@ -291,78 +229,96 @@ export function createStreamConverter(options: StreamConverterOptions): StreamCo
 
 
 /**
- * Transform a request body from one format to another.
+ * Transform a request body from one format to another,
+ * with provider-driven post-processing for completions targets.
  */
-export function buildTargetBody(options: Pick<TransformRequestOptions, 'fromFormat' | 'toFormat' | 'body' | 'sanitizeBody'>): any {
-  const { fromFormat, toFormat, body, sanitizeBody } = options;
+export function buildTargetBody(options: Pick<TransformRequestOptions, 'fromFormat' | 'toFormat' | 'body' | 'sanitizeBody' | 'providerConfig'>): any {
+  const { fromFormat, toFormat, body, sanitizeBody, providerConfig } = options;
 
   // Dispatch to the correct conversion pair
   const key = `${fromFormat}->${toFormat}`;
 
+  let result: any;
+
   switch (key) {
     // --- claude → * ---
     case 'claude->completions':
-      return claudeToCompletions(body);
+      result = claudeToCompletions(body);
+      break;
     case 'claude->responses':
-      return claudeToResponses(body);
+      result = claudeToResponses(body);
+      break;
     case 'claude->gemini':
-      return claudeToGemini(body);
-    case 'claude->deepseek': {
-      return claudeToDeepSeek(body);
-    }
+      result = claudeToGemini(body);
+      break;
 
     // --- responses → * ---
     case 'responses->completions':
-      return responsesToCompletions(body);
+      result = responsesToCompletions(body);
+      break;
     case 'responses->claude':
-      return responsesToClaude(body);
+      result = responsesToClaude(body);
+      break;
     case 'responses->gemini':
-      return responsesToGeminiRequest(body);
-    case 'responses->deepseek':
-      return responsesToDeepseekRequest(body);
+      result = responsesToGeminiRequest(body);
+      break;
     case 'responses->responses': {
       if (sanitizeBody) {
         // Responses 格式降级兼容：委托给 responses-responses pair 处理
-        return downgradeResponsesRequest(body);
+        result = downgradeResponsesRequest(body);
+      } else {
+        result = body;
       }
-      return body;
+      break;
     }
 
     // --- completions → * ---
     case 'completions->claude':
-      return completionsToClaude(body);
+      result = completionsToClaude(body);
+      break;
     case 'completions->responses':
-      return completionsToResponses(body);
+      result = completionsToResponses(body);
+      break;
     case 'completions->gemini':
-      return completionsToGemini(body);
-    case 'completions->deepseek': {
-      return completionsToDeepseek(body);
-    }
+      result = completionsToGemini(body);
+      break;
 
     // --- gemini → * ---
     case 'gemini->claude':
-      return geminiToClaude(body);
+      result = geminiToClaude(body);
+      break;
     case 'gemini->completions':
-      return geminiToCompletions(body);
+      result = geminiToCompletions(body);
+      break;
     case 'gemini->responses':
-      return geminiToResponsesRequest(body);
-    case 'gemini->deepseek': {
-      return geminiToDeepseek(body);
-    }
-
-    // --- deepseek → * ---
-    case 'deepseek->claude':
-      return deepseekToClaude(body);
-    case 'deepseek->completions':
-      return deepseekToCompletions(body);
-    case 'deepseek->responses':
-      return deepseekToResponsesRequest(body);
-    case 'deepseek->gemini':
-      return deepseekToGemini(body);
+      result = geminiToResponsesRequest(body);
+      break;
 
     default:
-      return body;
+      result = body;
   }
+
+  // --- Provider-driven post-processing for completions targets ---
+  if (toFormat === 'completions' && providerConfig) {
+    const isReasoningContentCompletion = providerConfig.outputFormat === 'reasoning_content';
+
+    if (isReasoningContentCompletion) {
+      // 修复历史：确保 assistant + tool_calls 消息有 reasoning_content
+      if (result.messages) {
+        result.messages = fixThinkingHistory(result.messages, 'completions');
+      }
+      // 剥离 stream_options（reasoning_content 提供商通常不支持）
+      delete result.stream_options;
+    }
+
+    // 注入 thinking 参数（如 thinking: { type: 'enabled' }）和 effort 参数
+    if (providerConfig.supportsThinking || providerConfig.supportsEffort) {
+      const effort = body.thinking ? claudeThinkingToReasoningEffort(body.thinking) : null;
+      result = applyReasoningConfig(result, providerConfig, effort);
+    }
+  }
+
+  return result;
 }
 
 /** Identity converter that passes events through unchanged */

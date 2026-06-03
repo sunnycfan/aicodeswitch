@@ -14,7 +14,7 @@ const SOURCE_TYPE_MIGRATION_MAP: Record<LegacySourceType, SourceType> = {
   'openai-responses': 'openai',        // 重命名
   'claude-chat': 'claude-chat',
   'claude-code': 'claude',              // 重命名
-  'deepseek-reasoning-chat': 'deepseek-reasoning-chat',
+  'deepseek-reasoning-chat': 'openai-chat',  // 合并到 openai-chat
   'gemini': 'gemini',
   'gemini-chat': 'gemini-chat',
 };
@@ -28,7 +28,6 @@ const SOURCE_TYPE_REVERSE_MAP: Record<SourceType, LegacySourceType> = {
   'openai': 'openai-responses',
   'claude-chat': 'claude-chat',
   'claude': 'claude-code',
-  'deepseek-reasoning-chat': 'deepseek-reasoning-chat',
   'gemini': 'gemini',
   'gemini-chat': 'gemini-chat',
 };
@@ -58,7 +57,7 @@ export function downgradeSourceType(newType: SourceType): LegacySourceType {
  * @returns 是否为旧类型
  */
 export function isLegacySourceType(type: string): type is LegacySourceType {
-  return type === 'openai-responses' || type === 'claude-code';
+  return type === 'openai-responses' || type === 'claude-code' || type === 'deepseek-reasoning-chat';
 }
 
 /**

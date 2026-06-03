@@ -196,7 +196,7 @@ export default {
             },
             {
                 name: 'DeepSeek Reasoning Chat 接口（付费API）',
-                sourceType: 'deepseek-reasoning-chat',
+                sourceType: 'openai-chat',
                 apiUrl: 'https://api.deepseek.com/v1/chat/completions',
                 models: 'deepseek-v4-flash, deepseek-v4-pro',
             },

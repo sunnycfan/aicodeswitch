@@ -1,6 +1,6 @@
 # Format Conversion System
 
-统一的 API 格式转换系统，在 5 种 AI API 格式之间进行请求/响应/流式转换。
+统一的 API 格式转换系统，在 4 种 AI API 格式之间进行请求/响应/流式转换。
 
 ## 支持的格式
 
@@ -10,7 +10,6 @@
 | `responses` | OpenAI Responses API | `/v1/responses` |
 | `completions` | OpenAI Chat Completions API | `/v1/chat/completions` |
 | `gemini` | Google Gemini GenerateContent API | `/v1beta/models/{model}:{generateContent\|streamGenerateContent}` |
-| `deepseek` | DeepSeek Reasoning API | `/v1/chat/completions` |
 
 ## 目录结构
 
@@ -26,7 +25,7 @@ conversions/
 │
 ├── thinking/                     # 推理/思考模式配置
 │   ├── providers.ts              # 各供应商的 ReasoningConfig 定义与匹配 + applyReasoningConfig 注入
-│   ├── effort.ts                 # Claude thinking ↔ 其他格式的 effort 映射 + deepseekThinkingConfig + isOSeriesModel
+│   ├── effort.ts                 # Claude thinking ↔ 其他格式的 effort 映射 + isOSeriesModel
 │   └── mapper.ts                 # thinking/reasoning 内容块转换 + fixThinkingHistory + redactedThinkingPlaceholder
 │
 ├── utils/                        # 跨 pair 共享的工具函数
@@ -37,11 +36,10 @@ conversions/
 │   ├── streaming-helpers.ts      # flushConverter / normalizeToolArgumentsFragment / parseEventData / createOutputEvent / serializeSSE
 │   └── format-mappers.ts         # Gemini ↔ Completions 的 finishReason + usage 映射
 │
-└── pairs/                        # 20 个单向转换目录
+└── pairs/                        # 13 个单向转换目录（含 1 个同格式降级兼容）
     ├── claude-completions/
     ├── claude-responses/
     ├── ...
-    └── deepseek-gemini/
 ```
 
 ## 命名规则
@@ -76,19 +74,20 @@ conversions/
 
 ## 转换矩阵
 
-5 种格式排列组合 5×5 = 25 个方向（含自转），其中 20 个跨格式 + 5 个同格式：
+4 种格式排列组合 4×4 = 16 个方向（含自转），其中 12 个跨格式 + 4 个同格式：
 
-| ↓ client \ upstream → | claude | responses | completions | gemini | deepseek |
-|-----------------------|--------|-----------|-------------|--------|----------|
-| **claude**            | —      | ✅        | ✅          | ✅     | ✅       |
-| **responses**         | ✅     | 🛡️        | ✅          | ✅     | ✅       |
-| **completions**       | ✅     | ✅        | —           | ✅     | ✅       |
-| **gemini**            | ✅     | ✅        | ✅          | —      | ✅       |
-| **deepseek**          | ✅     | ✅        | ✅          | ✅     | —        |
+| ↓ client \ upstream → | claude | responses | completions | gemini |
+|-----------------------|--------|-----------|-------------|--------|
+| **claude**            | —      | ✅        | ✅          | ✅     |
+| **responses**         | ✅     | 🛡️        | ✅          | ✅     |
+| **completions**       | ✅     | ✅        | —           | ✅     |
+| **gemini**            | ✅     | ✅        | ✅          | —      |
 
 > - ✅ = 跨格式转换（对应一个 pair 目录）
 > - 🛡️ = 降级兼容（通过对codex发起的responses请求的处理，通常是裁剪或修改，以确保被服务商兼容，可以正确响应codex的请求）
 > - — = 纯透传（不做任何处理）
+
+> **注意**：使用 `reasoning_content` 字段的提供商（DeepSeek、Moonshot、Qwen 等）通过 provider config 驱动的后处理自动适配，无需独立的格式类型。
 
 ## Direct vs Composite Pairs
 
@@ -103,22 +102,22 @@ conversions/
 | `claude-completions` | claude | completions | Claude → Completions 完整转换 |
 | `claude-responses` | claude | responses | Claude → Responses 完整转换 |
 | `claude-gemini` | claude | gemini | Claude → Gemini 完整转换 |
-| `claude-deepseek` | claude | deepseek | 自行实现（含 DeepSeek thinking 配置） |
+| `claude-deepseek` | claude | deepseek | 已移除（通过 provider config 后处理实现） |
 | `completions-claude` | completions | claude | Completions → Claude 完整转换 |
 | `completions-responses` | completions | responses | Completions → Responses 完整转换 |
 | `completions-gemini` | completions | gemini | Completions → Gemini 完整转换 |
-| `completions-deepseek` | completions | deepseek | 近似 passthrough（修复 thinking 历史 + 移除 stream_options） |
+| `completions-deepseek` | completions | deepseek | 已移除（通过 provider config 后处理实现） |
 | `responses-claude` | responses | claude | Responses → Claude 完整转换 |
 | `responses-completions` | responses | completions | Responses → Completions 完整转换（过滤非标准工具类型） |
 | `gemini-claude` | gemini | claude | Gemini → Claude 完整转换 |
 | `gemini-completions` | gemini | completions | Gemini → Completions 完整转换 |
-| `deepseek-claude` | deepseek | claude | 自行实现（与 Completions 格式相同，含 reasoning_content 处理） |
-| `deepseek-completions` | deepseek | completions | 完全 passthrough（格式相同，无任何转换） |
+| `deepseek-claude` | deepseek | claude | 已移除（completions 转换器已覆盖 reasoning_content） |
+| `deepseek-completions` | deepseek | completions | 已移除（格式相同，由 completions passthrough 覆盖） |
 | `responses-responses` | responses | responses | 同格式降级兼容（仅 `request.ts`，清理 OpenAI 私有扩展 + 转换消息格式） |
 
-> **设计原则**：每个 Direct pair 是一个独立单元。即使两个 pair 涉及相同的两种格式（如 `claude-deepseek` 和 `deepseek-claude`），它们也各自完整实现转换逻辑，互不依赖。可复用的底层工具（stop reason 映射、usage 映射、tool schema 转换等）统一放在 `utils/` 中。
+> **设计原则**：每个 Direct pair 是一个独立单元。可复用的底层工具（stop reason 映射、usage 映射、tool schema 转换等）统一放在 `utils/` 中。
 
-> **注意**：`completions-deepseek` 虽然底层格式相同，但 request.ts 会执行 `fixThinkingHistory()` 修复历史消息并移除 `stream_options`，因此不是完全的 passthrough。相比之下，`deepseek-completions` 的三个文件（request/response/streaming）都是纯粹的 passthrough。
+> **Provider 后处理**：使用 `reasoning_content` 的提供商（DeepSeek、Moonshot、Qwen 等）通过 `buildTargetBody` 中的 provider config 驱动后处理，自动注入 thinking 参数、修复 reasoning 历史、剥离 `stream_options`，无需独立 pair。
 
 ### Composite Pair（组合转换）
 
@@ -130,19 +129,14 @@ conversions/
 |------|------|------|
 | `responses-gemini` | responses → completions → gemini | 先转 Completions，再转 Gemini |
 | `gemini-responses` | gemini → completions → responses | 先转 Completions，再转 Responses |
-| `responses-deepseek` | responses → completions → deepseek | Completions → DeepSeek 为近似 passthrough |
-| `deepseek-responses` | deepseek → completions → responses | DeepSeek → Completions 为完全 passthrough |
-| `deepseek-gemini` | deepseek → completions → gemini | DeepSeek → Completions 为完全 passthrough |
-| `gemini-deepseek` | gemini → completions → deepseek | Completions → DeepSeek 为近似 passthrough |
 
 > **为什么选 completions 作为统一中间格式？**
 > - Completions (OpenAI Chat) 是业界最通用的 API 格式
-> - DeepSeek 与 Completions 共享相同的请求/响应/SSE 格式，组合链路中 DeepSeek ↔ Completions 这一步是零开销的 passthrough
 > - 所有 pair 都有与 completions 的直接转换，保证任意两种格式都能通过 completions 中转
 
 **组合型实现模式：**
 
-大多数 composite pair 严格遵循两步链式调用。但在 response 转换中，部分 pair 做了优化：
+大多数 composite pair 严格遵循两步链式调用：
 
 - **标准两步组合**（request + streaming 一律使用）：
   ```typescript
@@ -153,24 +147,6 @@ conversions/
   export function responsesToGeminiRequest(body: any): any {
     const completionsBody = responsesToCompletions(body);
     return completionsToGemini(completionsBody);
-  }
-  ```
-
-- **单步优化**（`gemini-deepseek` response）：由于 Completions → DeepSeek 是 passthrough，直接调用第一步即可：
-  ```typescript
-  import { geminiToCompletionsResponse } from '../completions-gemini/response.js';
-
-  export function geminiToDeepseekResponse(response: any): any {
-    return geminiToCompletionsResponse(response); // completions 即 deepseek 格式
-  }
-  ```
-
-- **直接构建**（`deepseek-gemini` response）：直接使用 `format-mappers` 工具函数构建 Gemini 响应，避免两步组合中的信息损失：
-  ```typescript
-  import { mapCompletionsFinishReason, mapCompletionsUsage } from '../../utils/format-mappers.js';
-
-  export function deepseekToGeminiResponse(response: any): any {
-    // 直接从 Completions/DeepSeek 格式构建 Gemini 响应
   }
   ```
 
@@ -197,8 +173,6 @@ export class GeminiToResponsesConverter implements StreamConverter {
   }
 }
 ```
-
-> **注意**：DeepSeek 与 Completions 共享相同的请求/响应/SSE 格式，因此 `deepseek-completions` 和 `completions-deepseek` 的流式转换器是 passthrough（直接透传），组合链路中涉及 DeepSeek ↔ Completions 的步骤开销为零。
 
 ## 依赖关系
 
@@ -251,7 +225,7 @@ const result = transformRequest({
 >
 > 1. **Tool 类型过滤**：`tools` 数组中仅保留 `type: "function"` 的标准工具，移除 `custom`、`tool_search`、`web_search`、`file_search`、`code_interpreter` 等 OpenAI 私有类型（其他提供商返回 "unknown tool type" 400 错误）
 > 2. **顶层字段移除**：删除 `text`（含 verbosity）、`reasoning`、`prompt_cache_key`、`client_metadata`、`include`、`parallel_tool_calls` 等 OpenAI 私有请求字段（其他提供商返回 "unknown field" 400 错误）
-> 3. **消息格式修正**：`developer` 角色 → `system`；`input_text` 数组内容展平为字符串；`status: "completed"` 自动补全
+> 3. **消息格式修正**：`developer` 角色 → `system`；content 字符串规范化为 ContentItem 数组（根据 role 选择 `input_text`/`output_text` 类型）；`status: "completed"` 自动补全
 >
 > **何时开启清理**：proxy-server 通过 `APIService.isDowngradeCompatibility` 配置字段传入 `sanitizeBody: true`，启用降级兼容。该字段由用户在服务配置中显式开启（适用于火山方舟/豆包等非原始提供商）。
 >
@@ -268,12 +242,15 @@ const convertedBody = buildTargetBody({
   fromFormat: 'claude',
   toFormat: 'completions',
   body: claudeRequestBody,
-  sanitizeBody?: boolean,  // 同 transformRequest
+  providerConfig?: ReasoningConfig,  // 可选：供应商推理配置
+  sanitizeBody?: boolean,            // 同 transformRequest
 });
-// 返回转换后的 body
+// 返回转换后的 body（含 provider 后处理）
 ```
 
 > `transformRequest` 内部调用 `buildTargetBody` 来完成 body 转换，因此两者的转换逻辑完全一致。
+>
+> **Provider 后处理**：当 `toFormat === 'completions'` 且 `providerConfig` 存在时，`buildTargetBody` 在基本格式转换后自动执行 provider 级别的后处理（thinking 参数注入、reasoning 历史修复、stream_options 剥离）。
 
 ### `transformResponse(options): any`
 
@@ -334,7 +311,7 @@ const format = detectRequestFormat('/v1/messages', requestBody);
 // => 'claude'
 ```
 
-> **注意**：`gemini` 和 `deepseek` 是纯上游格式，客户端不会以这些格式发请求，`detectRequestFormat` 永远不会返回它们。此外 `/v1/responses/compact` 路径被特殊排除，不会匹配为 `responses` 格式。
+> **注意**：`gemini` 是纯上游格式，客户端不会以该格式发请求，`detectRequestFormat` 永远不会返回它。此外 `/v1/responses/compact` 路径被特殊排除，不会匹配为 `responses` 格式。
 
 ### `sourceTypeToFormat(sourceType): Format`
 
@@ -347,7 +324,6 @@ sourceTypeToFormat('claude-chat');   // => 'claude'
 sourceTypeToFormat('openai');        // => 'responses'
 sourceTypeToFormat('openai-chat');   // => 'completions'
 sourceTypeToFormat('gemini-chat');   // => 'gemini'
-sourceTypeToFormat('deepseek-reasoning-chat'); // => 'deepseek'
 ```
 
 映射关系：
@@ -357,24 +333,23 @@ sourceTypeToFormat('deepseek-reasoning-chat'); // => 'deepseek'
 | `openai` | `responses` |
 | `openai-chat` | `completions` |
 | `gemini`, `gemini-chat` | `gemini` |
-| `deepseek-reasoning-chat`, `deepseek-reasoning` | `deepseek` |
 | 其他 | `completions`（默认） |
 
 ### `getReasoningConfig(providerName, baseUrl, model): ReasoningConfig`
 
-获取指定供应商的推理/思考配置。由 `proxy-server.ts` 在请求后处理阶段自动调用，根据供应商能力清理/注入 reasoning 参数。
+获取指定供应商的推理/思考配置。由 `proxy-server.ts` 在请求转换前获取，传入 `buildTargetBody` 进行自动后处理。
 
 ```typescript
-import { getReasoningConfig, applyReasoningConfig } from './conversions/index.js';
+import { getReasoningConfig } from './conversions/index.js';
 
-// 在 proxy-server.applyProviderReasoningConfig() 中自动调用：
-const config = getReasoningConfig(vendorName, service.apiUrl, body.model);
+// 在 proxy-server 中获取 provider config：
+const config = getReasoningConfig(service.name, service.apiUrl, body.model);
 
-// 提取转换器设置的 reasoning_effort，根据供应商配置清理并重新注入
-const effort = body.reasoning_effort;
-delete body.reasoning_effort;  // 清理转换器盲目设置的值
-const body = applyReasoningConfig(body, config, effort);  // 按供应商能力重新注入
+// 传入转换函数，buildTargetBody 会自动执行后处理：
+const result = convertRequest({ fromFormat, toFormat, body, providerConfig: config });
 ```
+
+> **集成方式**：`getReasoningConfig` 由 `proxy-server.ts` 在调用 `transformRequestToUpstream` 前调用，获取的 `providerConfig` 传入转换管线。`buildTargetBody` 在完成基本格式转换后，根据 config 自动执行：thinking 参数注入（`applyReasoningConfig`）、reasoning 历史修复（`fixThinkingHistory`）、`stream_options` 剥离。
 
 ## StreamConverterAdapter
 
@@ -393,7 +368,7 @@ pipeline(source, adapter, destination);
 ## 类型定义速览
 
 ```typescript
-type Format = 'claude' | 'responses' | 'completions' | 'gemini' | 'deepseek';
+type Format = 'claude' | 'responses' | 'completions' | 'gemini';
 
 interface TransformResult {
   body: any;
@@ -447,7 +422,7 @@ interface ReasoningConfig {
 | 组件 | 职责 |
 |------|------|
 | `providers.ts` | 9 个供应商配置的 ReasoningConfig 模式匹配 + `applyReasoningConfig()` 注入函数 |
-| `effort.ts` | Claude thinking ↔ effort 字符串 ↔ 其他格式的映射 + `deepseekThinkingConfig()` + `isOSeriesModel()` |
+| `effort.ts` | Claude thinking ↔ effort 字符串 ↔ 其他格式的映射 + `isOSeriesModel()` |
 | `mapper.ts` | thinking 内容块的格式转换 + `fixThinkingHistory()`（修复供应商吞掉 thinking 块的问题）+ `redactedThinkingPlaceholder()` |
 
 ### providers.ts — 供应商配置
@@ -464,7 +439,7 @@ interface ReasoningConfig {
 | Mimo/Xiaomimimo | `thinking: { type: 'enabled' }` | — | `reasoning_content` |
 | OpenRouter | — | `reasoning.effort` (openrouter mode) | `reasoning` |
 | SiliconFlow | `enable_thinking: true` | — | `reasoning_content` |
-| Stepfun/Step | — | `reasoning_effort` (low_high mode) | `reasoning` |
+| Stepfun/Step | `none`（`supportsThinking: true` 但不注入参数） | `reasoning_effort` (low_high mode) | `reasoning` |
 
 > `applyReasoningConfig(body, config, effort)` 根据 config 将 thinking/effort 参数注入到请求 body 中。
 >
@@ -477,7 +452,6 @@ interface ReasoningConfig {
 | `claudeThinkingToReasoningEffort(thinking)` | Claude thinking 配置 → effort 字符串（优先取 `output_config.effort`，否则按 `budget_tokens` 推导） |
 | `claudeThinkingToResponsesReasoning(thinking)` | Claude thinking → Responses API `{ effort }` 对象 |
 | `reasoningEffortToClaudeThinking(effort)` | effort 字符串 → Claude thinking 配置（low→2048, medium→8192, high→32000, xhigh→adaptive） |
-| `deepseekThinkingConfig(thinking)` | Claude thinking → DeepSeek thinking 配置（`{ type: 'enabled' }` / `{ type: 'disabled' }`） |
 | `isOSeriesModel(model)` | 检测是否为 OpenAI o-series 推理模型（o1-o9, o4, gpt-5） |
 
 ### mapper.ts — 内容块转换
@@ -493,7 +467,7 @@ interface ReasoningConfig {
 
 ## Compact API（对话压缩）
 
-`compact.ts` 提供 `/v1/responses/compact` 端点的核心逻辑，用于将长对话压缩为摘要。底层复用 `transformRequest()` 和 `transformResponse()` 与上游交互，自动支持所有 5 种格式。
+`compact.ts` 提供 `/v1/responses/compact` 端点的核心逻辑，用于将长对话压缩为摘要。底层复用 `transformRequest()` 和 `transformResponse()` 与上游交互，自动支持所有 4 种格式。
 
 ### 两种客户端的 Compact 行为
 
@@ -564,6 +538,16 @@ responses 目标（passthrough）:
 | `extractSummaryFromResponse` | `(response, fromFormat: Format) => string` | 从上游响应提取摘要文本（通过 `transformResponse` 转 Responses 格式后提取） |
 | `buildCompactedResponse` | `(summary, model, inputTokens?, outputTokens?) => object` | 构建标准 Responses API compact 响应对象 |
 | `sanitizeClaudeMessagesForCompact` | `(messages: any[]) => any[]` | 清理 Claude Messages 格式的 messages，为未配对的 `tool_use` 补充合成 `tool_result` |
+| `isClaudeCompactRequest` | `(message: any) => boolean` | 检测消息是否为 Claude Code compact 命令请求（包含 `CRITICAL: Respond with TEXT ONLY` 指令） |
+| `isLastClaudeMessageCompact` | `(messages: any[]) => boolean` | 检测消息列表中最后一条是否为 Claude Code compact 请求 |
+| `isCodexCompactRequest` | `(path?: string) => boolean` | 检测请求路径是否为 Codex compact（`POST /v1/responses/compact`） |
+| `flattenClaudeToolBlocksForCompact` | `(messages: any[]) => any[]` | 将 Claude 历史中的 tool_use/tool_result 块降级为普通文本块（compact 场景下避免严格校验） |
+| `normalizeClaudeCompactRequestBody` | `(body: any) => any` | 移除 compact 请求中的 thinking/tools/tool_choice/mcp_servers 字段，确保上游仅生成纯文本摘要 |
+| `stripClaudeCompactResponseContent` | `(response: any) => any` | 过滤 compact 响应中的 thinking/tool_use block，只保留纯文本摘要，避免客户端错误恢复 |
+| `countUnpairedClaudeToolUses` | `(messages: any[]) => number` | 统计 Claude messages 中未配对的 tool_use 数量 |
+| `summarizeClaudeMessagesForDebug` | `(messages: any[], startIndex, endIndex) => any[]` | 提取 messages 指定范围的摘要信息用于调试 |
+| `collectCompactPayloadDebugInfo` | `(body: any, targetCallId?) => Record<string, any>` | 收集 compact 请求的调试信息（消息数量、工具调用检测等） |
+| `collectClaudeToolUseDiagnostics` | `(messages: any[]) => string[]` | 生成 Claude messages 中 tool_use 配对情况的诊断日志 |
 
 ### 类型定义
 
@@ -584,7 +568,7 @@ interface CompactRequestResult {
 
 - **Claude Code 的 compact 不走 prepareCompactRequest/processCompactResponse**：Claude Code 的 compact 本质是一条包含摘要指令的用户消息，由正常 proxy 管道处理（`transformRequest` / `transformResponse`）。但需注意，compact 请求中对话历史末尾可能有 `tool_use` 块缺少对应的 `tool_result`，导致上游 API 返回 400。`proxy-server.ts` 在转发前调用 `sanitizeClaudeMessagesForCompact()` 自动补充合成的 `tool_result` 块
 - **Passthrough 模式**：当目标格式是 `responses` 时，`prepareCompactRequest` 返回原始请求体和 `isPassthrough: true`，`processCompactResponse` 直接返回原始响应，不做任何处理
-- **提示词模式**：当目标格式是 Claude / Gemini / Completions / DeepSeek 时，系统会自动提取对话文本、构造压缩提示词、转换为目标格式发送
+- **提示词模式**：当目标格式是 Claude / Gemini / Completions 时，系统会自动提取对话文本、构造压缩提示词、转换为目标格式发送
 
 ## pipeline.ts 额外导出
 
@@ -596,6 +580,18 @@ interface CompactRequestResult {
 | `SSEEventParser` | 类 | 轻量级 SSE 事件解析器（`pushChunk` + `flush`） |
 
 > **注意**：`utils/streaming-helpers.ts` 也有一个同名 `serializeSSE` 函数，两者逻辑相同。`pipeline.ts` 版本用于管线内部，`streaming-helpers.ts` 版本供 pair 目录使用。
+
+
+## URL 规范化（url-normalizer.ts）
+
+`url-normalizer.ts` 提供 API URL 规范化工具，解决用户配置的 `apiUrl` 可能已包含版本路径（如 `/v1`、`/v4`）而系统又硬编码拼接版本路径导致的双重版本路径问题。
+
+> **注意**：`url-normalizer.ts` 不通过 `conversions/index.ts` 导出，由 `proxy-server.ts` 直接导入使用。
+
+| 函数 | 说明 |
+|------|------|
+| `buildUpstreamUrl(apiUrl, appendPath)` | 智能构建上游请求 URL：检测 `apiUrl` 末尾版本路径，智能处理版本冲突（如 `https://xxx.com/v4` + `/v1/messages` → `https://xxx.com/v4/messages`） |
+| `normalizeApiUrl(apiUrl)` | 规范化 API URL，去除末尾斜杠和版本后缀 |
 
 ## 工具函数一览
 
@@ -627,8 +623,6 @@ interface CompactRequestResult {
 | `claudeToResponsesStatus(reason)` | Claude stop_reason → Responses `{ status, incomplete_details }` |
 | `completionsToResponsesFinishReason(reason)` | Completions finish_reason → Responses status |
 | `responsesToCompletionsFinishReason(status)` | Responses status → Completions finish_reason |
-| `deepseekToClaudeStopReason` | 别名：`completionsToClaudeStopReason` |
-| `claudeToDeepseekStopReason` | 别名：`claudeToCompletionsStopReason` |
 
 ### `utils/usage.ts` — Token Usage 映射
 
@@ -681,15 +675,13 @@ detectRequestFormat()          ← 检测客户端格式
     │
     ▼
 transformRequest()             ← 客户端格式 → 上游格式
-    └─ buildTargetBody()       ← 请求 body 转换
+    └─ buildTargetBody()       ← 请求 body 转换 + provider 后处理
         ├─ 同格式 → passthrough（responses 格式 + sanitizeBody 时：过滤私有扩展）
-        └─ 跨格式 → pair 转换（tool-schema.ts 中自动过滤非 function 类型）
-    │
-    ▼
-applyProviderReasoningConfig() ← proxy-server 后处理：根据供应商能力清理/注入 reasoning 参数
-    ├─ getReasoningConfig()    ← 按供应商名/URL/模型匹配 ReasoningConfig
-    ├─ applyReasoningConfig()  ← 注入 provider 特有的 thinking/effort 参数
-    └─ 清理 stream_options     ← 已知第三方提供商不支持时自动移除
+        ├─ 跨格式 → pair 转换（tool-schema.ts 中自动过滤非 function 类型）
+        └─ provider 后处理（completions 目标 + providerConfig 时）：
+            ├─ fixThinkingHistory()    ← 修复 reasoning 历史（isReasoningContentCompletion）
+            ├─ strip stream_options    ← 剥离不支持的参数
+            └─ applyReasoningConfig()  ← 注入 thinking/effort 参数
     │
     ▼
 buildUpstreamUrl()             ← URL 规范化（智能处理版本路径冲突，如 /v1 /v4）
@@ -709,7 +701,7 @@ fetch(upstream)                ← 转发给上游供应商
 1. 在 `types.ts` 的 `Format` 联合类型中添加新字符串
 2. 在 `detector.ts` 中添加路径/结构检测规则（如果客户端会以该格式发请求）
 3. 在 `sourceTypeToFormat` 中添加旧版 SourceType 映射（如果需要兼容）
-4. 创建 4 个新 pair 目录（与其他 4 种格式各一个），每个目录独立实现
+4. 创建 3 个新 pair 目录（与其他 3 种格式各一个），每个目录独立实现
 5. 在 `index.ts` 中添加 import 和 switch case
 6. 在 `utils/tool-schema.ts`、`stop-reasons.ts`、`usage.ts`、`id.ts` 中添加映射函数
 7. 如需支持 thinking/reasoning，在 `thinking/providers.ts` 中添加配置

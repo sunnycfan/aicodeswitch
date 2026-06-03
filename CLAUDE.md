@@ -185,7 +185,8 @@ aicos version            # Show current version information
 - **OpenAI Chat Completions API** ↔ **Gemini GenerateContent API**
 - **OpenAI Chat Completions API** ↔ **OpenAI Responses API**
 - **OpenAI Responses API** ↔ **Gemini GenerateContent API**
-- **DeepSeek Chat** ↔ 其他格式（支持 developer 角色映射）
+
+**Provider-driven 后处理**：`thinking/providers.ts` 通过 `getReasoningConfig()` 检测上游提供商（DeepSeek、Moonshot、Qwen 等），在 `buildTargetBody` 中自动注入 thinking 参数、修复 reasoning 历史消息、剥离 `stream_options` 等 provider 级别的后处理。
 
 **支持的转换内容**：
 - 文本内容 (text)
@@ -337,9 +338,8 @@ aicos version            # Show current version information
   - OpenAI Responses
   - Claude Chat
   - Claude Code
-  - DeepSeek Chat
 - Model override helper now keeps original payload when no override model is provided (prevents fallback request-body null regression)
-- Claude Code -> Gemini/Gemini Chat/OpenAI Chat/OpenAI/DeepSeek Reasoning Chat defaults to streaming (SSE) when `stream` is not explicitly set to `false`
+- Claude Code -> Gemini/Gemini Chat/OpenAI Chat/OpenAI defaults to streaming (SSE) when `stream` is not explicitly set to `false`
 - `/v1/messages/count_tokens` is handled locally in server for Claude Code bridge sources, and returns `{ "input_tokens": number }` directly
 
 ### Configuration Management

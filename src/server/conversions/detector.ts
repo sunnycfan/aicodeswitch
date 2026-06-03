@@ -68,9 +68,6 @@ export function sourceTypeToFormat(sourceType: string): Format {
     case 'gemini':
     case 'gemini-chat':
       return 'gemini';
-    case 'deepseek-reasoning-chat':
-    case 'deepseek-reasoning':
-      return 'deepseek';
     default:
       return 'completions';
   }

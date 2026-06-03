@@ -3,7 +3,7 @@
  */
 
 /** Supported API formats */
-export type Format = 'claude' | 'responses' | 'completions' | 'gemini' | 'deepseek';
+export type Format = 'claude' | 'responses' | 'completions' | 'gemini';
 
 /** Result of a request transformation */
 export interface TransformResult {

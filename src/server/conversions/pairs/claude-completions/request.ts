@@ -10,10 +10,10 @@ import { claudeToCompletionsTools } from '../../utils/tool-schema.js';
 /**
  * Convert a Claude Messages request body to an OpenAI Chat Completions request body.
  *
- * @param preserveReasoningContent  When true, `thinking` / `redacted_thinking` blocks
- *                                  are surfaced as `reasoning_content` on assistant messages.
+ * Always preserves reasoning_content: thinking / redacted_thinking blocks are surfaced
+ * as reasoning_content on assistant messages.
  */
-export function claudeToCompletions(body: any, preserveReasoningContent = false): any {
+export function claudeToCompletions(body: any): any {
   const messages: any[] = [];
 
   // --- System prompt -------------------------------------------------------
@@ -34,7 +34,7 @@ export function claudeToCompletions(body: any, preserveReasoningContent = false)
   // --- Messages ------------------------------------------------------------
   if (body.messages) {
     for (const msg of body.messages) {
-      const converted = convertClaudeMessageToCompletions(msg, preserveReasoningContent);
+      const converted = convertClaudeMessageToCompletions(msg);
       const toolResults = converted._toolResults;
       delete converted._toolResults;
 
@@ -97,7 +97,6 @@ export function claudeToCompletions(body: any, preserveReasoningContent = false)
  */
 function convertClaudeMessageToCompletions(
   msg: any,
-  preserveReasoningContent: boolean,
 ): any {
   const content = msg.content;
 
@@ -141,15 +140,9 @@ function convertClaudeMessageToCompletions(
         content: resultContent,
       });
     } else if (block.type === 'thinking') {
-      if (preserveReasoningContent) {
-        reasoningParts.push(block.thinking || '');
-      }
-      // otherwise skip
+      reasoningParts.push(block.thinking || '');
     } else if (block.type === 'redacted_thinking') {
-      if (preserveReasoningContent) {
-        reasoningParts.push('[redacted thinking]');
-      }
-      // otherwise skip
+      reasoningParts.push('[redacted thinking]');
     }
   }
 
@@ -160,11 +153,7 @@ function convertClaudeMessageToCompletions(
       content: parts.join('\n') || null,
       tool_calls: toolCalls,
     };
-    if (
-      preserveReasoningContent &&
-      msg.role === 'assistant' &&
-      reasoningParts.length > 0
-    ) {
+    if (msg.role === 'assistant' && reasoningParts.length > 0) {
       result.reasoning_content = reasoningParts.join('\n');
     }
     return result;
@@ -185,11 +174,7 @@ function convertClaudeMessageToCompletions(
     content: parts.join('\n') || null,
   };
 
-  if (
-    preserveReasoningContent &&
-    msg.role === 'assistant' &&
-    reasoningParts.length > 0
-  ) {
+  if (msg.role === 'assistant' && reasoningParts.length > 0) {
     result.reasoning_content = reasoningParts.join('\n');
   }
 

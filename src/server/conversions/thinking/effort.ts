@@ -47,14 +47,6 @@ export function reasoningEffortToClaudeThinking(effort: string | null): any {
   }
 }
 
-/** Convert Claude thinking config to DeepSeek thinking config */
-export function deepseekThinkingConfig(thinking: any): any {
-  if (!thinking || thinking.type === 'disabled') {
-    return { thinking: { type: 'disabled' } };
-  }
-  return { thinking: { type: 'enabled' } };
-}
-
 /** Check if a model is an OpenAI o-series reasoning model */
 export function isOSeriesModel(model: string): boolean {
   if (!model) return false;
