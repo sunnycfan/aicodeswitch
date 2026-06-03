@@ -93,6 +93,9 @@ export class FileSystemDatabaseManager {
   private contentTypeDistributionInitialized = false;
   private contentTypeDistributionInitializing = false;
 
+  // 分片写入锁：防止并发读写同一个分片文件导致数据损坏
+  private shardWriteLocks: Map<string, Promise<void>> = new Map();
+
   // 缓存机制
   private logsCountCache: { count: number; timestamp: number } | null = null;
   private errorLogsCountCache: { count: number; timestamp: number } | null = null;
@@ -535,8 +538,40 @@ export class FileSystemDatabaseManager {
     // 检查并迁移旧的 logs.json 文件
     await this.migrateOldLogsIfNeeded();
 
+    // 校验索引与实际分片数据的一致性
+    await this.verifyShardIndexConsistency();
+
     // 清理旧日志分片
     await this.cleanupOldLogShards();
+  }
+
+  /**
+   * 校验索引中的 count 与实际分片文件中的数据是否一致
+   * 修复因并发写入竞争导致的不一致
+   */
+  private async verifyShardIndexConsistency(): Promise<void> {
+    let fixedCount = 0;
+    for (const shard of this.logShardsIndex) {
+      try {
+        const shardLogs = await this.loadLogShard(shard.filename);
+        if (shardLogs.length !== shard.count) {
+          console.warn(`[Database] Shard count mismatch on startup: ${shard.filename} index=${shard.count} actual=${shardLogs.length}, correcting`);
+          shard.count = shardLogs.length;
+          fixedCount++;
+        }
+      } catch {
+        // 分片文件无法读取，将 count 设为 0
+        if (shard.count > 0) {
+          console.warn(`[Database] Shard file unreadable on startup: ${shard.filename}, setting count to 0`);
+          shard.count = 0;
+          fixedCount++;
+        }
+      }
+    }
+    if (fixedCount > 0) {
+      console.log(`[Database] Fixed ${fixedCount} shard index count mismatch(es)`);
+      await this.saveLogsIndex();
+    }
   }
 
   private async saveLogsIndex(): Promise<void> {
@@ -807,8 +842,20 @@ export class FileSystemDatabaseManager {
   private async loadLogShard(filename: string): Promise<RequestLog[]> {
     const filepath = path.join(this.logsDir, filename);
     try {
-      const data = await fs.readFile(filepath, 'utf-8');
-      return JSON.parse(data);
+      let content = await fs.readFile(filepath, 'utf-8');
+      // 检测并修复空字节损坏（并发写入竞争可能导致文件中间出现大量 \x00）
+      const nullIndex = content.indexOf('\x00');
+      if (nullIndex !== -1) {
+        console.warn(`[Database] Detected corrupted shard file: ${filename}, truncating at null byte (pos ${nullIndex})`);
+        content = content.substring(0, nullIndex);
+        // 尝试补全被截断的 JSON 数组
+        const openBrackets = (content.match(/\[/g) || []).length;
+        const closeBrackets = (content.match(/\]/g) || []).length;
+        if (openBrackets > closeBrackets) {
+          content += ']';
+        }
+      }
+      return JSON.parse(content);
     } catch {
       return [];
     }
@@ -816,8 +863,12 @@ export class FileSystemDatabaseManager {
 
   private async saveLogShard(filename: string, logs: RequestLog[]): Promise<void> {
     const filepath = path.join(this.logsDir, filename);
+    const tempFile = path.join(this.logsDir, `.tmp_${filename}`);
     await fs.mkdir(this.logsDir, { recursive: true });
-    await fs.writeFile(filepath, JSON.stringify(logs, null, 2));
+    const content = JSON.stringify(logs, null, 2);
+    // 先写临时文件，再原子重命名，避免写入中途被并发操作导致文件损坏
+    await fs.writeFile(tempFile, content, 'utf-8');
+    await fs.rename(tempFile, filepath);
   }
 
   private async loadErrorLogs() {
@@ -1578,33 +1629,51 @@ export class FileSystemDatabaseManager {
     // 获取目标分片文件名
     const filename = await this.getLogShardFilename(logWithId.timestamp);
 
-    // 加载现有分片数据
-    let shardLogs = await this.loadLogShard(filename);
+    // 使用分片级别的写入锁，防止并发 read-modify-write 竞争条件
+    const previousLock = this.shardWriteLocks.get(filename) || Promise.resolve();
+    let shardLogsLength = 0;
+    const currentWrite = previousLock.then(async () => {
+      const shardLogs = await this.loadLogShard(filename);
+      shardLogs.push(logWithId);
+      shardLogsLength = shardLogs.length;
+      await this.saveLogShard(filename, shardLogs);
 
-    // 添加新日志
-    shardLogs.push(logWithId);
+      // 更新索引（在锁内完成，保证一致性）
+      const date = new Date(logWithId.timestamp).toISOString().split('T')[0];
+      const shardIndex = this.logShardsIndex.find(s => s.filename === filename);
 
-    // 保存分片
-    await this.saveLogShard(filename, shardLogs);
+      if (shardIndex) {
+        shardIndex.count = shardLogs.length;
+        shardIndex.endTime = Math.max(shardIndex.endTime, logWithId.timestamp);
+      } else {
+        this.logShardsIndex.push({
+          filename,
+          date,
+          startTime: logWithId.timestamp,
+          endTime: logWithId.timestamp,
+          count: 1
+        });
+      }
 
-    // 更新索引
-    const date = new Date(logWithId.timestamp).toISOString().split('T')[0];
-    let shardIndex = this.logShardsIndex.find(s => s.filename === filename);
+      await this.saveLogsIndex();
+    });
 
-    if (shardIndex) {
-      shardIndex.count = shardLogs.length;
-      shardIndex.endTime = Math.max(shardIndex.endTime, logWithId.timestamp);
-    } else {
-      this.logShardsIndex.push({
-        filename,
-        date,
-        startTime: logWithId.timestamp,
-        endTime: logWithId.timestamp,
-        count: 1
-      });
+    this.shardWriteLocks.set(filename, currentWrite);
+
+    try {
+      await currentWrite;
+    } catch (error) {
+      // 写入失败时清理锁
+      if (this.shardWriteLocks.get(filename) === currentWrite) {
+        this.shardWriteLocks.delete(filename);
+      }
+      throw error;
     }
 
-    await this.saveLogsIndex();
+    // 如果当前锁已执行完毕且没有被后续锁覆盖，清理它
+    if (this.shardWriteLocks.get(filename) === currentWrite) {
+      this.shardWriteLocks.delete(filename);
+    }
 
     // 同时更新统计数据
     await this.updateStatistics(logWithId);
@@ -1620,7 +1689,7 @@ export class FileSystemDatabaseManager {
         refs = [];
         this.sessionLogIndex.set(sessionId, refs);
       }
-      refs.push({ filename, index: shardLogs.length - 1, timestamp: logWithId.timestamp });
+      refs.push({ filename, index: shardLogsLength - 1, timestamp: logWithId.timestamp });
       this.scheduleSessionLogIndexFlush();
     }
   }
@@ -1635,12 +1704,18 @@ export class FileSystemDatabaseManager {
     // 遍历分片直到收集足够的日志
     for (const shard of sortedShards) {
       if (currentOffset + shard.count <= offset) {
-        // 跳过整个分片
+        // 跳过整个分片（使用索引中的 count 做快速跳过判断，避免不必要的磁盘IO）
         currentOffset += shard.count;
         continue;
       }
 
       const shardLogs = await this.loadLogShard(shard.filename);
+
+      // 修正索引中的计数（如果发现不一致）
+      if (shardLogs.length !== shard.count) {
+        console.warn(`[Database] Shard count mismatch: ${shard.filename} index=${shard.count} actual=${shardLogs.length}, correcting`);
+        shard.count = shardLogs.length;
+      }
 
       // 计算需要从该分片取出的日志范围
       let startIndex = 0;
@@ -1654,7 +1729,7 @@ export class FileSystemDatabaseManager {
       // 添加日志到结果
       allLogs.push(...shardLogs.slice(startIndex, endIndex));
 
-      currentOffset += shard.count;
+      currentOffset += shardLogs.length;
 
       if (allLogs.length >= limit) {
         break;

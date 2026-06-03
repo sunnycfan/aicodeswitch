@@ -37,7 +37,16 @@ export function claudeToCompletions(body: any, preserveReasoningContent = false)
       const converted = convertClaudeMessageToCompletions(msg, preserveReasoningContent);
       const toolResults = converted._toolResults;
       delete converted._toolResults;
-      messages.push(converted);
+
+      // When the message contains only tool_result blocks (no text),
+      // converted.content is null – skip pushing the empty wrapper to avoid
+      // sending an invalid { role: "user", content: null } message.
+      const hasOnlyToolResults = toolResults && toolResults.length > 0 && converted.content === null;
+
+      if (!hasOnlyToolResults) {
+        messages.push(converted);
+      }
+
       // Emit tool_result blocks as separate 'tool' role messages (OpenAI format)
       if (toolResults) {
         for (const tr of toolResults) {

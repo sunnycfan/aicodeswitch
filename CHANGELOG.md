@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file. See [standa
 
 ### 2026-06-03
 
+#### Bug Fixes
+* **日志并发写入导致文件损坏和数据丢失**：`addLog` 中 `loadLogShard` → `push` → `saveLogShard` 存在 read-modify-write 竞争条件，并发请求可能导致日志文件被空字节填充而损坏，进而导致 UI 日志页面无法正确显示（包括 Codex 请求日志丢失）。修复方案：添加分片级别写入锁防止并发竞争；`saveLogShard` 使用临时文件+重命名实现原子写入；`loadLogShard` 增加空字节损坏容错；`getLogs` 使用实际加载数据数量计算偏移量；启动时自动校验并修复索引与实际数据的不一致
+* **Claude Code → Completions 转换 tool_result 产生无效 user 消息**：修复当 Claude `user` 消息仅包含 `tool_result` 内容块时，转换器在输出 OpenAI Chat Completions 格式时会额外生成 `{ role: "user", content: null }` 的无效消息，导致 GLM 等上游 API 返回 400 错误（`API 调用参数有误`）。同步修复 `claude-completions` 和 `claude-deepseek` 两个转换器
+
 #### Refactor
 * **迁移 proxy-server 从 transformers/ 到 conversions/ 统一格式转换系统**：将请求转换、响应转换、流式转换、token 用量提取全部迁移到 `conversions/` 模块，删除 `transformers/transformers.ts`（~2000 行）和 `streaming.ts` 中 9 个未使用的 Transform 类（~2800 行），移除 4 个已废弃的 legacy SSE 分支（~440 行）
 

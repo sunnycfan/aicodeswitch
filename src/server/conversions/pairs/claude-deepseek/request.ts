@@ -40,7 +40,16 @@ export function claudeToDeepSeek(body: any): any {
       const converted = convertClaudeMessage(msg);
       const toolResults = converted._toolResults;
       delete converted._toolResults;
-      messages.push(converted);
+
+      // When the message contains only tool_result blocks (no text),
+      // converted.content is null – skip pushing the empty wrapper to avoid
+      // sending an invalid { role: "user", content: null } message.
+      const hasOnlyToolResults = toolResults && toolResults.length > 0 && converted.content === null;
+
+      if (!hasOnlyToolResults) {
+        messages.push(converted);
+      }
+
       if (toolResults) {
         for (const tr of toolResults) {
           messages.push(tr);
