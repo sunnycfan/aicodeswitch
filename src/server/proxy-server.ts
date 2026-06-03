@@ -16,9 +16,9 @@ import {
   sourceTypeToFormat,
   getReasoningConfig,
 } from './conversions/index';
-import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
 import type { Format } from './conversions/types';
-import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, TokenUsage, ContentType, RequestLog } from '../types';
+import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
+import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, TokenUsage, ContentType, RequestLog, ApiPath, ApiPathBinding } from '../types';
 import { AuthType } from '../types';
 import {
   isRuleUsingMCP,
@@ -45,6 +45,60 @@ type ContentTypeDetector = {
 };
 
 const SUPPORTED_TARGETS = ['claude-code', 'codex'];
+
+/** 默认模型列表 */
+const DEFAULT_MODELS = [
+  { id: 'claude-sonnet-4-20250514', owned_by: 'anthropic' },
+  { id: 'claude-opus-4-20250514', owned_by: 'anthropic' },
+  { id: 'claude-haiku-4-20250514', owned_by: 'anthropic' },
+  { id: 'gpt-5.3-codex', owned_by: 'openai' },
+  { id: 'gpt-5.4', owned_by: 'openai' },
+  { id: 'gpt-5.5', owned_by: 'openai' },
+  { id: 'gpt-5.4-mini', owned_by: 'openai' },
+  { id: 'o3-pro', owned_by: 'openai' },
+  { id: 'gemini-3-pro-preview', owned_by: 'google' },
+  { id: 'gemini-3-flash-preview', owned_by: 'google' },
+  { id: 'deepseek-r1', owned_by: 'deepseek' },
+  { id: 'deepseek-chat', owned_by: 'deepseek' },
+];
+
+/** 根据 config 生成模型列表响应 */
+function buildModelsResponse(customModelsStr?: string) {
+  const models = customModelsStr?.trim()
+    ? customModelsStr.split(',').map(s => s.trim()).filter(Boolean)
+    : DEFAULT_MODELS.map(m => m.id);
+  return {
+    object: 'list',
+    data: models.map(id => ({
+      id,
+      object: 'model' as const,
+      created: 1747267200,
+      owned_by: 'custom',
+    })),
+  };
+}
+
+/** 匹配标准 API 路径 */
+function matchApiPath(reqPath: string): ApiPath | null {
+  const p = reqPath.split('?')[0];
+  if (p === '/v1/models') return '/v1/models';
+  if (p === '/v1/messages' || p.startsWith('/v1/messages/')) return '/v1/messages';
+  if (p === '/v1/responses') return '/v1/responses';
+  if (p === '/v1/chat/completions') return '/v1/chat/completions';
+  if (/^\/v1beta\/models\//.test(p)) return '/v1beta/models';
+  return null;
+}
+
+/** 从 API 路径推断客户端格式 */
+function apiPathToClientFormat(apiPath: ApiPath): Format | null {
+  switch (apiPath) {
+    case '/v1/messages': return 'claude';
+    case '/v1/responses': return 'responses';
+    case '/v1/chat/completions': return 'completions';
+    case '/v1beta/models': return 'gemini';
+    case '/v1/models': return null;
+  }
+}
 
 type ProxyRequestOptions = {
   failoverEnabled?: boolean;
@@ -187,7 +241,7 @@ export class ProxyServer {
       this.inferTargetTypeFromPath(req.path) ||
       this.inferTargetTypeFromPath(req.originalUrl || '');
 
-    if (!enableLogging || !resolvedTargetType) {
+    if (!enableLogging) {
       return;
     }
 
@@ -208,7 +262,51 @@ export class ProxyServer {
   }
 
   initialize() {
-    // Dynamic proxy middleware
+    // === 标准 API 路径前置中间件 ===
+    // 处理 /v1/models 和 4 个可绑定的标准 API 路径
+    this.app.use(async (req: Request, res: Response, next: NextFunction) => {
+      const apiPath = matchApiPath(req.path);
+      if (!apiPath) {
+        return next();
+      }
+
+      // /v1/models: 直接返回静态模型列表
+      if (apiPath === '/v1/models') {
+        // 鉴权
+        if (this.config.apiKey) {
+          const authHeader = req.headers.authorization;
+          const providedKey = authHeader?.replace('Bearer ', '');
+          if (!providedKey || providedKey !== this.config.apiKey) {
+            res.status(401).json({ error: { message: 'Invalid API key' } });
+            return;
+          }
+        }
+        res.json(buildModelsResponse(this.dbManager.getApiPathModels()));
+        return;
+      }
+
+      // 其余 4 个路径：查找绑定
+      const bindings = this.dbManager.getApiPathBindings();
+      const binding = bindings.find((b: ApiPathBinding) => b.apiPath === apiPath);
+      if (!binding || !binding.routeId) {
+        return next(); // 未绑定，交给后续中间件或返回 404
+      }
+
+      // 加载绑定的路由
+      const allRoutes = this.dbManager.getRoutes();
+      const route = allRoutes.find((r: Route) => r.id === binding.routeId && r.isActive);
+      if (!route) {
+        return res.status(404).json({ error: { message: 'Bound route not found or inactive' } });
+      }
+
+      // 推断客户端格式
+      const clientFormat = apiPathToClientFormat(apiPath)!;
+
+      // 复用完整的代理请求处理
+      await this.handleApiPathProxyRequest(req, res, route, clientFormat, apiPath);
+    });
+
+    // Dynamic proxy middleware (原有的 /claude-code, /codex 逻辑)
     this.app.use(async (req: Request, res: Response, next: NextFunction) => {
       // 仅处理支持的目标路径
       if (!SUPPORTED_TARGETS.some(target => req.path.startsWith(`/${target}/`))) {
@@ -4125,5 +4223,553 @@ export class ProxyServer {
   async registerProxyRoutes() {
     this.addProxyRoutes();
     await this.reloadRoutes();
+  }
+
+  // ============================================================
+  // 标准 API 路径代理请求处理
+  // ============================================================
+
+  /**
+   * 处理通过标准 API 路径（/v1/messages, /v1/responses 等）进入的代理请求。
+   * 与原有 proxyRequest 逻辑独立，复用规则匹配、故障切换等机制。
+   */
+  private async handleApiPathProxyRequest(
+    req: Request,
+    res: Response,
+    route: Route,
+    clientFormat: Format,
+    apiPath: ApiPath
+  ) {
+    const requestStartAt = Date.now();
+
+    // 鉴权
+    if (this.config.apiKey) {
+      const authHeader = req.headers.authorization;
+      const providedKey = authHeader?.replace('Bearer ', '');
+      if (!providedKey || providedKey !== this.config.apiKey) {
+        await this.logToolRequest(req, {
+          statusCode: 401,
+          responseTime: Date.now() - requestStartAt,
+          error: 'Invalid API key',
+          tags: this.buildRelayTags(false),
+        });
+        // 根据客户端格式返回错误
+        if (clientFormat === 'claude') {
+          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
+        } else {
+          res.status(401).json({ error: { message: 'Invalid API key' } });
+        }
+        return;
+      }
+    }
+
+    const enableFailover = this.config?.enableFailover !== false;
+
+    if (!enableFailover) {
+      const rule = await this.findMatchingRule(route.id, req);
+      if (!rule) {
+        return res.status(404).json({ error: { message: 'No matching rule found' } });
+      }
+      const service = this.getServiceById(rule.targetServiceId);
+      if (!service) {
+        return res.status(500).json({ error: { message: 'Target service not configured' } });
+      }
+      try {
+        await this.proxyRequestForApiPath(req, res, route, rule, service, clientFormat, apiPath);
+      } catch (error: any) {
+        console.error('[ApiPathProxy] Error:', error.message);
+        this.sendFormatError(res, clientFormat, 500, error.message);
+      }
+      return;
+    }
+
+    // 故障切换模式
+    const allRules = this.getAllMatchingRules(route.id, req);
+    if (allRules.length === 0) {
+      return res.status(404).json({ error: { message: 'No matching rule found' } });
+    }
+
+    let lastError: Error | null = null;
+    let lastFailedRule: Rule | null = null;
+    let lastFailedService: APIService | null = null;
+
+    for (let i = 0; i < allRules.length; i++) {
+      const rule = allRules[i];
+      const service = this.getServiceById(rule.targetServiceId);
+      if (!service) continue;
+
+      const isBlacklisted = await this.dbManager.isServiceBlacklisted(
+        service.id, route.id, rule.contentType
+      );
+      if (isBlacklisted) {
+        console.log(`[ApiPathProxy] Service ${service.name} is blacklisted, skipping...`);
+        continue;
+      }
+
+      try {
+        const nextServiceName = await this.findNextAvailableServiceName(allRules, i + 1, route.id);
+        await this.proxyRequestForApiPath(req, res, route, rule, service, clientFormat, apiPath, {
+          failoverEnabled: true,
+          forwardedToServiceName: nextServiceName,
+        });
+        return;
+      } catch (error: any) {
+        console.error(`[ApiPathProxy] Service ${service.name} failed:`, error.message);
+        lastError = error;
+        lastFailedRule = rule;
+        lastFailedService = service;
+
+        const isTimeout = error.code === 'ECONNABORTED' ||
+          error.message?.toLowerCase().includes('timeout') ||
+          error.errno === 'ETIMEDOUT';
+
+        if (isTimeout) {
+          await this.dbManager.addToBlacklist(service.id, route.id, rule.contentType,
+            'Request timeout', undefined, 'timeout');
+          rulesStatusBroadcaster.markRuleSuspended(route.id, rule.id, service.id, rule.contentType,
+            '请求超时', 'timeout');
+        } else {
+          const statusCode = this.getErrorStatusCode(error, 500);
+          if (statusCode >= 400) {
+            await this.dbManager.addToBlacklist(service.id, route.id, rule.contentType,
+              error.message, statusCode, 'http');
+            rulesStatusBroadcaster.markRuleSuspended(route.id, rule.id, service.id, rule.contentType,
+              `HTTP ${statusCode} 错误`, 'http');
+          }
+        }
+        continue;
+      }
+    }
+
+    // Fallback: try the last failed service
+    if (lastFailedRule && lastFailedService) {
+      try {
+        await this.proxyRequestForApiPath(req, res, route, lastFailedRule, lastFailedService, clientFormat, apiPath, {
+          failoverEnabled: false,
+        });
+        return;
+      } catch (fallbackError: any) {
+        lastError = fallbackError;
+      }
+    }
+
+    await this.logToolRequest(req, {
+      statusCode: 503,
+      responseTime: Date.now() - requestStartAt,
+      error: lastError?.message || 'All services failed',
+      tags: this.buildRelayTags(true),
+    });
+
+    this.sendFormatError(res, clientFormat, 503, lastError?.message || 'All services failed');
+  }
+
+  /**
+   * 对单个规则执行代理请求（标准 API 路径入口）。
+   * 与原有 proxyRequest 类似，但使用 clientFormat 而非 targetType 推断格式。
+   */
+  private async proxyRequestForApiPath(
+    req: Request,
+    res: Response,
+    route: Route,
+    rule: Rule,
+    service: APIService,
+    clientFormat: Format,
+    apiPath: ApiPath,
+    options?: ProxyRequestOptions
+  ) {
+    const startTime = Date.now();
+    const rawSourceType = service.sourceType || 'openai-chat';
+    const sourceType = normalizeSourceType(rawSourceType);
+
+    const vendor = this.dbManager.getVendorByServiceId(service.id);
+    console.log(`\x1b[32m[ApiPathProxy]\x1b[0m path=${apiPath}, clientFormat=${clientFormat}, session=-, rule=${rule.id}(${rule.contentType}), vendor=${vendor?.name || '-'}, service=${service.name}`);
+
+    const failoverEnabled = options?.failoverEnabled === true;
+
+    let requestBody: any = this.cloneRequestBody(req.body || {});
+    let usageForLog: TokenUsage | undefined;
+    let responseBodyForLog: string | undefined;
+    let downstreamResponseBodyForLog: string | undefined;
+    let streamChunksForLog: string[] | undefined;
+    let responseHeadersForLog: Record<string, string> | undefined;
+    let upstreamRequestForLog: any;
+    let relayedForLog = true;
+    void downstreamResponseBodyForLog; void streamChunksForLog; void responseHeadersForLog; void upstreamRequestForLog;
+
+    // Compact 处理（针对 claude 格式的 compact）
+    if (rule.contentType === 'compact' && clientFormat === 'claude') {
+      if (Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+    }
+
+    const finalizeLog = async (statusCode: number, error?: string) => {
+      if (logged) return;
+      logged = true;
+
+      await this.logToolRequest(req, {
+        statusCode,
+        responseTime: Date.now() - startTime,
+        usage: usageForLog,
+        error,
+        tags: this.buildRelayTags(relayedForLog),
+      });
+    };
+    let logged = false;
+
+    // count_tokens 本地处理
+    if (this.isCountTokensPath(req.path)) {
+      const inputTokens = this.estimateClaudeCountTokens(requestBody);
+      const localTokenResponse = { input_tokens: inputTokens };
+      usageForLog = { inputTokens, outputTokens: 0, totalTokens: inputTokens };
+      res.status(200).json(localTokenResponse);
+      await finalizeLog(200);
+      return;
+    }
+
+    // 请求转换：使用 clientFormat 而非硬编码的 tool→format 映射
+    const payloadForTransform = this.cloneRequestBody(requestBody);
+    const effectiveApiUrl = this.resolveEffectiveApiUrl(service);
+    const effectiveModel = rule.targetModel || requestBody?.model;
+    const providerConfig = getReasoningConfig(service.name || '', effectiveApiUrl || '', effectiveModel || '');
+
+    const transformedRequestBody = this.transformRequestByFormat(clientFormat, sourceType, payloadForTransform, rule.targetModel as string, providerConfig);
+    requestBody = transformedRequestBody ?? this.cloneRequestBody(requestBody) ?? {};
+
+    // Compact final sanitize
+    if (rule.contentType === 'compact' && clientFormat === 'claude' && Array.isArray(requestBody?.messages)) {
+      requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+      if (this.isClaudeSource(sourceType)) {
+        requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+    }
+
+    // 应用 max_output_tokens 限制
+    requestBody = this.applyMaxOutputTokensLimit(requestBody, service);
+
+    // Stream 判断
+    const streamRequested = this.isStreamRequested(req, requestBody);
+
+    // 构建上游 URL
+    const model = rule.targetModel || requestBody?.model;
+    const apiUrl = this.resolveEffectiveApiUrl(service);
+    const upstreamUrl = this.mapApiPathToUpstreamUrl(apiPath, sourceType, apiUrl, model, streamRequested);
+
+    upstreamRequestForLog = { url: upstreamUrl, body: requestBody || undefined };
+
+    const upstreamHeaders = this.buildUpstreamHeaders(req, service, sourceType, streamRequested, requestBody);
+
+    const upstreamAbortController = new AbortController();
+    const abortUpstreamRequest = (reason: string) => {
+      if (!upstreamAbortController.signal.aborted) {
+        upstreamAbortController.abort(new Error(`Client disconnected: ${reason}`));
+      }
+    };
+    req.once('aborted', () => abortUpstreamRequest('request aborted'));
+    res.once('close', () => {
+      if (!res.writableEnded) abortUpstreamRequest('response stream closed');
+    });
+
+    try {
+      const axiosConfig: AxiosRequestConfig = {
+        method: req.method as any,
+        url: upstreamUrl,
+        headers: upstreamHeaders,
+        timeout: this.resolveEffectiveTimeout(rule),
+        validateStatus: () => true,
+        responseType: streamRequested ? 'stream' : 'json',
+        signal: upstreamAbortController.signal,
+      };
+      if (Object.keys(req.query).length > 0) {
+        axiosConfig.params = req.query;
+      }
+      if (['POST', 'PUT', 'PATCH'].includes(req.method.toUpperCase())) {
+        axiosConfig.data = requestBody;
+      }
+
+      // 代理配置
+      if (service.enableProxy) {
+        const appConfig = this.dbManager.getConfig();
+        if (appConfig.proxyEnabled && appConfig.proxyUrl) {
+          try {
+            const { HttpsProxyAgent } = await import('https-proxy-agent');
+            let proxyUrl = appConfig.proxyUrl;
+            const proxyAuth = appConfig.proxyUsername && appConfig.proxyPassword
+              ? `${appConfig.proxyUsername}:${appConfig.proxyPassword}@` : '';
+            if (!proxyUrl.startsWith('http://') && !proxyUrl.startsWith('https://')) {
+              proxyUrl = `http://${proxyAuth}${proxyUrl}`;
+            } else if (proxyAuth) {
+              const urlObj = new URL(proxyUrl);
+              urlObj.username = appConfig.proxyUsername!;
+              urlObj.password = appConfig.proxyPassword!;
+              proxyUrl = urlObj.toString();
+            }
+            axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
+            axiosConfig.httpAgent = new HttpsProxyAgent(proxyUrl);
+          } catch (error) {
+            console.error('[ApiPathProxy] Failed to create proxy agent:', error);
+          }
+        }
+      }
+
+      const response = await axios(axiosConfig);
+      const responseHeaders = response.headers || {};
+      const contentType = typeof responseHeaders['content-type'] === 'string' ? responseHeaders['content-type'] : '';
+      const isEventStream = streamRequested && contentType.includes('text/event-stream');
+
+      // Handle upstream errors
+      if (response.status >= 400) {
+        let errorResponseData = response.data;
+        if (streamRequested && response.data && typeof response.data.on === 'function') {
+          const raw = await this.readStreamBody(response.data);
+          errorResponseData = this.safeJsonParse(raw) ?? raw;
+        }
+        responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+        const errorMessage = typeof errorResponseData === 'string'
+          ? errorResponseData
+          : errorResponseData?.error?.message || errorResponseData?.error || JSON.stringify(errorResponseData);
+
+        if (failoverEnabled) {
+          await finalizeLog(response.status, errorMessage);
+          throw this.createFailoverError(errorMessage, response.status);
+        }
+
+        this.copyResponseHeaders(responseHeaders, res);
+        if (contentType.includes('application/json')) {
+          res.status(response.status).json(errorResponseData);
+        } else {
+          res.status(response.status).send(errorResponseData);
+        }
+        await finalizeLog(response.status);
+        return;
+      }
+
+      if (isEventStream && response.data) {
+        // Stream pipeline
+        const parser = new SSEParserTransform();
+        const eventCollector = new SSEEventCollectorTransform();
+        const serializer = new SSESerializerTransform();
+        const downstreamChunkCollector = new ChunkCollectorTransform();
+        responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+        const { converter, extractUsage } = this.transformSSEByFormat(clientFormat, sourceType);
+        this.copyResponseHeaders(responseHeaders, res);
+        res.status(response.status);
+
+        const finalizeStreamChunks = () => {
+          streamChunksForLog = eventCollector.getChunks();
+          responseBodyForLog = streamChunksForLog.join('\n');
+          downstreamResponseBodyForLog = downstreamChunkCollector.getChunks().join('');
+          let extractedUsage = eventCollector.extractUsage();
+          if (converter && typeof (converter as any).getUsage === 'function') {
+            const converterUsage = (converter as any).getUsage();
+            if (converterUsage) extractedUsage = converterUsage;
+          }
+          if (extractUsage && extractedUsage) {
+            usageForLog = extractUsage(extractedUsage);
+          } else if (extractedUsage) {
+            usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
+          }
+        };
+
+        try {
+          await new Promise<void>((resolve, reject) => {
+            if (converter) {
+              pipeline(response.data, parser, eventCollector, converter, serializer, downstreamChunkCollector, res, (error: any) => {
+                if (error) { reject(error); return; }
+                resolve();
+              });
+            } else {
+              pipeline(response.data, parser, eventCollector, serializer, downstreamChunkCollector, res, (error: any) => {
+                if (error) { reject(error); return; }
+                resolve();
+              });
+            }
+          });
+        } catch (error: any) {
+          if (this.isClientDisconnectError(error, res)) {
+            await finalizeLog(499, 'Client disconnected');
+            return;
+          }
+          console.error('[ApiPathProxy] Stream pipeline error:', error);
+          await finalizeLog(500, error.message);
+          if (failoverEnabled && !this.isResponseCommitted(res)) {
+            throw this.createFailoverError(error.message, 500, error);
+          }
+          return;
+        }
+
+        finalizeStreamChunks();
+        await finalizeLog(res.statusCode);
+        return;
+      }
+
+      // Non-stream response
+      let responseData = response.data;
+      if (streamRequested && response.data && typeof response.data.on === 'function' && !isEventStream) {
+        const raw = await this.readStreamBody(response.data);
+        responseData = this.safeJsonParse(raw) ?? raw;
+      }
+
+      responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+      if (this.isEmptyResponse(responseData)) {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        await finalizeLog(200);
+        res.status(200).end();
+        return;
+      }
+
+      // 使用 clientFormat 做响应转换
+      const converted = this.transformResponseByFormat(sourceType, clientFormat, responseData);
+      const normalizedConverted = rule.contentType === 'compact' && clientFormat === 'claude'
+        ? stripClaudeCompactResponseContent(converted)
+        : converted;
+
+      usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
+      this.copyResponseHeaders(responseHeaders, res);
+
+      if (normalizedConverted && normalizedConverted !== responseData) {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        downstreamResponseBodyForLog = JSON.stringify(normalizedConverted);
+        res.status(response.status).json(normalizedConverted);
+      } else {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        downstreamResponseBodyForLog = responseBodyForLog;
+        if (contentType.includes('application/json')) {
+          res.status(response.status).json(responseData);
+        } else {
+          res.status(response.status).send(responseData);
+        }
+      }
+
+      await finalizeLog(res.statusCode);
+    } finally {
+      rulesStatusBroadcaster.markRuleIdle(route.id, rule.id);
+    }
+  }
+
+  /**
+   * 使用显式 clientFormat 进行请求转换（取代 tool → format 的硬编码映射）
+   */
+  private transformRequestByFormat(clientFormat: Format, source: SourceType, payloadData: any, targetModel: string, providerConfig?: any): any {
+    const upstreamFormat = sourceTypeToFormat(source);
+    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData, providerConfig });
+    const body = result.body;
+    if (targetModel) {
+      const isOpenAIModel = /^gpt-|o[123]/i.test(targetModel);
+      if (!isOpenAIModel) {
+        body.model = targetModel;
+      }
+    }
+    return body;
+  }
+
+  /**
+   * 使用显式格式进行响应转换
+   */
+  private transformResponseByFormat(upstreamFormat: SourceType, clientFormat: Format, responseData: any): any {
+    const upstream = sourceTypeToFormat(upstreamFormat);
+    return convertResponse({ fromFormat: upstream, toFormat: clientFormat, response: responseData });
+  }
+
+  /**
+   * 使用显式格式进行流式转换
+   */
+  private transformSSEByFormat(clientFormat: Format, sourceType: SourceType): {
+    converter: Transform | null;
+    extractUsage?: (usage: any) => any;
+  } {
+    const upstreamFormat = sourceTypeToFormat(sourceType);
+    if (upstreamFormat === clientFormat) {
+      return { converter: null };
+    }
+    const streamConverter = createStreamConverter({ fromFormat: upstreamFormat, toFormat: clientFormat });
+    const adapter = new StreamConverterAdapter(streamConverter);
+
+    const extractUsage = clientFormat === 'claude'
+      ? (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+        })
+      : (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
+        });
+
+    return { converter: adapter, extractUsage };
+  }
+
+  /**
+   * 为标准 API 路径构建上游 URL
+   */
+  private mapApiPathToUpstreamUrl(_apiPath: ApiPath, source: SourceType, apiUrl: string, modelName: string, isStream: boolean): string {
+    const geminiEndpoint = isStream ? 'streamGenerateContent' : 'generateContent';
+    const buildGeminiUrl = (url: string) => {
+      if (url.includes('streamGenerateContent')) {
+        const [pathname, search] = url.split('?');
+        if (search?.includes('alt=sse')) return url;
+        if (search) return `${pathname}?${search}&alt=sse`;
+        return `${pathname}?alt=sse`;
+      }
+      return url;
+    };
+
+    // Gemini chat 类型：URL 中包含 {modelName} 和 {endPoint} 占位符
+    if (this.isGeminiChatSource(source)) {
+      const url = apiUrl.replace('{modelName}', modelName).replace('{endPoint}', geminiEndpoint);
+      return buildGeminiUrl(url);
+    }
+
+    // Chat 类型（openai-chat, claude-chat）：直接使用 apiUrl
+    if (this.isChatType(source)) {
+      return apiUrl;
+    }
+
+    // Gemini base 类型
+    if (this.isGeminiSource(source)) {
+      const url = `${apiUrl}/v1beta/models/${modelName}:${geminiEndpoint}`;
+      return buildGeminiUrl(url);
+    }
+
+    // 对于标准 API 路径，直接根据上游格式拼接
+    const upstreamFormat = sourceTypeToFormat(source);
+    switch (upstreamFormat) {
+      case 'claude':
+        return `${apiUrl}/v1/messages`;
+      case 'responses':
+        return `${apiUrl}/v1/responses`;
+      case 'completions':
+        return `${apiUrl}/v1/chat/completions`;
+      case 'gemini':
+        return `${apiUrl}/v1beta/models/${modelName}:${geminiEndpoint}`;
+      default:
+        return apiUrl;
+    }
+  }
+
+  /**
+   * 根据客户端格式发送错误响应
+   */
+  private sendFormatError(res: Response, clientFormat: Format, statusCode: number, message: string) {
+    if (this.isResponseCommitted(res)) return;
+    switch (clientFormat) {
+      case 'claude':
+        res.status(statusCode).json({ type: 'error', error: { type: 'api_error', message } });
+        break;
+      case 'gemini':
+        res.status(statusCode).json({ error: { code: statusCode, message } });
+        break;
+      default:
+        res.status(statusCode).json({ error: { message } });
+    }
   }
 }

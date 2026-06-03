@@ -254,6 +254,7 @@ export interface AppConfig {
   proxyUrl?: string;  // 代理地址，例如: proxy.example.com:8080
   proxyUsername?: string;  // 代理认证用户名
   proxyPassword?: string;  // 代理认证密码
+  // API 路径路由映射
 }
 
 export interface ExportData {
@@ -489,4 +490,18 @@ export interface ConfigFileState {
   backupHash?: string;
   hasUnmanagedChanges?: boolean;
   managedFieldsChanged?: boolean;
+}
+
+/** 标准 API 路径枚举 */
+export type ApiPath =
+  | '/v1/messages'
+  | '/v1/responses'
+  | '/v1/chat/completions'
+  | '/v1beta/models'
+  | '/v1/models';
+
+/** 路径与路由的绑定关系 */
+export interface ApiPathBinding {
+  apiPath: ApiPath;
+  routeId: string | null;
 }

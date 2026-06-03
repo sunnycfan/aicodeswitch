@@ -21,6 +21,7 @@ import type {
   TargetType,
   CodexReasoningEffort,
   ClaudeEffortLevel,
+  ApiPathBinding,
 } from '../types';
 import { migrateSourceType, isLegacySourceType, normalizeSourceType } from './type-migration';
 
@@ -87,6 +88,8 @@ export class FileSystemDatabaseManager {
   private errorLogs: ErrorLog[] = [];
   private blacklist: Map<string, ServiceBlacklistEntry> = new Map();
   private mcps: MCPServer[] = [];
+  private apiPathBindingsData: ApiPathBinding[] = [];
+  private apiPathModelsData = '';
 
   // 持久化统计数据
   private statistics: Statistics = this.createEmptyStatistics();
@@ -120,6 +123,7 @@ export class FileSystemDatabaseManager {
   private get blacklistFile() { return path.join(this.dataPath, 'blacklist.json'); }
   private get statisticsFile() { return path.join(this.dataPath, 'statistics.json'); }
   private get mcpFile() { return path.join(this.dataPath, 'mcps.json'); }
+  private get apiPathBindingsFile() { return path.join(this.dataPath, 'api-path-bindings.json'); }
 
   // 创建空的统计数据结构
   private createEmptyStatistics(): Statistics {
@@ -183,6 +187,7 @@ export class FileSystemDatabaseManager {
       this.loadBlacklist(),
       this.loadStatistics(),
       this.loadMCPs(),
+      this.loadApiPathBindings(),
     ]);
 
     // 会话日志索引依赖 logShardsIndex，必须在 loadLogsIndex 之后
@@ -951,6 +956,49 @@ export class FileSystemDatabaseManager {
     }
   }
 
+  private async loadApiPathBindings() {
+    const defaults: ApiPathBinding[] = [
+      { apiPath: '/v1/messages', routeId: null },
+      { apiPath: '/v1/responses', routeId: null },
+      { apiPath: '/v1/chat/completions', routeId: null },
+      { apiPath: '/v1beta/models', routeId: null },
+      { apiPath: '/v1/models', routeId: null },
+    ];
+    try {
+      const data = await fs.readFile(this.apiPathBindingsFile, 'utf-8');
+      const parsed = JSON.parse(data);
+      this.apiPathBindingsData = parsed.bindings || defaults;
+      this.apiPathModelsData = parsed.models || '';
+    } catch {
+      this.apiPathBindingsData = defaults;
+      this.apiPathModelsData = '';
+      await this.saveApiPathBindings();
+    }
+  }
+
+  private async saveApiPathBindings() {
+    await fs.writeFile(this.apiPathBindingsFile, JSON.stringify({
+      bindings: this.apiPathBindingsData,
+      models: this.apiPathModelsData,
+    }, null, 2));
+  }
+
+  getApiPathBindings(): ApiPathBinding[] {
+    return this.apiPathBindingsData;
+  }
+
+  getApiPathModels(): string {
+    return this.apiPathModelsData;
+  }
+
+  async updateApiPathBindings(bindings: ApiPathBinding[], models?: string): Promise<void> {
+    this.apiPathBindingsData = bindings;
+    if (models !== undefined) {
+      this.apiPathModelsData = models;
+    }
+    await this.saveApiPathBindings();
+  }
+
   private async saveMCPs() {
     await fs.writeFile(this.mcpFile, JSON.stringify(this.mcps, null, 2));
   }
@@ -977,6 +1025,9 @@ export class FileSystemDatabaseManager {
       proxyUsername: '',
       proxyPassword: '',
     };
+
+
+
 
     // spread: current 覆盖 defaults，未来新增字段自动保留
     this.config = { ...defaults, ...current };

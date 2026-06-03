@@ -2156,6 +2156,42 @@ ${instruction}
     res.json(status);
   });
 
+  // API 路径路由映射
+  app.get('/api/api-path-bindings', (_req, res) => {
+    res.json({ bindings: dbManager.getApiPathBindings(), models: dbManager.getApiPathModels() });
+  });
+
+  app.put('/api/api-path-bindings', asyncHandler(async (req, res) => {
+    const { bindings } = req.body as { bindings: Array<{ apiPath: string; routeId: string | null }> };
+    const VALID_API_PATHS = ['/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1beta/models', '/v1/models'];
+    const routes = dbManager.getRoutes();
+    const routeIds = new Set(routes.map((r: any) => r.id));
+
+    // Validate
+    for (const b of bindings) {
+      if (!VALID_API_PATHS.includes(b.apiPath)) {
+        res.status(400).json({ error: `Invalid apiPath: ${b.apiPath}` });
+        return;
+      }
+      if (b.routeId !== null && !routeIds.has(b.routeId)) {
+        res.status(400).json({ error: `Route not found: ${b.routeId}` });
+        return;
+      }
+      // /v1/models does not accept route binding
+      if (b.apiPath === '/v1/models' && b.routeId !== null) {
+        res.status(400).json({ error: '/v1/models does not accept route binding' });
+        return;
+      }
+    }
+
+    const { models } = req.body as { models?: string };
+    await dbManager.updateApiPathBindings(
+      bindings.map(b => ({ apiPath: b.apiPath as any, routeId: b.routeId })),
+      models,
+    );
+    res.json({ success: true, bindings: dbManager.getApiPathBindings(), models: dbManager.getApiPathModels() });
+  }));
+
   app.post(
     '/api/export',
     asyncHandler(async (req, res) => {

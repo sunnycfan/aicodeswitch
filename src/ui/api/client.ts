@@ -1,4 +1,4 @@
-import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort } from '../../types';
+import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort, ApiPathBinding } from '../../types';
 
 interface BackendAPI {
   // 鉴权相关
@@ -144,6 +144,10 @@ interface BackendAPI {
   createMCP: (mcp: MCPInstallRequest) => Promise<MCPServer>;
   updateMCP: (id: string, mcp: Partial<MCPServer>) => Promise<boolean>;
   deleteMCP: (id: string) => Promise<boolean>;
+
+  // API 路径路由映射
+  getApiPathBindings: () => Promise<{ bindings: ApiPathBinding[]; models: string }>;
+  updateApiPathBindings: (bindings: ApiPathBinding[], models?: string) => Promise<{ success: boolean; bindings: ApiPathBinding[] }>;
 }
 
 const buildUrl = (
@@ -392,6 +396,14 @@ export const api: BackendAPI = {
   deleteMCP: (id: string) => requestJson<boolean>(buildUrl(`/api/mcps/${id}`), {
     method: 'DELETE'
   }),
+  // API 路径路由映射
+  getApiPathBindings: () => requestJson(buildUrl('/api/api-path-bindings')),
+  updateApiPathBindings: (bindings: ApiPathBinding[], models?: string) =>
+    requestJson(buildUrl('/api/api-path-bindings'), {
+      method: 'PUT',
+      body: JSON.stringify({ bindings, models }),
+    }),
+
   installTool: (tool, callbacks) => {
     console.log('[API Client] 开始安装工具:', tool);
 

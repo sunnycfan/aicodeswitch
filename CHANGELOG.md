@@ -1,3 +1,20 @@
+## 2026-06-04: 样式优化
+
+### 优化
+- **API 路径路由映射样式重构**: 优化路由映射区域的选择、输入样式，增加卡片行设计、路径徽章、状态指示灯、自定义下拉箭头等视觉元素，提升界面高级感。
+
+## 2026-06-03: API 路径路由映射
+
+### 新增功能
+- **标准 API 路径支持**: 新增 5 个标准 API 路径入口（`/v1/messages`、`/v1/responses`、`/v1/chat/completions`、`/v1beta/models/*`、`/v1/models`），任何兼容标准 API 的编程工具都可以直接接入。
+- **路由映射板块**: 在"路由管理"页面顶部新增"路由映射"配置区，用户可以为每个 API 路径绑定一个已创建的路由。
+- **`/v1/models` 静态模型列表**: 自动返回写死的主流模型列表，无需绑定路由。
+- **日志记录**: 通过标准 API 路径接入的请求正常记录日志，不包含"客户端类型"信息（前端显示为 `-`）。
+
+### 兼容性
+- 现有 `/claude-code` 和 `/codex` 路径的所有行为完全不变。
+- 新功能为增量添加，不影响任何现有数据结构和 API。
+
 # Changelog
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.

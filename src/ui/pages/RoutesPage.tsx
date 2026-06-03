@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
-import type { Route, Rule, APIService, ContentType, Vendor, ServiceBlacklistEntry, MCPServer, ToolInstallationStatus, CodexReasoningEffort, ClaudeEffortLevel, AppConfig } from '../../types';
+import type { Route, Rule, APIService, ContentType, Vendor, ServiceBlacklistEntry, MCPServer, ToolInstallationStatus, CodexReasoningEffort, ClaudeEffortLevel, AppConfig, ApiPathBinding } from '../../types';
 import { useFlipAnimation } from '../hooks/useFlipAnimation';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
@@ -101,6 +101,9 @@ export default function RoutesPage() {
   const [services, setServices] = useState<APIService[]>([]);
   const [mcps, setMCPs] = useState<MCPServer[]>([]);
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+  const [apiPathBindings, setApiPathBindings] = useState<ApiPathBinding[]>([]);
+  const [isSavingBindings, setIsSavingBindings] = useState(false);
+  const [apiPathModels, setApiPathModels] = useState('');
   const [selectedRoute, setSelectedRoute] = useState<Route | null>(null);
   const [showRouteModal, setShowRouteModal] = useState(false);
   const [showRuleModal, setShowRuleModal] = useState(false);
@@ -168,8 +171,39 @@ export default function RoutesPage() {
     loadAllServices();
     loadMCPs();
     loadAppConfig();
+    loadApiPathBindings();
     checkClaudeVersion();
   }, []);
+
+
+  const loadApiPathBindings = async () => {
+    try {
+      const result = await api.getApiPathBindings();
+      setApiPathBindings(result.bindings || []);
+      setApiPathModels(result.models || '');
+    } catch (error) {
+      console.error('Failed to load API path bindings:', error);
+    }
+  };
+
+  const handleSaveBindings = async () => {
+    setIsSavingBindings(true);
+    try {
+      const result = await api.updateApiPathBindings(apiPathBindings, apiPathModels);
+      setApiPathBindings(result.bindings);
+      toast.success('路由映射已保存');
+    } catch (error: any) {
+      toast.error(error.message || '保存失败');
+    } finally {
+      setIsSavingBindings(false);
+    }
+  };
+
+  const handleBindingChange = (apiPath: string, routeId: string | null) => {
+    setApiPathBindings(prev =>
+      prev.map(b => b.apiPath === apiPath ? { ...b, routeId } : b)
+    );
+  };
 
   // 添加页面刷新保护
   useEffect(() => {
@@ -987,6 +1021,63 @@ export default function RoutesPage() {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column' }}>
+        {/* API 路径路由映射 */}
+        <div className="card api-binding-card" style={{ marginBottom: 20 }}>
+          <div className="api-binding-header">
+            <span className="api-binding-header-icon">⚡</span>
+            <h3>API 路径路由映射</h3>
+          </div>
+          <p className="api-binding-desc">
+            将标准 API 路径绑定到路由，使任何兼容该 API 的编程工具都可以通过对应路径使用服务。
+          </p>
+          <div className="api-binding-list">
+            {apiPathBindings.map(binding => {
+              const isModelsPath = binding.apiPath === '/v1/models';
+              const isBound = isModelsPath ? !!apiPathModels.trim() : !!binding.routeId;
+              return (
+                <div key={binding.apiPath} className="api-binding-row">
+                  <span className={`api-binding-status ${isBound ? 'api-binding-status--bound' : ''}`} />
+                  <span className={`api-binding-path ${isModelsPath ? 'api-binding-path--disabled' : ''}`}>
+                    {binding.apiPath === '/v1beta/models' ? '/v1beta/models/{model}:{action}' : binding.apiPath}
+                  </span>
+                  <span className="api-binding-arrow">→</span>
+                  <div className="api-binding-control">
+                    {isModelsPath ? (
+                      <input
+                        type="text"
+                        value={apiPathModels}
+                        onChange={(e) => setApiPathModels(e.target.value)}
+                        placeholder="自定义模型列表，英文逗号分隔，留空使用默认列表"
+                      />
+                    ) : (
+                      <select
+                        value={binding.routeId || ''}
+                        onChange={(e) => handleBindingChange(binding.apiPath, e.target.value || null)}
+                      >
+                        <option value="">无</option>
+                        {routes.map(r => (
+                          <option key={r.id} value={r.id}>
+                            {r.name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="api-binding-footer">
+            <button
+              className="btn btn-primary api-binding-save-btn"
+              onClick={handleSaveBindings}
+              disabled={isSavingBindings}
+            >
+              {isSavingBindings ? '⟳ 保存中...' : '✓ 保存映射'}
+            </button>
+          </div>
+        </div>
+
         <div style={{ display: 'flex', gap: '20px' }}>
           <div className="card" style={{ flex: '0 0 25%', minWidth: 300 }}>
             <div className="toolbar">
