@@ -2,7 +2,10 @@
  * OpenAI Chat Completions SSE → OpenAI Responses API SSE streaming conversion.
  *
  * Stateful converter that translates Chat Completions SSE events into
- * OpenAI Responses API SSE events.
+ * OpenAI Responses API SSE events, following the official Responses API spec.
+ *
+ * Reasoning content (reasoning_content) is emitted as standard `reasoning`
+ * output items with `response.reasoning_summary_text.delta` events.
  */
 
 import type { SSEEvent, StreamConverter } from '../../types.js';
@@ -71,7 +74,7 @@ export class CompletionsToResponsesConverter implements StreamConverter {
         this.started = true;
       }
 
-      // --- reasoning_content ---
+      // --- reasoning_content -> standard reasoning output item ---
       if (delta?.reasoning_content) {
         this.pendingReasoningText += delta.reasoning_content;
 
@@ -90,8 +93,10 @@ export class CompletionsToResponsesConverter implements StreamConverter {
           this.reasoningStarted = true;
         }
 
-        events.push(this.makeSSE('response.reasoning.delta', {
+        // Emit using official standard event name
+        events.push(this.makeSSE('response.reasoning_summary_text.delta', {
           output_index: this.reasoningOutputIndex,
+          summary_index: 0,
           delta: delta.reasoning_content,
         }));
       }

@@ -2,6 +2,8 @@
  * OpenAI Chat Completions → OpenAI Responses API response conversion.
  *
  * Converts a Chat Completions response body into an OpenAI Responses API response body.
+ * Reasoning content (reasoning_content) is converted to a standard `reasoning` output
+ * item following the official Responses API specification.
  */
 
 import {
@@ -19,7 +21,7 @@ export function completionsToResponsesResponse(response: any): any {
 
   const output: any[] = [];
 
-  // reasoning_content -> reasoning item
+  // reasoning_content -> reasoning output item (official Responses API format)
   if (choice.message?.reasoning_content) {
     output.push({
       type: 'reasoning',

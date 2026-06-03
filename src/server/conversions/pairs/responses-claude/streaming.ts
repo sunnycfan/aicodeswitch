@@ -115,7 +115,7 @@ export class ClaudeToResponsesConverter implements StreamConverter {
             const text = delta.thinking || '';
             if (text) {
               this.reasoningText += text;
-              events.push(this.makeSSE('response.reasoning.delta', {
+              events.push(this.makeSSE('response.reasoning_summary_text.delta', {
                 output_index: this.output.length,
                 delta: text,
               }));

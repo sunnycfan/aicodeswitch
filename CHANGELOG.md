@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file. See [standa
 
 ### 2026-06-03
 
+#### Fix
+* **Codex + Completions 上游 reasoning_content 输出优化**：将 completions → responses 转换对中的 `reasoning_content` 按 Responses API 官方标准格式输出为 `{ type: 'reasoning', summary: [...] }` 输出项，流式事件使用标准 `response.reasoning_summary_text.delta` 事件名，确保 Codex 正确识别推理内容。同步更新 `responses-claude` 流式转换器的事件名为标准名称。
+
 #### Refactor
 * **移除 DeepSeek 独立类型，合并到 OpenAI-Chat/Completions**：将 `deepseek-reasoning-chat` SourceType 和 `deepseek` Format 移除，合并到 `openai-chat`/`completions`。激活 `thinking/providers.ts` 中的 `getReasoningConfig`/`applyReasoningConfig` 系统，通过 provider config 驱动 request body 后处理（thinking 参数注入、reasoning 历史修复、stream_options 剥离）。删除 8 个 DeepSeek pair 目录（24 文件）。启动时 migration 自动将已有 `deepseek-reasoning-chat` 服务转为 `openai-chat`。Streaming/Response 转换无需改动（completions converter 已完整覆盖 `reasoning_content` 处理）。
 
