@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-04: 启动优化 - 延迟日志分片维护
+
+### 变更
+- 将启动时的日志分片一致性校验（verifyShardIndexConsistency）、损坏修复、旧日志清理改为服务启动后异步执行
+- 将会话日志索引全量构建（buildSessionLogIndex）改为服务启动后异步执行
+- 新增 `deferredMaintenance()` 方法，在 HTTP 服务器启动后 fire-and-forget 调用
+- 启动速度显著提升，不再因大量日志分片的 IO 操作阻塞
+
 ## 2026-06-04: 路由激活交互重构
 
 ### 新增

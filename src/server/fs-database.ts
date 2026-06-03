@@ -105,6 +105,10 @@ export class FileSystemDatabaseManager {
   // 分片写入锁：防止并发读写同一个分片文件导致数据损坏
   private shardWriteLocks: Map<string, Promise<void>> = new Map();
 
+  // 延迟维护标记：启动时跳过耗时操作，后台异步执行
+  private _needsShardVerification = false;
+  private _needsSessionLogIndexBuild = false;
+
   // 缓存机制
   private logsCountCache: { count: number; timestamp: number } | null = null;
   private errorLogsCountCache: { count: number; timestamp: number } | null = null;
@@ -182,6 +186,41 @@ export class FileSystemDatabaseManager {
     await this.ensureDefaultConfig();
   }
 
+  /**
+   * 执行延迟的维护任务（启动后异步执行，不阻塞服务启动）
+   * 包括：分片一致性校验、损坏修复、旧日志清理、会话索引构建
+   */
+  async deferredMaintenance(): Promise<void> {
+    const tasks: Promise<void>[] = [];
+
+    if (this._needsShardVerification) {
+      this._needsShardVerification = false;
+      tasks.push((async () => {
+        try {
+          await this.verifyShardIndexConsistency();
+          await this.cleanupOldLogShards();
+          console.log('[Database] Background shard verification completed');
+        } catch (err) {
+          console.error('[Database] Background shard verification failed:', err);
+        }
+      })());
+    }
+
+    if (this._needsSessionLogIndexBuild) {
+      this._needsSessionLogIndexBuild = false;
+      tasks.push((async () => {
+        try {
+          await this.buildSessionLogIndex();
+          console.log('[Database] Background session log index build completed');
+        } catch (err) {
+          console.error('[Database] Background session log index build failed:', err);
+        }
+      })());
+    }
+
+    await Promise.all(tasks);
+  }
+
   private async loadAllData() {
     await Promise.all([
       this.loadVendors(),  // loadVendors 内部会处理旧 services.json 的迁移
@@ -189,7 +228,7 @@ export class FileSystemDatabaseManager {
       this.loadRoutes(),
       this.loadConfig(),
       this.loadSessions(),
-      this.loadLogsIndex(),
+      this.loadLogsIndex(true), // 启动时跳过耗时校验
       this.loadErrorLogs(),
       this.loadBlacklist(),
       this.loadStatistics(),
@@ -199,7 +238,7 @@ export class FileSystemDatabaseManager {
     ]);
 
     // 会话日志索引依赖 logShardsIndex，必须在 loadLogsIndex 之后
-    await this.loadSessionLogIndex();
+    await this.loadSessionLogIndex(true); // 启动时跳过全量构建
   }
 
   private async loadVendors() {
@@ -561,7 +600,7 @@ export class FileSystemDatabaseManager {
     await fs.writeFile(this.sessionsFile, JSON.stringify(this.sessions, null, 2));
   }
 
-  private async loadLogsIndex(): Promise<void> {
+  private async loadLogsIndex(deferMaintenance = true): Promise<void> {
     try {
       const data = await fs.readFile(this.logsIndexFile, 'utf-8');
       this.logShardsIndex = JSON.parse(data);
@@ -573,11 +612,15 @@ export class FileSystemDatabaseManager {
     // 检查并迁移旧的 logs.json 文件
     await this.migrateOldLogsIfNeeded();
 
-    // 校验索引与实际分片数据的一致性
-    await this.verifyShardIndexConsistency();
-
-    // 清理旧日志分片
-    await this.cleanupOldLogShards();
+    if (deferMaintenance) {
+      // 启动时跳过耗时操作，由 deferredMaintenance() 异步执行
+      this._needsShardVerification = true;
+    } else {
+      // 校验索引与实际分片数据的一致性
+      await this.verifyShardIndexConsistency();
+      // 清理旧日志分片
+      await this.cleanupOldLogShards();
+    }
   }
 
   /**
@@ -614,18 +657,24 @@ export class FileSystemDatabaseManager {
   }
 
   /**
-   * 加载会话日志索引，若不存在则从现有日志全量构建
+   * 加载会话日志索引，若不存在则标记为延迟构建
    */
-  private async loadSessionLogIndex(): Promise<void> {
+  private async loadSessionLogIndex(deferBuild = true): Promise<void> {
     try {
       const data = await fs.readFile(this.sessionLogIndexFile, 'utf-8');
       const parsed = JSON.parse(data);
       this.sessionLogIndex = new Map(Object.entries(parsed));
       console.log(`[Database] Session log index loaded: ${this.sessionLogIndex.size} sessions`);
     } catch {
-      // 索引文件不存在，从现有日志全量构建
-      console.log('[Database] Session log index not found, building from existing logs...');
-      await this.buildSessionLogIndex();
+      if (deferBuild) {
+        // 启动时跳过全量构建，由 deferredMaintenance() 异步执行
+        console.log('[Database] Session log index not found, will build in background...');
+        this._needsSessionLogIndexBuild = true;
+      } else {
+        // 索引文件不存在，从现有日志全量构建
+        console.log('[Database] Session log index not found, building from existing logs...');
+        await this.buildSessionLogIndex();
+      }
     }
   }
 

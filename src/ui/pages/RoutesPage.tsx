@@ -1000,6 +1000,10 @@ export default function RoutesPage() {
           <p className="api-binding-desc">
             将标准 API 路径绑定到路由，使任何兼容该 API 的编程工具都可以通过对应路径使用服务。
           </p>
+          <div className="api-binding-baseurl-row">
+            <span className="api-binding-baseurl-prefix">Base URL</span>
+            <span className="api-binding-baseurl-value">{window.location.origin}</span>
+          </div>
           <div className="api-binding-list">
             {apiPathBindings.map(binding => {
               const isModelsPath = binding.apiPath === '/v1/models';

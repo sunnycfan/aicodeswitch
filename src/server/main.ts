@@ -2622,6 +2622,12 @@ const start = async () => {
 
   const server = app.listen(port, host, () => {
     console.log(`Admin server running on http://${host}:${port}`);
+
+    // 启动后异步执行延迟维护任务（分片校验/修复、日志清理、会话索引构建）
+    // 不阻塞服务启动，后台静默执行
+    dbManager.deferredMaintenance().catch(err => {
+      console.error('[Server] Deferred maintenance error:', err);
+    });
   });
 
   // 创建 WebSocket 服务器用于工具安装

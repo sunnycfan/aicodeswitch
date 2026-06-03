@@ -1381,6 +1381,35 @@ table th {
   line-height: 1.6;
 }
 
+.api-binding-baseurl-row {
+  display: flex;
+  align-items: center;
+  margin: 0 0 14px 0;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+
+.api-binding-baseurl-prefix {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--border-primary);
+  letter-spacing: 0.3px;
+}
+
+.api-binding-baseurl-value {
+  flex: 1;
+  padding: 6px 12px;
+  font-family: monospace;
+  font-size: 13px;
+  color: var(--text-secondary);
+  user-select: all;
+}
+
 .api-binding-list {
   display: flex;
   flex-direction: column;

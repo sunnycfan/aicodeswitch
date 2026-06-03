@@ -296,14 +296,15 @@ export class ProxyServer {
       const bindings = this.dbManager.getApiPathBindings();
       const binding = bindings.find((b: ApiPathBinding) => b.apiPath === apiPath);
       if (!binding || !binding.routeId) {
-        return next(); // 未绑定，交给后续中间件或返回 404
+        res.status(404).json({ error: { message: `API path ${apiPath} is not bound to any route. Please configure it in Route Mapping settings.` } });
+        return;
       }
 
       // 加载绑定的路由
       const allRoutes = this.dbManager.getRoutes();
       const route = allRoutes.find((r: Route) => r.id === binding.routeId);
       if (!route) {
-        return res.status(404).json({ error: { message: 'Bound route not found or inactive' } });
+        return res.status(404).json({ error: { message: `Bound route '${binding.routeId}' not found or inactive. Please check Route Mapping settings.` } });
       }
 
       // 推断客户端格式
