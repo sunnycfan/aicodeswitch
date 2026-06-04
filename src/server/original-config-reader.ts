@@ -54,7 +54,7 @@ const inferSourceTypeFromBaseUrlAndWireApi = (baseUrl: string, wireApi?: string)
   }
 
   if (lowerBaseUrl.includes('deepseek')) {
-    return 'deepseek-reasoning-chat';
+    return 'openai-chat';
   }
 
   if (normalizedWireApi === 'chat') {

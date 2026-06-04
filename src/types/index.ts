@@ -4,6 +4,8 @@ export interface Vendor {
   name: string;
   description?: string;
   apiKey?: string;
+  apiBaseUrl?: string;  // 供应商默认 API Base URL
+  authType?: AuthType;  // 供应商默认 API 认证方式
   sortOrder?: number;
   services: APIService[];  // 供应商的 API 服务列表
   createdAt: number;
@@ -11,11 +13,22 @@ export interface Vendor {
 }
 
 /** 供应商API接口的数据结构标准类型 */
-export type SourceType = 'openai-chat' | 'openai' | 'claude-chat' | 'claude' | 'deepseek-reasoning-chat' | 'gemini' | 'gemini-chat';
-/** 路由的目标对象类型，目前，仅支持claude-code和codex */
+export type SourceType = 'openai-chat' | 'openai' | 'claude-chat' | 'claude' | 'gemini' | 'gemini-chat';
+/** 工具名称（用于工具绑定，独立于路由） */
+export type ToolName = 'claude-code' | 'codex';
+/** 路由的目标对象类型，保留用于日志、统计等向后兼容场景 */
 export type ToolType = 'claude-code' | 'codex';
 /** TargetType 是 ToolType 的别名，用于向后兼容 */
 export type TargetType = ToolType;
+
+/** 单个工具的路由激活配置 */
+export interface ToolBinding {
+  tool: ToolName;
+  routeId: string | null;
+}
+
+/** 所有工具的路由激活配置集合 */
+export type ToolBindings = Record<ToolName, ToolBinding>;
 /** Codex 推理强度配置 */
 export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
 
@@ -88,11 +101,15 @@ export interface APIService {
   apiUrl: string;
   apiKey: string;
   inheritVendorApiKey?: boolean;
+  inheritVendorApiBaseUrl?: boolean;  // 是否继承供应商的 API Base URL
   sourceType?: SourceType;
   authType?: AuthType; // 认证方式（ AUTH_TOKEN/API_KEY/G_API_KEY），默认为 AUTH_TOKEN
   supportedModels?: string[];
   modelLimits?: Record<string, number>; // 模型名 -> 最大输出tokens映射
   enableProxy?: boolean; // 是否启用代理
+  enableCodingPlan?: boolean; // 是否启用编程套餐限制。启用后仅允许编程工具（Claude Code / Codex / Cursor 等）发起的请求通过。
+  isDowngradeCompatibility?: boolean; // 是否开启降级兼容。开启后同格式 passthrough 会清理私有扩展字段/工具类型，
+                                       // 确保与非原始提供商（如火山方舟/豆包）的兼容性。默认 false（不清理）。
 
   // 新增：Token超量配置
   enableTokenLimit?: boolean;          // 是否启用Token超量限制
@@ -115,14 +132,6 @@ export interface Route {
   id: string;
   name: string;
   description?: string;
-  targetType: ToolType;
-  isActive: boolean;
-  /** @deprecated 已迁移为全局配置 AppConfig.enableAgentTeams */
-  enableAgentTeams?: boolean;
-  /** @deprecated 已迁移为全局配置 AppConfig.enableBypassPermissionsSupport */
-  enableBypassPermissionsSupport?: boolean;
-  /** @deprecated 已迁移为全局配置 AppConfig.codexModelReasoningEffort */
-  codexModelReasoningEffort?: CodexReasoningEffort;
   createdAt: number;
   updatedAt: number;
 }
@@ -157,7 +166,7 @@ export interface Rule {
   updatedAt: number;
 }
 
-export type ContentType = 'default' | 'background' | 'thinking' | 'long-context' | 'image-understanding' | 'model-mapping' | 'high-iq';
+export type ContentType = 'default' | 'background' | 'thinking' | 'long-context' | 'image-understanding' | 'model-mapping' | 'high-iq' | 'compact';
 
 export interface RequestLog {
   id: string;
@@ -241,6 +250,7 @@ export interface AppConfig {
   enableAgentTeams?: boolean;  // Claude Code Agent Teams（全局）
   enableBypassPermissionsSupport?: boolean;  // Claude Code bypassPermissions 支持（全局）
   claudeEffortLevel?: ClaudeEffortLevel;  // Claude Code effort level（全局）
+  autocompactPctOverride?: number;  // Claude Code 自动压缩百分比阈值（1-100，全局）
   claudeDefaultModel?: string;  // Claude Code 默认模型（全局）
   codexModelReasoningEffort?: CodexReasoningEffort;  // Codex reasoning effort（全局）
   codexDefaultModel?: string;  // Codex 默认模型（全局）
@@ -249,6 +259,7 @@ export interface AppConfig {
   proxyUrl?: string;  // 代理地址，例如: proxy.example.com:8080
   proxyUsername?: string;  // 代理认证用户名
   proxyPassword?: string;  // 代理认证密码
+  // API 路径路由映射
 }
 
 export interface ExportData {
@@ -322,7 +333,7 @@ export interface LoginResponse {
 
 /** Session 会话信息 */
 export interface Session {
-  id: string;              // session ID (对于Claude Code是metadata.user_id，对于Codex是headers.session_id)
+  id: string;              // session ID (对于Claude Code是metadata.user_id，对于Codex是headers.session-id或headers.session_id)
   targetType: ToolType;  // 客户端类型 (claude-code 或 codex)
   title?: string;          // 会话标题（从第一条消息内容提取）
   firstRequestAt: number;  // 第一次请求时间
@@ -484,4 +495,18 @@ export interface ConfigFileState {
   backupHash?: string;
   hasUnmanagedChanges?: boolean;
   managedFieldsChanged?: boolean;
+}
+
+/** 标准 API 路径枚举 */
+export type ApiPath =
+  | '/v1/messages'
+  | '/v1/responses'
+  | '/v1/chat/completions'
+  | '/v1beta/models'
+  | '/v1/models';
+
+/** 路径与路由的绑定关系 */
+export interface ApiPathBinding {
+  apiPath: ApiPath;
+  routeId: string | null;
 }

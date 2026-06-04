@@ -21,6 +21,7 @@ import type {
   MCPInstallRequest,
   CodexReasoningEffort,
   ClaudeEffortLevel,
+  ToolName,
 } from '../types';
 import os from 'os';
 import { isAuthEnabled, verifyAuthCode, generateToken, authMiddleware } from './auth';
@@ -153,12 +154,17 @@ const isClaudeEffortLevel = (value: unknown): value is ClaudeEffortLevel => {
   return typeof value === 'string' && VALID_CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel);
 };
 
+const isValidAutocompactPct = (v: unknown): v is number => {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100;
+};
+
 const writeClaudeConfig = async (
   dbManager: FileSystemDatabaseManager,
   enableAgentTeams?: boolean,
   enableBypassPermissionsSupport?: boolean,
   effortLevel?: ClaudeEffortLevel,
   defaultModel?: string,
+  autocompactPctOverride?: number,
   options: ToolConfigWriteOptions = {}
 ): Promise<boolean> => {
   try {
@@ -249,6 +255,11 @@ const writeClaudeConfig = async (
     // 如果设置了默认模型，添加对应的配置项
     if (defaultModel && typeof defaultModel === 'string' && defaultModel.trim()) {
       proxySettings.model = defaultModel.trim();
+    }
+
+    // 如果设置了自动压缩百分比阈值，添加对应的配置项
+    if (isValidAutocompactPct(autocompactPctOverride)) {
+      claudeSettingsEnv.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(autocompactPctOverride);
     }
 
     // 使用智能合并：将代理配置的管理字段写入，保留当前配置的非管理字段
@@ -701,7 +712,8 @@ const syncConfigsOnServerStartup = async (dbManager: FileSystemDatabaseManager):
     config.enableAgentTeams,
     config.enableBypassPermissionsSupport,
     claudeEffortLevel,
-    config.claudeDefaultModel
+    config.claudeDefaultModel,
+    config.autocompactPctOverride
   );
   console.log(`[Startup Config Sync] Claude Code config ${claudeWritten ? 'written' : 'skipped'}`);
 
@@ -728,6 +740,7 @@ const syncConfigsOnGlobalConfigUpdate = async (dbManager: FileSystemDatabaseMana
     config.enableBypassPermissionsSupport,
     claudeEffortLevel,
     config.claudeDefaultModel,
+    config.autocompactPctOverride,
     { allowOverwriteRefresh: true }
   );
   console.log(`[Config Update Sync] Claude Code config ${claudeUpdated ? 'written' : 'skipped'}`);
@@ -1247,59 +1260,82 @@ const registerRoutes = (dbManager: FileSystemDatabaseManager, proxyServer: Proxy
   app.get('/api/routes', (_req, res) => res.json(dbManager.getRoutes()));
   app.post('/api/routes', asyncHandler(async (req, res) => res.json(await dbManager.createRoute(req.body))));
   app.put('/api/routes/:id', asyncHandler(async (req, res) => res.json(await dbManager.updateRoute(req.params.id, req.body))));
-  app.delete('/api/routes/:id', asyncHandler(async (req, res) => res.json(await dbManager.deleteRoute(req.params.id))));
+  app.delete('/api/routes/:id', asyncHandler(async (req, res) => {
+    // Check if route is bound to any tool
+    if (dbManager.isRouteBound(req.params.id)) {
+      return res.status(400).json({ error: '该路由当前被工具使用中，请先停用后再删除' });
+    }
+    const result = await dbManager.deleteRoute(req.params.id);
+    res.json(result);
+  }));
+  // Tool Bindings API
+  app.get('/api/tool-bindings', (_req, res) => {
+    res.json(dbManager.getToolBindings());
+  });
+
   app.post(
-    '/api/routes/:id/activate',
+    '/api/tool-bindings/activate',
     asyncHandler(async (req, res) => {
-      const result = await dbManager.activateRoute(req.params.id);
+      const { tool, routeId } = req.body as { tool: ToolName; routeId: string };
+      if (!tool || !routeId) {
+        return res.status(400).json({ error: 'tool and routeId are required' });
+      }
+      if (tool !== 'claude-code' && tool !== 'codex') {
+        return res.status(400).json({ error: 'Invalid tool name' });
+      }
+      const route = dbManager.getRoute(routeId);
+      if (!route) {
+        return res.status(404).json({ error: 'Route not found' });
+      }
+
+      const result = await dbManager.activateToolRoute(tool, routeId);
       if (result) {
         await proxyServer.reloadRoutes();
 
-        // 激活路由后，同步MCP配置
-        const routes = dbManager.getRoutes();
-        const route = routes.find(r => r.id === req.params.id);
-        if (route) {
-          const mcps = dbManager.getMCPs();
-          const hasMCPForTarget = mcps.some(m => m.targets?.includes(route.targetType));
-          if (hasMCPForTarget) {
-            await writeMCPConfig(route.targetType);
-          }
+        // Sync MCP config for this tool
+        const mcps = dbManager.getMCPs();
+        const hasMCPForTarget = mcps.some(m => m.targets?.includes(tool));
+        if (hasMCPForTarget) {
+          await writeMCPConfig(tool);
         }
       }
-      res.json(result);
+      res.json({ success: result });
     })
   );
 
   app.post(
-    '/api/routes/:id/deactivate',
+    '/api/tool-bindings/deactivate',
     asyncHandler(async (req, res) => {
-      const result = await dbManager.deactivateRoute(req.params.id);
+      const { tool } = req.body as { tool: ToolName };
+      if (!tool || (tool !== 'claude-code' && tool !== 'codex')) {
+        return res.status(400).json({ error: 'Invalid tool name' });
+      }
+
+      const result = await dbManager.deactivateToolRoute(tool);
       if (result) {
         await proxyServer.reloadRoutes();
       }
-      res.json(result);
+      res.json({ success: result });
     })
   );
 
-  // 批量停用所有激活的路由（用于应用关闭时清理）
+  // 批量停用所有工具绑定（用于应用关闭时清理）
   app.post(
     '/api/routes/deactivate-all',
     asyncHandler(async (_req, res) => {
-      console.log('[Deactivate All Routes] Starting route deactivation...');
+      console.log('[Deactivate All] Starting tool-bindings deactivation...');
 
-      // 仅停用路由，不再在路由接口内处理配置文件恢复
-      console.log('[Deactivate All Routes] Deactivating all active routes...');
-      const deactivatedCount = await dbManager.deactivateAllRoutes();
+      const deactivatedCount = await dbManager.deactivateAllToolRoutes();
 
       if (deactivatedCount > 0) {
-        console.log(`[Deactivate All Routes] Deactivated ${deactivatedCount} route(s), reloading routes...`);
+        console.log(`[Deactivate All] Deactivated ${deactivatedCount} tool binding(s), reloading routes...`);
         await proxyServer.reloadRoutes();
-        console.log('[Deactivate All Routes] Routes reloaded successfully');
+        console.log('[Deactivate All] Routes reloaded successfully');
       } else {
-        console.log('[Deactivate All Routes] No active routes to deactivate');
+        console.log('[Deactivate All] No active tool bindings to deactivate');
       }
 
-      console.log('[Deactivate All Routes] Route deactivation completed');
+      console.log('[Deactivate All] Deactivation completed');
 
       res.json({
         success: true,
@@ -2014,7 +2050,14 @@ ${instruction}
       const enableBypassPermissionsSupport = typeof requestedBypass === 'boolean'
         ? requestedBypass
         : appConfig.enableBypassPermissionsSupport;
-      const result = await writeClaudeConfig(dbManager, enableAgentTeams, enableBypassPermissionsSupport, undefined, appConfig.claudeDefaultModel);
+      const result = await writeClaudeConfig(
+        dbManager,
+        enableAgentTeams,
+        enableBypassPermissionsSupport,
+        undefined,
+        appConfig.claudeDefaultModel,
+        appConfig.autocompactPctOverride
+      );
       res.json(result);
     })
   );
@@ -2136,6 +2179,42 @@ ${instruction}
     const status = checkCodexConfigStatus();
     res.json(status);
   });
+
+  // API 路径路由映射
+  app.get('/api/api-path-bindings', (_req, res) => {
+    res.json({ bindings: dbManager.getApiPathBindings(), models: dbManager.getApiPathModels() });
+  });
+
+  app.put('/api/api-path-bindings', asyncHandler(async (req, res) => {
+    const { bindings } = req.body as { bindings: Array<{ apiPath: string; routeId: string | null }> };
+    const VALID_API_PATHS = ['/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1beta/models', '/v1/models'];
+    const routes = dbManager.getRoutes();
+    const routeIds = new Set(routes.map((r: any) => r.id));
+
+    // Validate
+    for (const b of bindings) {
+      if (!VALID_API_PATHS.includes(b.apiPath)) {
+        res.status(400).json({ error: `Invalid apiPath: ${b.apiPath}` });
+        return;
+      }
+      if (b.routeId !== null && !routeIds.has(b.routeId)) {
+        res.status(400).json({ error: `Route not found: ${b.routeId}` });
+        return;
+      }
+      // /v1/models does not accept route binding
+      if (b.apiPath === '/v1/models' && b.routeId !== null) {
+        res.status(400).json({ error: '/v1/models does not accept route binding' });
+        return;
+      }
+    }
+
+    const { models } = req.body as { models?: string };
+    await dbManager.updateApiPathBindings(
+      bindings.map(b => ({ apiPath: b.apiPath as any, routeId: b.routeId })),
+      models,
+    );
+    res.json({ success: true, bindings: dbManager.getApiPathBindings(), models: dbManager.getApiPathModels() });
+  }));
 
   app.post(
     '/api/export',
@@ -2364,12 +2443,11 @@ ${instruction}
       targets: mcpData.targets || [],
     });
 
-    // 如果有激活的路由，立即写入MCP配置
+    // 如果有工具绑定的路由，立即写入MCP配置
     if (mcpData.targets) {
-      const routes = dbManager.getRoutes();
       for (const target of mcpData.targets) {
-        const activeRoute = routes.find(r => r.targetType === target && r.isActive);
-        if (activeRoute) {
+        const activeRouteId = dbManager.getActiveRouteIdForTool(target);
+        if (activeRouteId) {
           await writeMCPConfig(target);
         }
       }
@@ -2544,6 +2622,12 @@ const start = async () => {
 
   const server = app.listen(port, host, () => {
     console.log(`Admin server running on http://${host}:${port}`);
+
+    // 启动后异步执行延迟维护任务（分片校验/修复、日志清理、会话索引构建）
+    // 不阻塞服务启动，后台静默执行
+    dbManager.deferredMaintenance().catch(err => {
+      console.error('[Server] Deferred maintenance error:', err);
+    });
   });
 
   // 创建 WebSocket 服务器用于工具安装

@@ -20,6 +20,10 @@ import type {
   MCPServer,
   TargetType,
   CodexReasoningEffort,
+  ClaudeEffortLevel,
+  ApiPathBinding,
+  ToolName,
+  ToolBindings,
 } from '../types';
 import { migrateSourceType, isLegacySourceType, normalizeSourceType } from './type-migration';
 
@@ -41,8 +45,19 @@ const VALID_CODEX_REASONING_EFFORTS: CodexReasoningEffort[] = ['low', 'medium', 
 const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = 'high';
 const DEFAULT_FAILOVER_RECOVERY_SECONDS = 30;
 
+const VALID_CLAUDE_EFFORT_LEVELS: ClaudeEffortLevel[] = ['low', 'medium', 'high', 'max'];
+const DEFAULT_CLAUDE_EFFORT_LEVEL: ClaudeEffortLevel = 'medium';
+
 const isCodexReasoningEffort = (value: unknown): value is CodexReasoningEffort => {
   return typeof value === 'string' && VALID_CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort);
+};
+
+const isClaudeEffortLevel = (value: unknown): value is ClaudeEffortLevel => {
+  return typeof value === 'string' && VALID_CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel);
+};
+
+const isValidAutocompactPct = (v: unknown): v is number => {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100;
 };
 
 const normalizeFailoverRecoverySeconds = (value: unknown): number => {
@@ -75,11 +90,24 @@ export class FileSystemDatabaseManager {
   private errorLogs: ErrorLog[] = [];
   private blacklist: Map<string, ServiceBlacklistEntry> = new Map();
   private mcps: MCPServer[] = [];
+  private apiPathBindingsData: ApiPathBinding[] = [];
+  private apiPathModelsData = '';
+  private toolBindings: ToolBindings = {
+    'claude-code': { tool: 'claude-code', routeId: null },
+    'codex': { tool: 'codex', routeId: null },
+  };
 
   // 持久化统计数据
   private statistics: Statistics = this.createEmptyStatistics();
   private contentTypeDistributionInitialized = false;
   private contentTypeDistributionInitializing = false;
+
+  // 分片写入锁：防止并发读写同一个分片文件导致数据损坏
+  private shardWriteLocks: Map<string, Promise<void>> = new Map();
+
+  // 延迟维护标记：启动时跳过耗时操作，后台异步执行
+  private _needsShardVerification = false;
+  private _needsSessionLogIndexBuild = false;
 
   // 缓存机制
   private logsCountCache: { count: number; timestamp: number } | null = null;
@@ -105,6 +133,8 @@ export class FileSystemDatabaseManager {
   private get blacklistFile() { return path.join(this.dataPath, 'blacklist.json'); }
   private get statisticsFile() { return path.join(this.dataPath, 'statistics.json'); }
   private get mcpFile() { return path.join(this.dataPath, 'mcps.json'); }
+  private get toolBindingsFile() { return path.join(this.dataPath, 'tool-bindings.json'); }
+  private get apiPathBindingsFile() { return path.join(this.dataPath, 'api-path-bindings.json'); }
 
   // 创建空的统计数据结构
   private createEmptyStatistics(): Statistics {
@@ -156,6 +186,41 @@ export class FileSystemDatabaseManager {
     await this.ensureDefaultConfig();
   }
 
+  /**
+   * 执行延迟的维护任务（启动后异步执行，不阻塞服务启动）
+   * 包括：分片一致性校验、损坏修复、旧日志清理、会话索引构建
+   */
+  async deferredMaintenance(): Promise<void> {
+    const tasks: Promise<void>[] = [];
+
+    if (this._needsShardVerification) {
+      this._needsShardVerification = false;
+      tasks.push((async () => {
+        try {
+          await this.verifyShardIndexConsistency();
+          await this.cleanupOldLogShards();
+          console.log('[Database] Background shard verification completed');
+        } catch (err) {
+          console.error('[Database] Background shard verification failed:', err);
+        }
+      })());
+    }
+
+    if (this._needsSessionLogIndexBuild) {
+      this._needsSessionLogIndexBuild = false;
+      tasks.push((async () => {
+        try {
+          await this.buildSessionLogIndex();
+          console.log('[Database] Background session log index build completed');
+        } catch (err) {
+          console.error('[Database] Background session log index build failed:', err);
+        }
+      })());
+    }
+
+    await Promise.all(tasks);
+  }
+
   private async loadAllData() {
     await Promise.all([
       this.loadVendors(),  // loadVendors 内部会处理旧 services.json 的迁移
@@ -163,15 +228,17 @@ export class FileSystemDatabaseManager {
       this.loadRoutes(),
       this.loadConfig(),
       this.loadSessions(),
-      this.loadLogsIndex(),
+      this.loadLogsIndex(true), // 启动时跳过耗时校验
       this.loadErrorLogs(),
       this.loadBlacklist(),
       this.loadStatistics(),
       this.loadMCPs(),
+      this.loadApiPathBindings(),
+      this.loadToolBindings(),
     ]);
 
     // 会话日志索引依赖 logShardsIndex，必须在 loadLogsIndex 之后
-    await this.loadSessionLogIndex();
+    await this.loadSessionLogIndex(true); // 启动时跳过全量构建
   }
 
   private async loadVendors() {
@@ -186,10 +253,12 @@ export class FileSystemDatabaseManager {
               ...service,
               apiKey: typeof service.apiKey === 'string' ? service.apiKey : '',
               inheritVendorApiKey: service.inheritVendorApiKey === true,
+              inheritVendorApiBaseUrl: service.inheritVendorApiBaseUrl === true,
             };
             if (
               normalizedService.apiKey !== service.apiKey ||
-              normalizedService.inheritVendorApiKey !== service.inheritVendorApiKey
+              normalizedService.inheritVendorApiKey !== service.inheritVendorApiKey ||
+              normalizedService.inheritVendorApiBaseUrl !== service.inheritVendorApiBaseUrl
             ) {
               needSave = true;
             }
@@ -429,6 +498,28 @@ export class FileSystemDatabaseManager {
     await this.saveRoutesData();
   }
 
+  private async loadToolBindings(): Promise<void> {
+    try {
+      const data = await fs.readFile(this.toolBindingsFile, 'utf-8');
+      const parsed = JSON.parse(data);
+      // Merge with defaults to handle new tools
+      this.toolBindings = {
+        'claude-code': parsed['claude-code'] || { tool: 'claude-code', routeId: null },
+        'codex': parsed['codex'] || { tool: 'codex', routeId: null },
+      };
+    } catch {
+      // File doesn't exist yet, use defaults
+      this.toolBindings = {
+        'claude-code': { tool: 'claude-code', routeId: null },
+        'codex': { tool: 'codex', routeId: null },
+      };
+    }
+  }
+
+  private async saveToolBindings(): Promise<void> {
+    await fs.writeFile(this.toolBindingsFile, JSON.stringify(this.toolBindings, null, 2));
+  }
+
   /**
    * 检测并迁移旧的 rules.json 到 routes.json 的 rules 属性
    * 旧格式：routes.json + rules.json 分离
@@ -509,7 +600,7 @@ export class FileSystemDatabaseManager {
     await fs.writeFile(this.sessionsFile, JSON.stringify(this.sessions, null, 2));
   }
 
-  private async loadLogsIndex(): Promise<void> {
+  private async loadLogsIndex(deferMaintenance = true): Promise<void> {
     try {
       const data = await fs.readFile(this.logsIndexFile, 'utf-8');
       this.logShardsIndex = JSON.parse(data);
@@ -521,8 +612,44 @@ export class FileSystemDatabaseManager {
     // 检查并迁移旧的 logs.json 文件
     await this.migrateOldLogsIfNeeded();
 
-    // 清理旧日志分片
-    await this.cleanupOldLogShards();
+    if (deferMaintenance) {
+      // 启动时跳过耗时操作，由 deferredMaintenance() 异步执行
+      this._needsShardVerification = true;
+    } else {
+      // 校验索引与实际分片数据的一致性
+      await this.verifyShardIndexConsistency();
+      // 清理旧日志分片
+      await this.cleanupOldLogShards();
+    }
+  }
+
+  /**
+   * 校验索引中的 count 与实际分片文件中的数据是否一致
+   * 修复因并发写入竞争导致的不一致
+   */
+  private async verifyShardIndexConsistency(): Promise<void> {
+    let fixedCount = 0;
+    for (const shard of this.logShardsIndex) {
+      try {
+        const shardLogs = await this.loadLogShard(shard.filename);
+        if (shardLogs.length !== shard.count) {
+          console.warn(`[Database] Shard count mismatch on startup: ${shard.filename} index=${shard.count} actual=${shardLogs.length}, correcting`);
+          shard.count = shardLogs.length;
+          fixedCount++;
+        }
+      } catch {
+        // 分片文件无法读取，将 count 设为 0
+        if (shard.count > 0) {
+          console.warn(`[Database] Shard file unreadable on startup: ${shard.filename}, setting count to 0`);
+          shard.count = 0;
+          fixedCount++;
+        }
+      }
+    }
+    if (fixedCount > 0) {
+      console.log(`[Database] Fixed ${fixedCount} shard index count mismatch(es)`);
+      await this.saveLogsIndex();
+    }
   }
 
   private async saveLogsIndex(): Promise<void> {
@@ -530,18 +657,24 @@ export class FileSystemDatabaseManager {
   }
 
   /**
-   * 加载会话日志索引，若不存在则从现有日志全量构建
+   * 加载会话日志索引，若不存在则标记为延迟构建
    */
-  private async loadSessionLogIndex(): Promise<void> {
+  private async loadSessionLogIndex(deferBuild = true): Promise<void> {
     try {
       const data = await fs.readFile(this.sessionLogIndexFile, 'utf-8');
       const parsed = JSON.parse(data);
       this.sessionLogIndex = new Map(Object.entries(parsed));
       console.log(`[Database] Session log index loaded: ${this.sessionLogIndex.size} sessions`);
     } catch {
-      // 索引文件不存在，从现有日志全量构建
-      console.log('[Database] Session log index not found, building from existing logs...');
-      await this.buildSessionLogIndex();
+      if (deferBuild) {
+        // 启动时跳过全量构建，由 deferredMaintenance() 异步执行
+        console.log('[Database] Session log index not found, will build in background...');
+        this._needsSessionLogIndexBuild = true;
+      } else {
+        // 索引文件不存在，从现有日志全量构建
+        console.log('[Database] Session log index not found, building from existing logs...');
+        await this.buildSessionLogIndex();
+      }
     }
   }
 
@@ -793,8 +926,20 @@ export class FileSystemDatabaseManager {
   private async loadLogShard(filename: string): Promise<RequestLog[]> {
     const filepath = path.join(this.logsDir, filename);
     try {
-      const data = await fs.readFile(filepath, 'utf-8');
-      return JSON.parse(data);
+      let content = await fs.readFile(filepath, 'utf-8');
+      // 检测并修复空字节损坏（并发写入竞争可能导致文件中间出现大量 \x00）
+      const nullIndex = content.indexOf('\x00');
+      if (nullIndex !== -1) {
+        console.warn(`[Database] Detected corrupted shard file: ${filename}, truncating at null byte (pos ${nullIndex})`);
+        content = content.substring(0, nullIndex);
+        // 尝试补全被截断的 JSON 数组
+        const openBrackets = (content.match(/\[/g) || []).length;
+        const closeBrackets = (content.match(/\]/g) || []).length;
+        if (openBrackets > closeBrackets) {
+          content += ']';
+        }
+      }
+      return JSON.parse(content);
     } catch {
       return [];
     }
@@ -802,8 +947,12 @@ export class FileSystemDatabaseManager {
 
   private async saveLogShard(filename: string, logs: RequestLog[]): Promise<void> {
     const filepath = path.join(this.logsDir, filename);
+    const tempFile = path.join(this.logsDir, `.tmp_${filename}`);
     await fs.mkdir(this.logsDir, { recursive: true });
-    await fs.writeFile(filepath, JSON.stringify(logs, null, 2));
+    const content = JSON.stringify(logs, null, 2);
+    // 先写临时文件，再原子重命名，避免写入中途被并发操作导致文件损坏
+    await fs.writeFile(tempFile, content, 'utf-8');
+    await fs.rename(tempFile, filepath);
   }
 
   private async loadErrorLogs() {
@@ -886,32 +1035,96 @@ export class FileSystemDatabaseManager {
     }
   }
 
+  private async loadApiPathBindings() {
+    const defaults: ApiPathBinding[] = [
+      { apiPath: '/v1/messages', routeId: null },
+      { apiPath: '/v1/responses', routeId: null },
+      { apiPath: '/v1/chat/completions', routeId: null },
+      { apiPath: '/v1beta/models', routeId: null },
+      { apiPath: '/v1/models', routeId: null },
+    ];
+    try {
+      const data = await fs.readFile(this.apiPathBindingsFile, 'utf-8');
+      const parsed = JSON.parse(data);
+      this.apiPathBindingsData = parsed.bindings || defaults;
+      this.apiPathModelsData = parsed.models || '';
+    } catch {
+      this.apiPathBindingsData = defaults;
+      this.apiPathModelsData = '';
+      await this.saveApiPathBindings();
+    }
+  }
+
+  private async saveApiPathBindings() {
+    await fs.writeFile(this.apiPathBindingsFile, JSON.stringify({
+      bindings: this.apiPathBindingsData,
+      models: this.apiPathModelsData,
+    }, null, 2));
+  }
+
+  getApiPathBindings(): ApiPathBinding[] {
+    return this.apiPathBindingsData;
+  }
+
+  getApiPathModels(): string {
+    return this.apiPathModelsData;
+  }
+
+  async updateApiPathBindings(bindings: ApiPathBinding[], models?: string): Promise<void> {
+    this.apiPathBindingsData = bindings;
+    if (models !== undefined) {
+      this.apiPathModelsData = models;
+    }
+    await this.saveApiPathBindings();
+  }
+
   private async saveMCPs() {
     await fs.writeFile(this.mcpFile, JSON.stringify(this.mcps, null, 2));
   }
 
   private async ensureDefaultConfig() {
     const current = this.config;
-    this.config = {
-      enableLogging: current?.enableLogging ?? true,
-      logRetentionDays: current?.logRetentionDays ?? 30,
-      maxLogSize: current?.maxLogSize ?? 100000,
-      apiKey: current?.apiKey ?? '',
-      enableFailover: current?.enableFailover ?? true,
-      failoverRecoverySeconds: normalizeFailoverRecoverySeconds(current?.failoverRecoverySeconds),
-      ruleGlobalTimeout: typeof current?.ruleGlobalTimeout === 'number' && current.ruleGlobalTimeout > 0
-        ? current.ruleGlobalTimeout
-        : undefined,
-      enableAgentTeams: current?.enableAgentTeams ?? false,
-      enableBypassPermissionsSupport: current?.enableBypassPermissionsSupport ?? false,
-      codexModelReasoningEffort: isCodexReasoningEffort(current?.codexModelReasoningEffort)
-        ? current!.codexModelReasoningEffort
-        : DEFAULT_CODEX_REASONING_EFFORT,
-      proxyEnabled: current?.proxyEnabled ?? false,
-      proxyUrl: current?.proxyUrl ?? '',
-      proxyUsername: current?.proxyUsername ?? '',
-      proxyPassword: current?.proxyPassword ?? '',
+    const defaults: AppConfig = {
+      enableLogging: true,
+      logRetentionDays: 30,
+      maxLogSize: 100000,
+      apiKey: '',
+      enableFailover: true,
+      failoverRecoverySeconds: DEFAULT_FAILOVER_RECOVERY_SECONDS,
+      ruleGlobalTimeout: undefined,
+      enableAgentTeams: false,
+      enableBypassPermissionsSupport: false,
+      claudeEffortLevel: DEFAULT_CLAUDE_EFFORT_LEVEL,
+      autocompactPctOverride: undefined,
+      claudeDefaultModel: undefined,
+      codexModelReasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+      codexDefaultModel: undefined,
+      proxyEnabled: false,
+      proxyUrl: '',
+      proxyUsername: '',
+      proxyPassword: '',
     };
+
+
+
+
+    // spread: current 覆盖 defaults，未来新增字段自动保留
+    this.config = { ...defaults, ...current };
+
+    // 校验归一化（与 updateConfig 保持一致）
+    if (!isCodexReasoningEffort(this.config.codexModelReasoningEffort)) {
+      this.config.codexModelReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+    }
+    if (!isClaudeEffortLevel(this.config.claudeEffortLevel)) {
+      this.config.claudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL;
+    }
+    if (typeof this.config.autocompactPctOverride !== 'undefined' && !isValidAutocompactPct(this.config.autocompactPctOverride)) {
+      this.config.autocompactPctOverride = undefined;
+    }
+    this.config.failoverRecoverySeconds = normalizeFailoverRecoverySeconds(this.config.failoverRecoverySeconds);
+    if (typeof this.config.ruleGlobalTimeout !== 'number' || this.config.ruleGlobalTimeout <= 0) {
+      this.config.ruleGlobalTimeout = undefined;
+    }
 
     // 仅在首次创建或存在字段补齐时落盘
     if (!current || JSON.stringify(current) !== JSON.stringify(this.config)) {
@@ -920,6 +1133,12 @@ export class FileSystemDatabaseManager {
   }
 
   private async migrateRouteToolSettingsToGlobalConfig(): Promise<void> {
+    const rawRoutes = this.routes as any[];
+
+    // ---------------------------------------------------------------------------
+    // Step 1: Migrate legacy route-level tool settings (enableAgentTeams, etc.)
+    //         to global AppConfig — only if AppConfig doesn't already have them.
+    // ---------------------------------------------------------------------------
     const hasGlobalToolConfig =
       !!this.config &&
       (
@@ -928,19 +1147,18 @@ export class FileSystemDatabaseManager {
         Object.prototype.hasOwnProperty.call(this.config, 'codexModelReasoningEffort')
       );
 
-    const getPreferredRoute = (targetType: TargetType) => {
-      const activeRoute = this.routes.find(route => route.targetType === targetType && route.isActive);
-      if (activeRoute) {
-        return activeRoute;
-      }
-      return this.routes.find(route => route.targetType === targetType);
-    };
-
-    let configUpdated = false;
     if (!hasGlobalToolConfig) {
+      const getPreferredRoute = (targetType: TargetType): any | undefined => {
+        // Prefer isActive=true route, fall back to first match
+        const active = rawRoutes.find(r => r.targetType === targetType && r.isActive === true);
+        if (active) return active;
+        return rawRoutes.find(r => r.targetType === targetType);
+      };
+
       const preferredClaudeRoute = getPreferredRoute('claude-code');
       const preferredCodexRoute = getPreferredRoute('codex');
       const nextConfig: AppConfig = { ...(this.config || {}) };
+      let configUpdated = false;
 
       if (typeof preferredClaudeRoute?.enableAgentTeams === 'boolean') {
         nextConfig.enableAgentTeams = preferredClaudeRoute.enableAgentTeams;
@@ -958,33 +1176,84 @@ export class FileSystemDatabaseManager {
       if (configUpdated) {
         this.config = nextConfig;
         await this.saveConfig();
-        console.log('[ConfigMigration] Migrated route-level tool settings to global app config');
+        console.log('[Migration] Migrated route-level tool settings to global AppConfig');
       }
     }
 
-    // 清理路由中的旧字段，避免后续重复歧义
-    let routesUpdated = false;
-    this.routes = this.routes.map((route) => {
-      const hasLegacyFields =
-        Object.prototype.hasOwnProperty.call(route, 'enableAgentTeams') ||
-        Object.prototype.hasOwnProperty.call(route, 'enableBypassPermissionsSupport') ||
-        Object.prototype.hasOwnProperty.call(route, 'codexModelReasoningEffort');
+    // ---------------------------------------------------------------------------
+    // Step 2: Migrate route.targetType + route.isActive → tool-bindings
+    //
+    // This step is the core migration for the Route Activation UX Refactor.
+    // It reads the old Route.isActive and Route.targetType fields from routes.json
+    // and writes equivalent entries into tool-bindings.json.
+    //
+    // Idempotency:
+    //   - If tool-bindings.json already has a non-null routeId for a tool, and
+    //     the routes no longer carry isActive/targetType (already migrated), this
+    //     step is a no-op.
+    //   - If routes still carry the old fields (first run after upgrade), they
+    //     are migrated and then cleaned.
+    // ---------------------------------------------------------------------------
+    const hasLegacyRouteFields = rawRoutes.some(r =>
+      Object.prototype.hasOwnProperty.call(r, 'isActive') ||
+      Object.prototype.hasOwnProperty.call(r, 'targetType')
+    );
 
-      if (!hasLegacyFields) {
-        return route;
+    if (hasLegacyRouteFields) {
+      let toolBindingsUpdated = false;
+
+      for (const route of rawRoutes) {
+        // Only migrate routes that are explicitly active and have a targetType
+        if (route.isActive === true && route.targetType) {
+          const tool = route.targetType as ToolName;
+          if (tool === 'claude-code' || tool === 'codex') {
+            // Only write if tool-bindings doesn't already have a binding
+            // (avoid overwriting user's newer tool-binding choices)
+            if (!this.toolBindings[tool]?.routeId) {
+              this.toolBindings[tool] = { tool, routeId: route.id };
+              toolBindingsUpdated = true;
+              console.log(`[Migration] Binding tool '${tool}' → route '${route.id}' (${route.name || 'unnamed'})`);
+            }
+          }
+        }
       }
 
-      routesUpdated = true;
-      const cleanedRoute = { ...route };
-      delete (cleanedRoute as Partial<Route>).enableAgentTeams;
-      delete (cleanedRoute as Partial<Route>).enableBypassPermissionsSupport;
-      delete (cleanedRoute as Partial<Route>).codexModelReasoningEffort;
-      return cleanedRoute;
-    });
+      if (toolBindingsUpdated) {
+        await this.saveToolBindings();
+        console.log('[Migration] Saved migrated tool-bindings to tool-bindings.json');
+      }
 
-    if (routesUpdated) {
-      await this.saveRoutes();
-      console.log('[ConfigMigration] Removed deprecated route-level tool settings');
+      // Clean legacy fields from all route objects
+      let routesUpdated = false;
+      this.routes = rawRoutes.map((route: any) => {
+        const hasLegacy =
+          Object.prototype.hasOwnProperty.call(route, 'targetType') ||
+          Object.prototype.hasOwnProperty.call(route, 'isActive') ||
+          Object.prototype.hasOwnProperty.call(route, 'enableAgentTeams') ||
+          Object.prototype.hasOwnProperty.call(route, 'enableBypassPermissionsSupport') ||
+          Object.prototype.hasOwnProperty.call(route, 'codexModelReasoningEffort');
+
+        if (!hasLegacy) return route;
+
+        routesUpdated = true;
+        const {
+          targetType,
+          isActive,
+          enableAgentTeams,
+          enableBypassPermissionsSupport,
+          codexModelReasoningEffort,
+          ...cleanedRoute
+        } = route;
+        return cleanedRoute as Route;
+      });
+
+      if (routesUpdated) {
+        await this.saveRoutes();
+        console.log('[Migration] Cleaned legacy fields (targetType, isActive, deprecated tool settings) from routes.json');
+      }
+    } else {
+      // No legacy fields found — either already migrated or fresh install
+      console.log('[Migration] No legacy route fields found, skipping tool-bindings migration');
     }
   }
 
@@ -1010,6 +1279,7 @@ export class FileSystemDatabaseManager {
     const newVendor: Vendor = {
       ...vendor,
       apiKey: typeof vendor.apiKey === 'string' ? vendor.apiKey : '',
+      apiBaseUrl: typeof vendor.apiBaseUrl === 'string' ? vendor.apiBaseUrl : '',
       id,
       services: vendor.services || [],  // 确保 services 字段存在
       createdAt: now,
@@ -1033,6 +1303,9 @@ export class FileSystemDatabaseManager {
       apiKey: typeof vendor.apiKey === 'string'
         ? vendor.apiKey
         : (this.vendors[index].apiKey || ''),
+      apiBaseUrl: typeof vendor.apiBaseUrl === 'string'
+        ? vendor.apiBaseUrl
+        : (this.vendors[index].apiBaseUrl || ''),
       // 供应商服务应通过 create/update/deleteAPIService 单独维护，避免编辑供应商时误覆盖
       services: this.vendors[index].services,
       updatedAt: now,
@@ -1133,6 +1406,7 @@ export class FileSystemDatabaseManager {
       ...serviceData,
       apiKey: typeof serviceData.apiKey === 'string' ? serviceData.apiKey : '',
       inheritVendorApiKey: serviceData.inheritVendorApiKey === true,
+      inheritVendorApiBaseUrl: serviceData.inheritVendorApiBaseUrl === true,
       id,
       createdAt: now,
       updatedAt: now
@@ -1173,6 +1447,9 @@ export class FileSystemDatabaseManager {
       inheritVendorApiKey: service.inheritVendorApiKey !== undefined
         ? service.inheritVendorApiKey === true
         : vendor.services![index].inheritVendorApiKey === true,
+      inheritVendorApiBaseUrl: service.inheritVendorApiBaseUrl !== undefined
+        ? service.inheritVendorApiBaseUrl === true
+        : vendor.services![index].inheritVendorApiBaseUrl === true,
       updatedAt: now,
     };
 
@@ -1256,7 +1533,7 @@ export class FileSystemDatabaseManager {
   async createRoute(route: Omit<Route, 'id' | 'createdAt' | 'updatedAt'>): Promise<Route> {
     const id = crypto.randomUUID();
     const now = Date.now();
-    const newRoute: Route = { ...route, id, createdAt: now, updatedAt: now };
+    const newRoute: Route = { name: route.name, description: route.description, id, createdAt: now, updatedAt: now };
     this.routes.push(newRoute);
     await this.saveRoutes();
     return newRoute;
@@ -1281,6 +1558,11 @@ export class FileSystemDatabaseManager {
     const index = this.routes.findIndex(r => r.id === id);
     if (index === -1) return false;
 
+    // 检查该路由是否被工具绑定
+    if (this.isRouteBound(id)) {
+      return false;
+    }
+
     // 删除关联的规则
     this.rules = this.rules.filter(r => r.routeId !== id);
     await this.saveRules();
@@ -1290,42 +1572,52 @@ export class FileSystemDatabaseManager {
     return true;
   }
 
-  async activateRoute(id: string): Promise<boolean> {
-    const route = this.routes.find(r => r.id === id);
+  getRoute(id: string): Route | undefined {
+    return this.routes.find(r => r.id === id);
+  }
+
+  // ToolBindings operations
+  getToolBindings(): ToolBindings {
+    return this.toolBindings;
+  }
+
+  getActiveRouteIdForTool(tool: ToolName): string | null {
+    return this.toolBindings[tool]?.routeId ?? null;
+  }
+
+  async activateToolRoute(tool: ToolName, routeId: string): Promise<boolean> {
+    const route = this.routes.find(r => r.id === routeId);
     if (!route) return false;
-
-    // 停用同类型的其他路由
-    for (const r of this.routes) {
-      if (r.targetType === route.targetType) {
-        r.isActive = r.id === id;
-      }
-    }
-
-    await this.saveRoutes();
+    this.toolBindings[tool] = { tool, routeId };
+    await this.saveToolBindings();
     return true;
   }
 
-  async deactivateRoute(id: string): Promise<boolean> {
-    const route = this.routes.find(r => r.id === id);
-    if (!route) return false;
-
-    route.isActive = false;
-    await this.saveRoutes();
+  async deactivateToolRoute(tool: ToolName): Promise<boolean> {
+    this.toolBindings[tool] = { tool, routeId: null };
+    await this.saveToolBindings();
     return true;
   }
 
-  async deactivateAllRoutes(): Promise<number> {
+  async deactivateAllToolRoutes(): Promise<number> {
     let count = 0;
-    for (const route of this.routes) {
-      if (route.isActive) {
-        route.isActive = false;
+    for (const tool of Object.keys(this.toolBindings) as ToolName[]) {
+      if (this.toolBindings[tool].routeId) {
+        this.toolBindings[tool] = { tool, routeId: null };
         count++;
       }
     }
     if (count > 0) {
-      await this.saveRoutes();
+      await this.saveToolBindings();
     }
     return count;
+  }
+
+  isRouteBound(routeId: string): boolean {
+    for (const tool of Object.keys(this.toolBindings) as ToolName[]) {
+      if (this.toolBindings[tool].routeId === routeId) return true;
+    }
+    return false;
   }
 
   // Rule operations
@@ -1538,33 +1830,51 @@ export class FileSystemDatabaseManager {
     // 获取目标分片文件名
     const filename = await this.getLogShardFilename(logWithId.timestamp);
 
-    // 加载现有分片数据
-    let shardLogs = await this.loadLogShard(filename);
+    // 使用分片级别的写入锁，防止并发 read-modify-write 竞争条件
+    const previousLock = this.shardWriteLocks.get(filename) || Promise.resolve();
+    let shardLogsLength = 0;
+    const currentWrite = previousLock.then(async () => {
+      const shardLogs = await this.loadLogShard(filename);
+      shardLogs.push(logWithId);
+      shardLogsLength = shardLogs.length;
+      await this.saveLogShard(filename, shardLogs);
 
-    // 添加新日志
-    shardLogs.push(logWithId);
+      // 更新索引（在锁内完成，保证一致性）
+      const date = new Date(logWithId.timestamp).toISOString().split('T')[0];
+      const shardIndex = this.logShardsIndex.find(s => s.filename === filename);
 
-    // 保存分片
-    await this.saveLogShard(filename, shardLogs);
+      if (shardIndex) {
+        shardIndex.count = shardLogs.length;
+        shardIndex.endTime = Math.max(shardIndex.endTime, logWithId.timestamp);
+      } else {
+        this.logShardsIndex.push({
+          filename,
+          date,
+          startTime: logWithId.timestamp,
+          endTime: logWithId.timestamp,
+          count: 1
+        });
+      }
 
-    // 更新索引
-    const date = new Date(logWithId.timestamp).toISOString().split('T')[0];
-    let shardIndex = this.logShardsIndex.find(s => s.filename === filename);
+      await this.saveLogsIndex();
+    });
 
-    if (shardIndex) {
-      shardIndex.count = shardLogs.length;
-      shardIndex.endTime = Math.max(shardIndex.endTime, logWithId.timestamp);
-    } else {
-      this.logShardsIndex.push({
-        filename,
-        date,
-        startTime: logWithId.timestamp,
-        endTime: logWithId.timestamp,
-        count: 1
-      });
+    this.shardWriteLocks.set(filename, currentWrite);
+
+    try {
+      await currentWrite;
+    } catch (error) {
+      // 写入失败时清理锁
+      if (this.shardWriteLocks.get(filename) === currentWrite) {
+        this.shardWriteLocks.delete(filename);
+      }
+      throw error;
     }
 
-    await this.saveLogsIndex();
+    // 如果当前锁已执行完毕且没有被后续锁覆盖，清理它
+    if (this.shardWriteLocks.get(filename) === currentWrite) {
+      this.shardWriteLocks.delete(filename);
+    }
 
     // 同时更新统计数据
     await this.updateStatistics(logWithId);
@@ -1580,7 +1890,7 @@ export class FileSystemDatabaseManager {
         refs = [];
         this.sessionLogIndex.set(sessionId, refs);
       }
-      refs.push({ filename, index: shardLogs.length - 1, timestamp: logWithId.timestamp });
+      refs.push({ filename, index: shardLogsLength - 1, timestamp: logWithId.timestamp });
       this.scheduleSessionLogIndexFlush();
     }
   }
@@ -1595,12 +1905,18 @@ export class FileSystemDatabaseManager {
     // 遍历分片直到收集足够的日志
     for (const shard of sortedShards) {
       if (currentOffset + shard.count <= offset) {
-        // 跳过整个分片
+        // 跳过整个分片（使用索引中的 count 做快速跳过判断，避免不必要的磁盘IO）
         currentOffset += shard.count;
         continue;
       }
 
       const shardLogs = await this.loadLogShard(shard.filename);
+
+      // 修正索引中的计数（如果发现不一致）
+      if (shardLogs.length !== shard.count) {
+        console.warn(`[Database] Shard count mismatch: ${shard.filename} index=${shard.count} actual=${shardLogs.length}, correcting`);
+        shard.count = shardLogs.length;
+      }
 
       // 计算需要从该分片取出的日志范围
       let startIndex = 0;
@@ -1614,7 +1930,7 @@ export class FileSystemDatabaseManager {
       // 添加日志到结果
       allLogs.push(...shardLogs.slice(startIndex, endIndex));
 
-      currentOffset += shard.count;
+      currentOffset += shardLogs.length;
 
       if (allLogs.length >= limit) {
         break;
@@ -2030,8 +2346,15 @@ export class FileSystemDatabaseManager {
       ...config,
     };
 
+    // 校验归一化（与 ensureDefaultConfig 保持一致）
     if (!isCodexReasoningEffort(merged.codexModelReasoningEffort)) {
       merged.codexModelReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+    }
+    if (!isClaudeEffortLevel(merged.claudeEffortLevel)) {
+      merged.claudeEffortLevel = DEFAULT_CLAUDE_EFFORT_LEVEL;
+    }
+    if (typeof merged.autocompactPctOverride !== 'undefined' && !isValidAutocompactPct(merged.autocompactPctOverride)) {
+      merged.autocompactPctOverride = undefined;
     }
     merged.failoverRecoverySeconds = normalizeFailoverRecoverySeconds(merged.failoverRecoverySeconds);
     if (typeof merged.ruleGlobalTimeout !== 'number' || merged.ruleGlobalTimeout <= 0) {
@@ -2081,7 +2404,9 @@ export class FileSystemDatabaseManager {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 name 字段` };
       }
       if (!service.apiUrl || typeof service.apiUrl !== 'string') {
-        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 apiUrl 字段` };
+        if (service.inheritVendorApiBaseUrl !== true) {
+          return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] 缺少有效的 apiUrl 字段` };
+        }
       }
       if (!service.apiKey || typeof service.apiKey !== 'string') {
         if (service.inheritVendorApiKey !== true) {
@@ -2090,6 +2415,9 @@ export class FileSystemDatabaseManager {
       }
       if (service.inheritVendorApiKey !== undefined && typeof service.inheritVendorApiKey !== 'boolean') {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiKey 必须是布尔值` };
+      }
+      if (service.inheritVendorApiBaseUrl !== undefined && typeof service.inheritVendorApiBaseUrl !== 'boolean') {
+        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiBaseUrl 必须是布尔值` };
       }
     }
     return { valid: true };
@@ -2108,12 +2436,7 @@ export class FileSystemDatabaseManager {
     if (!route.name || typeof route.name !== 'string') {
       return { valid: false, error: `路由[${index}](${route.id}) 缺少有效的 name 字段` };
     }
-    if (!route.targetType || !['claude-code', 'codex'].includes(route.targetType)) {
-      return { valid: false, error: `路由[${index}](${route.id}) 的 targetType 必须是 'claude-code' 或 'codex'` };
-    }
-    if (typeof route.isActive !== 'boolean') {
-      return { valid: false, error: `路由[${index}](${route.id}) 的 isActive 必须是布尔值` };
-    }
+    // targetType and isActive are no longer part of Route (migrated to tool-bindings)
     return { valid: true };
   }
 
@@ -2130,7 +2453,7 @@ export class FileSystemDatabaseManager {
     if (!rule.routeId || typeof rule.routeId !== 'string') {
       return { valid: false, error: `规则[${index}](${rule.id}) 缺少有效的 routeId 字段` };
     }
-    const validContentTypes = ['default', 'background', 'thinking', 'long-context', 'image-understanding', 'model-mapping', 'high-iq'];
+    const validContentTypes = ['default', 'background', 'thinking', 'long-context', 'image-understanding', 'model-mapping', 'high-iq', 'compact'];
     if (!rule.contentType || !validContentTypes.includes(rule.contentType)) {
       return { valid: false, error: `规则[${index}](${rule.id}) 的 contentType 无效` };
     }
@@ -2741,8 +3064,8 @@ export class FileSystemDatabaseManager {
    * 检查日志是否属于指定 session
    */
   private isLogBelongsToSession(log: RequestLog, sessionId: string): boolean {
-    // 检查 headers 中的 session_id（Codex）
-    if (log.headers?.['session_id'] === sessionId) {
+    // 检查 headers 中的 session-id 或 session_id（Codex，兼容新旧版本）
+    if (log.headers?.['session-id'] === sessionId || log.headers?.['session_id'] === sessionId) {
       return true;
     }
     // 检查 body 中的 metadata.user_id（Claude Code）
@@ -2776,12 +3099,12 @@ export class FileSystemDatabaseManager {
 
   /**
    * 从日志条目中提取 sessionId（用于索引）
-   * Codex: headers['session_id']
+   * Codex: headers['session-id']（新版）或 headers['session_id']（旧版）
    * Claude Code: body.metadata.user_id（兼容新旧格式）
    */
   private extractSessionIdFromLog(log: RequestLog): string | null {
-    // Codex: headers 中的 session_id
-    const headerSessionId = log.headers?.['session_id'];
+    // Codex: headers 中的 session-id 或 session_id（兼容新旧版本）
+    const headerSessionId = log.headers?.['session-id'] || log.headers?.['session_id'];
     if (typeof headerSessionId === 'string') return headerSessionId;
 
     // Claude Code: body 中的 metadata.user_id

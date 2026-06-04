@@ -73,7 +73,7 @@ aicodeswitch/
 - **数据结构:** `vendors.json` 内嵌 `services` 数组
 
 ### 路由与故障切换
-- **路由规则:** 按请求内容类型 (image-understanding/thinking/long-context/background/default) 匹配
+- **路由规则:** 按请求内容类型 (image-understanding/thinking/long-context/background/default/compact) 匹配
 - **智能故障切换:** 同类型多条规则时，优先使用第一条；报错/超时时自动切换下一条
 
 ### 日志规范
@@ -120,6 +120,9 @@ aicos stop            # 停止服务
 
 ## 最近变更
 
+- 2026-06-03: 强化 Claude Code compact 链路
+  - compact 请求在转发到上游前会补齐未配对的 `tool_use/server_tool_use`，并主动移除 `thinking`、`tools`、`tool_choice`、`mcp_servers`
+  - compact 响应回传给 Claude Code 前会过滤 `thinking` / `tool_use` block，只保留纯文本摘要，避免 compact 成功后客户端继续进入错误恢复流程
 - 2026-03-11: 修复 Claude Code → Gemini thinking 配置互斥冲突
   - 生成 `thinkingConfig` 时，若存在 `budget_tokens` 则仅写入 `thinkingBudget`，不再同时写入 `thinkingLevel`
   - 覆盖 `transformRequestFromClaudeToGemini` 与 `transformRequestFromResponsesToGemini`，修复 Gemini 400 报错

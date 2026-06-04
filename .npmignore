@@ -68,3 +68,4 @@ vite.config.ts
 /schemes/
 /public/
 .github/
+/docs/

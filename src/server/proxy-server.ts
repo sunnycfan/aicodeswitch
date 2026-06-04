@@ -1,46 +1,24 @@
 import express, { Request, Response, NextFunction } from 'express';
 import axios, { AxiosRequestConfig } from 'axios';
-import { pipeline } from 'stream';
-import type { Transform } from 'stream';
+import { pipeline, Transform } from 'stream';
 import crypto from 'crypto';
 import type { FileSystemDatabaseManager } from './fs-database';
 import {
-  ClaudeToOpenAIChatEventTransform,
-  OpenAIToClaudeEventTransform,
-  ChatCompletionsToResponsesEventTransform,
-  GeminiToClaudeEventTransform,
-  GeminiToOpenAIChatEventTransform,
-  ClaudeToResponsesEventTransform,
-  GeminiToResponsesEventTransform,
-  ChatCompletionsToClaudeEventTransform,
-  ResponsesToClaudeEventTransform,
   SSEParserTransform,
   SSESerializerTransform,
 } from './transformers/streaming';
 import { ChunkCollectorTransform, SSEEventCollectorTransform, type SSEEvent } from './transformers/chunk-collector';
 import { rulesStatusBroadcaster } from './rules-status-service';
 import {
-  // 请求转换函数，将工具发起的请求，转化为API服务接口需要的请求数据结构
-  transformRequestFromClaudeToGemini,
-  transformRequestFromClaudeToChatCompletions,
-  transformRequestFromClaudeToResponses,
-  transformRequestFromResponsesToChatCompletions,
-  transformRequestFromResponsesToGemini,
-  transformRequestFromResponsesToClaude,
-  // 响应转换函数，将API服务接口吐出的数据，转化为工具需要的数据结构
-  transformResponseFromChatCompletionsToClaude,
-  transformResponseFromGeminiToClaude,
-  transformResponseFromResponsesToClaude,
-  transformResponseFromClaudeToResponses,
-  transformResponseFromChatCompletionsToResponses,
-  transformResponseFromGeminiToResponses,
-  // 辅助函数
-  applyPayloadOverride,
-  extractTokenUsageFromGeminiUsage,
-  extractTokenUsageFromOpenAIUsage,
-  extractTokenUsageFromClaudeUsage,
-} from './transformers/transformers';
-import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, TokenUsage, ContentType, RequestLog } from '../types';
+  transformRequest as convertRequest,
+  transformResponse as convertResponse,
+  createStreamConverter,
+  sourceTypeToFormat,
+  getReasoningConfig,
+} from './conversions/index';
+import type { Format } from './conversions/types';
+import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
+import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, ToolName, TokenUsage, ContentType, RequestLog, ApiPath, ApiPathBinding } from '../types';
 import { AuthType } from '../types';
 import {
   isRuleUsingMCP,
@@ -51,6 +29,16 @@ import {
 } from './mcp-image-handler';
 import { normalizeSourceType } from './type-migration';
 import { readOriginalConfig } from './original-config-reader';
+import {
+  isCodexCompactRequest,
+  isLastClaudeMessageCompact,
+  sanitizeClaudeMessagesForCompact,
+  countUnpairedClaudeToolUses,
+  flattenClaudeToolBlocksForCompact,
+  normalizeClaudeCompactRequestBody,
+  stripClaudeCompactResponseContent,
+} from './conversions/compact';
+import { isCodingToolRequest } from './coding-plan';
 
 type ContentTypeDetector = {
   type: ContentType;
@@ -58,6 +46,60 @@ type ContentTypeDetector = {
 };
 
 const SUPPORTED_TARGETS = ['claude-code', 'codex'];
+
+/** 默认模型列表 */
+const DEFAULT_MODELS = [
+  { id: 'claude-sonnet-4-20250514', owned_by: 'anthropic' },
+  { id: 'claude-opus-4-20250514', owned_by: 'anthropic' },
+  { id: 'claude-haiku-4-20250514', owned_by: 'anthropic' },
+  { id: 'gpt-5.3-codex', owned_by: 'openai' },
+  { id: 'gpt-5.4', owned_by: 'openai' },
+  { id: 'gpt-5.5', owned_by: 'openai' },
+  { id: 'gpt-5.4-mini', owned_by: 'openai' },
+  { id: 'o3-pro', owned_by: 'openai' },
+  { id: 'gemini-3-pro-preview', owned_by: 'google' },
+  { id: 'gemini-3-flash-preview', owned_by: 'google' },
+  { id: 'deepseek-r1', owned_by: 'deepseek' },
+  { id: 'deepseek-chat', owned_by: 'deepseek' },
+];
+
+/** 根据 config 生成模型列表响应 */
+function buildModelsResponse(customModelsStr?: string) {
+  const models = customModelsStr?.trim()
+    ? customModelsStr.split(',').map(s => s.trim()).filter(Boolean)
+    : DEFAULT_MODELS.map(m => m.id);
+  return {
+    object: 'list',
+    data: models.map(id => ({
+      id,
+      object: 'model' as const,
+      created: 1747267200,
+      owned_by: 'custom',
+    })),
+  };
+}
+
+/** 匹配标准 API 路径 */
+function matchApiPath(reqPath: string): ApiPath | null {
+  const p = reqPath.split('?')[0];
+  if (p === '/v1/models') return '/v1/models';
+  if (p === '/v1/messages' || p.startsWith('/v1/messages/')) return '/v1/messages';
+  if (p === '/v1/responses') return '/v1/responses';
+  if (p === '/v1/chat/completions') return '/v1/chat/completions';
+  if (/^\/v1beta\/models\//.test(p)) return '/v1beta/models';
+  return null;
+}
+
+/** 从 API 路径推断客户端格式 */
+function apiPathToClientFormat(apiPath: ApiPath): Format | null {
+  switch (apiPath) {
+    case '/v1/messages': return 'claude';
+    case '/v1/responses': return 'responses';
+    case '/v1/chat/completions': return 'completions';
+    case '/v1beta/models': return 'gemini';
+    case '/v1/models': return null;
+  }
+}
 
 type ProxyRequestOptions = {
   failoverEnabled?: boolean;
@@ -82,6 +124,65 @@ type HighIqInferenceResult = {
   shouldUseHighIq: boolean;
   decisionSource: 'human' | 'fallback' | 'none';
 };
+
+class ClaudeCompactResponseSanitizer extends Transform {
+  private skippedBlockIndexes = new Set<number>();
+  private filteredToolUse = false;
+
+  constructor() {
+    super({ objectMode: true });
+  }
+
+  _transform(event: SSEEvent, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    const data: any = event?.data;
+
+    if (!data || typeof data !== 'object') {
+      this.push(event);
+      callback();
+      return;
+    }
+
+    if (data.type === 'content_block_start') {
+      const blockType = data.content_block?.type;
+      if (blockType === 'thinking' || blockType === 'tool_use') {
+        if (typeof data.index === 'number') {
+          this.skippedBlockIndexes.add(data.index);
+        }
+        if (blockType === 'tool_use') {
+          this.filteredToolUse = true;
+        }
+        callback();
+        return;
+      }
+    }
+
+    if ((data.type === 'content_block_delta' || data.type === 'content_block_stop') && this.skippedBlockIndexes.has(data.index)) {
+      if (data.type === 'content_block_stop') {
+        this.skippedBlockIndexes.delete(data.index);
+      }
+      callback();
+      return;
+    }
+
+    if (data.type === 'message_delta' && this.filteredToolUse && data.delta?.stop_reason === 'tool_use') {
+      this.push({
+        ...event,
+        data: {
+          ...(data || {}),
+          delta: {
+            ...(data?.delta || {}),
+            stop_reason: 'end_turn',
+          },
+        } as any,
+      });
+      callback();
+      return;
+    }
+
+    this.push(event);
+    callback();
+  }
+}
 
 export class ProxyServer {
   private app: express.Application;
@@ -117,6 +218,13 @@ export class ProxyServer {
     return undefined;
   }
 
+  private inferToolFromRequest(req: Request): ToolName {
+    const path = req.path || '';
+    if (path.startsWith('/claude-code')) return 'claude-code';
+    if (path.startsWith('/codex')) return 'codex';
+    return 'claude-code';
+  }
+
   private buildRelayTags(relayed: boolean, useOriginalConfig: boolean = false): string[] {
     const tags = [relayed ? '通过中转' : '未通过中转'];
     if (useOriginalConfig) {
@@ -141,7 +249,7 @@ export class ProxyServer {
       this.inferTargetTypeFromPath(req.path) ||
       this.inferTargetTypeFromPath(req.originalUrl || '');
 
-    if (!enableLogging || !resolvedTargetType) {
+    if (!enableLogging) {
       return;
     }
 
@@ -162,7 +270,52 @@ export class ProxyServer {
   }
 
   initialize() {
-    // Dynamic proxy middleware
+    // === 标准 API 路径前置中间件 ===
+    // 处理 /v1/models 和 4 个可绑定的标准 API 路径
+    this.app.use(async (req: Request, res: Response, next: NextFunction) => {
+      const apiPath = matchApiPath(req.path);
+      if (!apiPath) {
+        return next();
+      }
+
+      // /v1/models: 直接返回静态模型列表
+      if (apiPath === '/v1/models') {
+        // 鉴权
+        if (this.config.apiKey) {
+          const authHeader = req.headers.authorization;
+          const providedKey = authHeader?.replace('Bearer ', '');
+          if (!providedKey || providedKey !== this.config.apiKey) {
+            res.status(401).json({ error: { message: 'Invalid API key' } });
+            return;
+          }
+        }
+        res.json(buildModelsResponse(this.dbManager.getApiPathModels()));
+        return;
+      }
+
+      // 其余 4 个路径：查找绑定
+      const bindings = this.dbManager.getApiPathBindings();
+      const binding = bindings.find((b: ApiPathBinding) => b.apiPath === apiPath);
+      if (!binding || !binding.routeId) {
+        res.status(404).json({ error: { message: `API path ${apiPath} is not bound to any route. Please configure it in Route Mapping settings.` } });
+        return;
+      }
+
+      // 加载绑定的路由
+      const allRoutes = this.dbManager.getRoutes();
+      const route = allRoutes.find((r: Route) => r.id === binding.routeId);
+      if (!route) {
+        return res.status(404).json({ error: { message: `Bound route '${binding.routeId}' not found or inactive. Please check Route Mapping settings.` } });
+      }
+
+      // 推断客户端格式
+      const clientFormat = apiPathToClientFormat(apiPath)!;
+
+      // 复用完整的代理请求处理
+      await this.handleApiPathProxyRequest(req, res, route, clientFormat, apiPath);
+    });
+
+    // Dynamic proxy middleware (原有的 /claude-code, /codex 逻辑)
     this.app.use(async (req: Request, res: Response, next: NextFunction) => {
       // 仅处理支持的目标路径
       if (!SUPPORTED_TARGETS.some(target => req.path.startsWith(`/${target}/`))) {
@@ -195,7 +348,7 @@ export class ProxyServer {
         }
 
         // 高智商请求判定：存在规则时从消息末尾往前搜索 [!]/[x] 标记
-        const forcedContentType = await this.prepareHighIqRouting(req, route, route.targetType);
+        const forcedContentType = await this.prepareHighIqRouting(req, route, this.inferTargetTypeFromPath(req.path) || 'claude-code');
         const enableFailover = this.config?.enableFailover !== false; // 默认为 true
 
         if (!enableFailover) {
@@ -211,7 +364,7 @@ export class ProxyServer {
             await this.logToolRequest(req, {
               statusCode: 404,
               responseTime: Date.now() - requestStartAt,
-              targetType: route.targetType,
+              targetType: this.inferTargetTypeFromPath(req.path) || 'claude-code',
               error: 'No matching rule found',
               tags: this.buildRelayTags(false),
             });
@@ -223,7 +376,7 @@ export class ProxyServer {
             await this.logToolRequest(req, {
               statusCode: 500,
               responseTime: Date.now() - requestStartAt,
-              targetType: route.targetType,
+              targetType: this.inferTargetTypeFromPath(req.path) || 'claude-code',
               error: 'Target service not configured',
               tags: this.buildRelayTags(false),
             });
@@ -247,7 +400,7 @@ export class ProxyServer {
           await this.logToolRequest(req, {
             statusCode: 404,
             responseTime: Date.now() - requestStartAt,
-            targetType: route.targetType,
+            targetType: this.inferTargetTypeFromPath(req.path) || 'claude-code',
             error: 'No matching rule found',
             tags: this.buildRelayTags(false),
           });
@@ -381,7 +534,7 @@ export class ProxyServer {
         await this.logToolRequest(req, {
           statusCode: 503,
           responseTime: Date.now() - requestStartAt,
-          targetType: route.targetType,
+          targetType: this.inferTargetTypeFromPath(req.path) || 'claude-code',
           error: lastError?.message || 'All services failed',
           tags: this.buildRelayTags(hasRelayAttempt),
         });
@@ -488,7 +641,7 @@ export class ProxyServer {
     this.app.use('/codex', this.createFixedRouteHandler('codex'));
   }
 
-  private createFixedRouteHandler(targetType: 'claude-code' | 'codex') {
+  private createFixedRouteHandler(targetType: ToolName) {
     return async (req: Request, res: Response) => {
       const requestStartAt = Date.now();
       let hasRelayAttempt = false;
@@ -796,9 +949,7 @@ export class ProxyServer {
    * 从数据库实时获取所有活跃路由
    * @returns 活跃路由列表
    */
-  private getActiveRoutes(): Route[] {
-    return this.dbManager.getRoutes().filter(route => route.isActive);
-  }
+
 
   /**
    * 从数据库实时获取指定路由的规则
@@ -815,21 +966,19 @@ export class ProxyServer {
   }
 
   private findMatchingRoute(req: Request): Route | undefined {
-    // 根据请求路径确定目标类型
-    let targetType: ToolType | undefined;
+    let tool: ToolName | undefined;
     if (req.path.startsWith('/claude-code/')) {
-      targetType = 'claude-code';
+      tool = 'claude-code';
     } else if (req.path.startsWith('/codex/')) {
-      targetType = 'codex';
+      tool = 'codex';
     }
 
-    if (!targetType) {
-      return undefined;
-    }
+    if (!tool) return undefined;
 
-    // 返回匹配目标类型且处于活跃状态的路由
-    const activeRoutes = this.getActiveRoutes();
-    return activeRoutes.find(route => route.targetType === targetType && route.isActive);
+    const routeId = this.dbManager.getActiveRouteIdForTool(tool);
+    if (!routeId) return undefined;
+
+    return this.dbManager.getRoute(routeId);
   }
 
   /**
@@ -884,8 +1033,6 @@ export class ProxyServer {
       const tempRoute: Route = {
         id: 'fallback-route',
         name: 'Fallback to Original Config',
-        targetType: targetType,
-        isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
@@ -995,9 +1142,10 @@ export class ProxyServer {
     return undefined;
   }
 
-  private findRouteByTargetType(targetType: 'claude-code' | 'codex'): Route | undefined {
-    const activeRoutes = this.getActiveRoutes();
-    return activeRoutes.find(route => route.targetType === targetType && route.isActive);
+  private findRouteByTargetType(tool: ToolName): Route | undefined {
+    const routeId = this.dbManager.getActiveRouteIdForTool(tool);
+    if (!routeId) return undefined;
+    return this.dbManager.getRoute(routeId);
   }
 
   private async findNextAvailableServiceName(allRules: Rule[], startIndex: number, routeId: string): Promise<string | undefined> {
@@ -1337,8 +1485,7 @@ export class ProxyServer {
 
     const body = req.body;
     const requestModel = body?.model;
-    const route = this.dbManager.getRoutes().find(r => r.id === routeId);
-    const contentType = forcedContentType || this.determineContentType(req, route?.targetType || 'claude-code', routeId);
+    const contentType = forcedContentType || this.determineContentType(req, this.inferTargetTypeFromPath(req.path) || 'claude-code', routeId);
 
     // 高智商规则优先于 model-mapping，确保 !!/推断命中时不会被模型映射覆盖
     if (contentType === 'high-iq') {
@@ -1498,8 +1645,7 @@ export class ProxyServer {
     const body = req.body;
     const requestModel = body?.model;
     const candidates: Rule[] = [];
-    const route = this.dbManager.getRoutes().find(r => r.id === routeId);
-    const contentType = forcedContentType || this.determineContentType(req, route?.targetType || 'claude-code', routeId);
+    const contentType = forcedContentType || this.determineContentType(req, this.inferTargetTypeFromPath(req.path) || 'claude-code', routeId);
     const prioritizeContentType = contentType === 'high-iq';
 
     const modelMappingRules = requestModel
@@ -1676,6 +1822,16 @@ export class ProxyServer {
   private getContentTypeDetectors(): ContentTypeDetector[] {
     return [
       {
+        type: 'compact',
+        match: (req, body) => {
+          if (isCodexCompactRequest(req.path) || isCodexCompactRequest(req.originalUrl)) {
+            return true;
+          }
+          const messages = this.extractConversationMessages(body);
+          return isLastClaudeMessageCompact(messages);
+        },
+      },
+      {
         type: 'image-understanding',
         match: (_req, body) => this.containsImageContentInLatestMessage(body.messages) || this.containsImageContent(body.input),
       },
@@ -1765,6 +1921,10 @@ export class ProxyServer {
       image_understanding: 'image-understanding',
       'image-understanding': 'image-understanding',
       vision: 'image-understanding',
+      compact: 'compact',
+      compaction: 'compact',
+      summarize: 'compact',
+      summary: 'compact',
     };
 
     return mapping[normalized] || null;
@@ -2384,11 +2544,6 @@ export class ProxyServer {
     return sourceType === 'claude' || sourceType === 'claude-code';
   }
 
-  /** 判断是否为 Claude Chat 类型 */
-  private isClaudeChatSource(sourceType: SourceType | string) {
-    return sourceType === 'claude-chat';
-  }
-
   private isOpenAISource(sourceType: SourceType | string) {
     // 向下兼容：支持旧类型 'openai-responses'
     return sourceType === 'openai' || sourceType === 'openai-responses';
@@ -2396,12 +2551,7 @@ export class ProxyServer {
 
   /** 判断是否为 OpenAI Chat 类型 */
   private isOpenAIChatSource(sourceType: SourceType | string) {
-    return sourceType === 'openai-chat' || sourceType === 'deepseek-reasoning-chat';
-  }
-
-  /** 判断是否为 OpenAI 类型（包括 OpenAI Chat 和 OpenAI Responses） */
-  private isOpenAIType(sourceType: SourceType | string) {
-    return sourceType === 'openai' || sourceType === 'openai-chat' || sourceType === 'openai-responses' || sourceType === 'deepseek-reasoning-chat';
+    return sourceType === 'openai-chat';
   }
 
   /** 判断是否为 Gemini 类型 */
@@ -2555,7 +2705,7 @@ export class ProxyServer {
         headers['anthropic-version'] = headers['anthropic-version'] || '2023-06-01';
       }
     }
-    // 使用 Authorization 认证（适用于 openai-chat, openai-responses, deepseek-reasoning-chat 等）
+    // 使用 Authorization 认证（适用于 openai-chat, openai-responses 等）
     else {
       headers.authorization = `Bearer ${effectiveApiKey}`;
     }
@@ -2600,6 +2750,20 @@ export class ProxyServer {
     }
 
     return vendor.apiKey || '';
+  }
+
+  private resolveEffectiveApiUrl(service: APIService): string {
+    if (service.inheritVendorApiBaseUrl !== true) {
+      return service.apiUrl;
+    }
+
+    const vendor = this.dbManager.getVendorByServiceId(service.id);
+    if (!vendor || !vendor.apiBaseUrl) {
+      console.warn(`[Proxy] Service ${service.id} is set to inherit vendor API base URL, but vendor/url is missing`);
+      return service.apiUrl;
+    }
+
+    return vendor.apiBaseUrl;
   }
 
   private copyResponseHeaders(responseHeaders: Record<string, any>, res: Response) {
@@ -2700,6 +2864,8 @@ export class ProxyServer {
     }
   }
 
+
+
   private isEmptyResponse(data: any): boolean {
     if (data === null || data === undefined) return true;
     if (typeof data === 'string' && data.trim() === '') return true;
@@ -2718,8 +2884,8 @@ export class ProxyServer {
       const rawUserId = request.body?.metadata?.user_id;
       return ProxyServer.extractSessionIdFromUserId(rawUserId);
     } else if (type === 'codex') {
-      // Codex 使用 headers.session_id
-      const sessionId = request.headers['session_id'];
+      // Codex 使用 headers 中的 session-id 或 session_id（兼容新旧版本）
+      const sessionId = request.headers['session-id'] || request.headers['session_id'];
       if (typeof sessionId === 'string') {
         return sessionId;
       }
@@ -2922,56 +3088,22 @@ export class ProxyServer {
    * @param targetModel 目标模型名称（可选）
    * @returns 转换后往服务商API接口的数据
    */
-  private transformRequestToUpstream(tool: ToolType, source: SourceType, payloadData: any, targetModel: string): any {
-    // Claude Code 发起的请求
-    if (tool === 'claude-code') {
-      // claudecode向claude发送的请求，无需转换，但需要应用模型覆盖
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return applyPayloadOverride(payloadData, targetModel);
-      }
+  private transformRequestToUpstream(tool: ToolType, source: SourceType, payloadData: any, targetModel: string, providerConfig?: any): any {
+    const clientFormat: Format = tool === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(source);
 
-      // claudecode发送给gemini
-      if (this.isGeminiChatSource(source) || this.isGeminiSource(source)) {
-        return transformRequestFromClaudeToGemini(payloadData, targetModel);
-      }
+    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData, providerConfig });
+    const body = result.body;
 
-      // claudecode发送给openai chat completion接口
-      if (this.isOpenAIChatSource(source)) {
-        return transformRequestFromClaudeToChatCompletions(payloadData, targetModel);
-      }
-
-      // claudecode发送给openai responses接口
-      if (this.isOpenAISource(source)) {
-        return transformRequestFromClaudeToResponses(payloadData, targetModel);
+    // 模型覆盖：OpenAI 模型族保持原样，其余覆盖为 targetModel
+    if (targetModel) {
+      const isOpenAIModel = /^gpt-|o[123]/i.test(targetModel);
+      if (!isOpenAIModel) {
+        body.model = targetModel;
       }
     }
 
-    // Codex 发起的请求（仅支持 Responses API 格式）
-    if (tool === 'codex') {
-      // Codex 发送给 OpenAI Responses
-      if (this.isOpenAISource(source)) {
-        return applyPayloadOverride(payloadData, targetModel);
-      }
-
-      // Codex 发送给 OpenAI Chat
-      if (this.isOpenAIChatSource(source)) {
-        // 将 responses 格式转换为 chat completions 格式
-        return transformRequestFromResponsesToChatCompletions(payloadData, targetModel);
-      }
-
-      // Codex 发送给 Gemini
-      if (this.isGeminiChatSource(source) || this.isGeminiSource(source)) {
-        return transformRequestFromResponsesToGemini(payloadData, targetModel);
-      }
-
-      // Codex 发送给 Claude
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return transformRequestFromResponsesToClaude(payloadData, targetModel);
-      }
-    }
-
-    // 默认: 直接返回原始数据（如果需要，应用模型覆盖）
-    return applyPayloadOverride(payloadData, targetModel);
+    return body;
   }
 
   /**
@@ -2981,177 +3113,112 @@ export class ProxyServer {
    * @param responseData
    */
   private transformResponseToTool(tool: ToolType, source: SourceType, responseData: any): any {
-    if (tool === 'claude-code') {
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return responseData;
-      }
-      if (this.isOpenAIChatSource(source)) {
-        return transformResponseFromChatCompletionsToClaude(responseData);
-      }
-      if (this.isOpenAISource(source)) {
-        return transformResponseFromResponsesToClaude(responseData);
-      }
-      if (this.isGeminiSource(source) || this.isGeminiChatSource(source)) {
-        return transformResponseFromGeminiToClaude(responseData);
-      }
-    }
-
-    if (tool === 'codex') {
-      // Codex 仅支持 Responses API 格式
-      // Codex 接收来自 OpenAI Responses 的响应
-      if (this.isOpenAISource(source)) {
-        return responseData;
-      }
-
-      // Codex 接收来自 OpenAI Chat 的响应（转换为 Responses 格式）
-      if (this.isOpenAIChatSource(source)) {
-        return transformResponseFromChatCompletionsToResponses(responseData);
-      }
-
-      // Codex 接收来自 Claude 的响应（转换为 Responses 格式）
-      if (this.isClaudeSource(source) || this.isClaudeChatSource(source)) {
-        return transformResponseFromClaudeToResponses(responseData);
-      }
-
-      // Codex 接收来自 Gemini 的响应（转换为 Responses 格式）
-      if (this.isGeminiSource(source) || this.isGeminiChatSource(source)) {
-        return transformResponseFromGeminiToResponses(responseData);
-      }
-    }
+    const clientFormat: Format = tool === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(source);
+    return convertResponse({ fromFormat: upstreamFormat, toFormat: clientFormat, response: responseData });
   }
 
   /**
    * 获取流式响应转换器
    * @param targetType 目标工具类型
    * @param sourceType 数据源类型
-   * @param model 模型名称
    * @returns 转换器实例和相关信息
    */
-  private transformSSEToTool(targetType: ToolType, sourceType: SourceType, model?: string): {
+  private transformSSEToTool(targetType: ToolType, sourceType: SourceType): {
     converter: Transform | null;
     extractUsage?: (usage: any) => any;
   } {
-    // Claude Code 接收流式响应
-    if (targetType === 'claude-code') {
-      // Claude Code 接收来自 OpenAI Chat 的响应
-      if (this.isOpenAIChatSource(sourceType)) {
-        console.log('[Proxy] Using OpenAI Chat -> Claude API stream converter');
-        return {
-          converter: new ChatCompletionsToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
+    const clientFormat: Format = targetType === 'codex' ? 'responses' : 'claude';
+    const upstreamFormat = sourceTypeToFormat(sourceType);
 
-      // Claude Code 接收来自 OpenAI Responses 的响应
-      if (this.isOpenAISource(sourceType)) {
-        console.log('[Proxy] Using Responses API -> Claude API stream converter');
-        return {
-          converter: new ResponsesToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
-
-      // Claude Code 接收来自 Gemini 的响应
-      if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-        return {
-          converter: new GeminiToClaudeEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-          }),
-        };
-      }
+    if (upstreamFormat === clientFormat) {
+      return { converter: null };
     }
 
-    // Codex 接收流式响应
-    if (targetType === 'codex') {
-      // Codex 接收来自 Claude 的响应
-      if (this.isClaudeSource(sourceType) || this.isClaudeChatSource(sourceType)) {
-        console.log('[Proxy] Using Claude -> Responses API stream converter');
-        return {
-          converter: new ClaudeToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
+    const streamConverter = createStreamConverter({ fromFormat: upstreamFormat, toFormat: clientFormat });
+    const adapter = new StreamConverterAdapter(streamConverter);
 
-      // Codex 接收来自 OpenAI Chat 的响应
-      if (this.isOpenAIChatSource(sourceType)) {
-        console.log('[Proxy] Using OpenAI Chat -> Responses API stream converter');
-        return {
-          converter: new ChatCompletionsToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
+    const extractUsage = clientFormat === 'claude'
+      ? (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+        })
+      : (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
+        });
 
-      // Codex 接收来自 Gemini 的响应
-      if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-        console.log('[Proxy] Using Gemini -> Responses API stream converter');
-        return {
-          converter: new GeminiToResponsesEventTransform({ model }),
-          extractUsage: (usage) => ({
-            inputTokens: usage?.input_tokens || 0,
-            outputTokens: usage?.output_tokens || 0,
-            totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
-          }),
-        };
-      }
-    }
-
-    // 默认：返回空转换器（不需要转换）
-    return { converter: null };
+    return { converter: adapter, extractUsage };
   }
 
   private extractTokenUsageFromResponse(responseData: any, sourceType: SourceType) {
     if (!responseData) return undefined;
 
-    // Gemini 使用 usageMetadata 字段
-    if (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType)) {
-      return extractTokenUsageFromGeminiUsage(responseData?.usageMetadata);
+    const format = sourceTypeToFormat(sourceType);
+
+    if (format === 'gemini') {
+      const usage = responseData?.usageMetadata;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage.promptTokenCount,
+        outputTokens: usage.candidatesTokenCount,
+        totalTokens: usage.totalTokenCount,
+        cacheReadInputTokens: usage.cachedContentTokenCount,
+      };
     }
 
-    // OpenAI 使用 usage 字段
-    if (this.isOpenAIChatSource(sourceType) || this.isOpenAISource(sourceType)) {
-      return extractTokenUsageFromOpenAIUsage(responseData.usage);
+    if (format === 'completions' || format === 'responses') {
+      const usage = responseData?.usage;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage?.input_tokens || usage?.prompt_tokens || 0,
+        outputTokens: usage?.output_tokens || usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        cacheReadInputTokens: usage?.cached_tokens || usage?.cache_read_input_tokens || 0,
+      };
     }
 
-    // Claude：responseData 可能是 usage 对象本身，也可能包含 usage 字段
-    if (this.isClaudeSource(sourceType) || this.isClaudeChatSource(sourceType)) {
-      // 如果 responseData 直接包含 input_tokens/output_tokens，说明它本身就是 usage 对象
+    if (format === 'claude') {
       if (typeof responseData?.input_tokens === 'number' || typeof responseData?.output_tokens === 'number') {
-        return extractTokenUsageFromClaudeUsage(responseData);
+        return {
+          inputTokens: responseData?.input_tokens || 0,
+          outputTokens: responseData?.output_tokens || 0,
+          totalTokens: (responseData?.input_tokens ?? 0) + (responseData?.output_tokens ?? 0) || undefined,
+          cacheReadInputTokens: responseData?.cache_read_input_tokens || 0,
+        };
       }
-      // 否则尝试从 usage 字段提取
-      return extractTokenUsageFromClaudeUsage(responseData.usage);
+      const usage = responseData?.usage;
+      if (!usage) return undefined;
+      return {
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
+        totalTokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0) || undefined,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
+    // 通用 fallback
     const usage = responseData.usage;
     if (!usage) return undefined;
 
-    // OpenAI 使用 prompt_tokens 和 completion_tokens
     if (typeof usage?.prompt_tokens === 'number' || typeof usage?.completion_tokens === 'number') {
-      return extractTokenUsageFromOpenAIUsage(usage);
+      return {
+        inputTokens: usage?.prompt_tokens || 0,
+        outputTokens: usage?.completion_tokens || 0,
+        totalTokens: usage?.total_tokens || 0,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
-    // Claude 使用 input_tokens 和 output_tokens
     if (typeof usage?.input_tokens === 'number' || typeof usage?.output_tokens === 'number') {
-      return extractTokenUsageFromClaudeUsage(usage);
+      return {
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
+        totalTokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0) || undefined,
+        cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+      };
     }
 
     return undefined;
@@ -3170,7 +3237,7 @@ export class ProxyServer {
     const rawSourceType = service.sourceType || 'openai-chat';
     // 标准化 sourceType，将旧类型转换为新类型（向下兼容）
     const sourceType = normalizeSourceType(rawSourceType);
-    const targetType = route.targetType;
+    const targetType = this.inferToolFromRequest(req);
     const sessionId = this.defaultExtractSessionId(req, targetType) || '-';
 
     const vendor = this.dbManager.getVendorByServiceId(service.id);
@@ -3179,11 +3246,36 @@ export class ProxyServer {
     const forwardedToServiceName = options?.forwardedToServiceName;
     const useOriginalConfig = options?.useOriginalConfig === true;
     let relayedForLog = !useOriginalConfig;
-    const originalToolRequestBody = this.cloneRequestBody(req.body || {});
+    let originalToolRequestBody = this.cloneRequestBody(req.body || {});
     let requestBody: any = this.cloneRequestBody(originalToolRequestBody) || {};
     let usageForLog: TokenUsage | undefined;
     let logged = false;
     const extraTagsForLog: string[] = [];
+
+    // 编程套餐限制检查
+    const clientFormat: Format = targetType === 'codex' ? 'responses' : 'claude';
+    if (!this.checkCodingPlan(req, res, service, clientFormat)) return;
+
+    // Compact 请求消息清理：确保 tool_use/tool_result 配对完整
+    if (rule.contentType === 'compact' && targetType === 'claude-code') {
+      if (Array.isArray(originalToolRequestBody?.messages)) {
+        originalToolRequestBody.messages = sanitizeClaudeMessagesForCompact(originalToolRequestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          originalToolRequestBody.messages = flattenClaudeToolBlocksForCompact(originalToolRequestBody.messages);
+        }
+      }
+      originalToolRequestBody = normalizeClaudeCompactRequestBody(originalToolRequestBody);
+      if (Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+      if (Array.isArray(originalToolRequestBody?.messages)) {
+        console.log('[Compact-Sanitize] initial unpaired tool_use count:', countUnpairedClaudeToolUses(originalToolRequestBody.messages));
+      }
+    }
 
     // MCP 图像理解处理
     let tempImageFiles: string[] = [];
@@ -3579,8 +3671,23 @@ export class ProxyServer {
     try {
       // 使用统一的请求转换方法
       const payloadForTransform = this.cloneRequestBody(originalToolRequestBody);
-      const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string);
+      // 获取 provider config 用于驱动 request body 后处理（thinking 参数注入、reasoning 历史修复等）
+      const effectiveApiUrl = this.resolveEffectiveApiUrl(service);
+      const effectiveModel = rule.targetModel || requestBody?.model;
+      const providerConfig = getReasoningConfig(service.name || '', effectiveApiUrl || '', effectiveModel || '');
+      const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string, providerConfig);
       requestBody = transformedRequestBody ?? this.cloneRequestBody(originalToolRequestBody) ?? {};
+
+      // 对最终即将发送到上游的 Claude compact 请求再做一次兜底清理，
+      // 避免中间转换/覆盖步骤重新引入未配对的 tool_use。
+      if (rule.contentType === 'compact' && targetType === 'claude-code' && Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+        requestBody = normalizeClaudeCompactRequestBody(requestBody);
+        console.log('[Compact-Sanitize] final unpaired tool_use count:', countUnpairedClaudeToolUses(requestBody.messages));
+      }
 
       // 应用 max_output_tokens 限制
       requestBody = this.applyMaxOutputTokensLimit(requestBody, service);
@@ -3595,17 +3702,17 @@ export class ProxyServer {
 
       // Build the full URL by appending the request path to the service API URL
       let pathToRequest = req.path;
-      if (route.targetType === 'claude-code' && req.path.startsWith('/claude-code')) {
+      if (targetType === 'claude-code' && req.path.startsWith('/claude-code')) {
         pathToRequest = req.path.slice('/claude-code'.length);
-      } else if (route.targetType === 'codex' && req.path.startsWith('/codex')) {
+      } else if (targetType === 'codex' && req.path.startsWith('/codex')) {
         pathToRequest = req.path.slice('/codex'.length);
       }
 
       // 使用 mapRequestPathToUpstreamUrl 统一构建上游 URL
       const model = rule.targetModel || requestBody?.model;
-      const apiUrl = service.apiUrl;
+      const apiUrl = this.resolveEffectiveApiUrl(service);
       const upstreamUrl = this.mapRequestPathToUpstreamUrl(
-        route.targetType,
+        targetType,
         sourceType,
         pathToRequest,
         apiUrl,
@@ -3705,456 +3812,18 @@ export class ProxyServer {
 
       if (isEventStream && response.data) {
         res.status(response.status);
-        // 统一走默认流式链路（transformSSEToTool + 统一断连保护），避免历史分支行为不一致
-        const useLegacySpecialSSEBranches = false;
-
-        if (useLegacySpecialSSEBranches && targetType === 'claude-code' && this.isOpenAIType(sourceType)) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new OpenAIToClaudeEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          // 收集响应头
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          // 监听事件收集器的完成事件，确保所有chunks都被收集
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            console.log('[Proxy] Claude Code stream: converter usage:', usage);
-            if (usage) {
-              usageForLog = extractTokenUsageFromClaudeUsage(usage);
-              console.log('[Proxy] Claude Code stream: usageForLog from converter:', usageForLog);
-            }
-
-            // 尝试从event collector中提取usage（作为补充）
-            const extractedUsage = eventCollector.extractUsage();
-            console.log('[Proxy] Claude Code stream: extracted usage from eventCollector:', extractedUsage);
-            if (!usageForLog && extractedUsage) {
-              usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              console.log('[Proxy] Claude Code stream: usageForLog from eventCollector:', usageForLog);
-            }
-
-            // 收集stream chunks（每个chunk是一个完整的SSE事件）
-            streamChunksForLog = eventCollector.getChunks();
-            // 将所有 chunks 合并成完整的响应体用于日志记录
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Stream request finished, collected chunks:', streamChunksForLog?.length || 0);
-            console.log('[Proxy] Response body length:', responseBodyForLog?.length || 0);
-            console.log('[Proxy] Claude Code stream: final usageForLog before finalizeLog:', usageForLog);
-            void finalizeLog(res.statusCode);
-          };
-
-          // 在pipeline完成且eventCollector flush后执行
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished, collecting chunks...');
-            finalizeChunks();
-          });
-
-          // 备用：如果eventCollector的finish没有触发，监听res的finish
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          // 监听 res 的错误事件
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for claude-code:', error);
-
-              // 记录到错误日志 - 包含请求详情和实际转发信息
-              try {
-                // 获取供应商信息
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  // 添加请求详情
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              // 尝试向客户端发送错误事件
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `event: error\ndata: ${JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'api_error',
-                      message: 'Stream processing error occurred'
-                    }
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        if (useLegacySpecialSSEBranches && targetType === 'codex' && this.isClaudeSource(sourceType)) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new ClaudeToOpenAIChatEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          // 监听事件收集器的完成事件，确保所有chunks都被收集
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            console.log('[Proxy] Codex stream: converter usage:', usage);
-            if (usage) {
-              usageForLog = extractTokenUsageFromOpenAIUsage(usage);
-              console.log('[Proxy] Codex stream: usageForLog from converter:', usageForLog);
-            }
-
-            // 尝试从event collector中提取usage（作为补充）
-            const extractedUsage = eventCollector.extractUsage();
-            console.log('[Proxy] Codex stream: extracted usage from eventCollector:', extractedUsage);
-            if (!usageForLog && extractedUsage) {
-              usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              console.log('[Proxy] Codex stream: usageForLog from eventCollector:', usageForLog);
-            }
-
-            streamChunksForLog = eventCollector.getChunks();
-            // 将所有 chunks 合并成完整的响应体用于日志记录
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Codex stream request finished, collected chunks:', streamChunksForLog?.length || 0);
-            console.log('[Proxy] Response body length:', responseBodyForLog?.length || 0);
-            console.log('[Proxy] Codex stream: final usageForLog before finalizeLog:', usageForLog);
-            void finalizeLog(res.statusCode);
-          };
-
-          // 在pipeline完成且eventCollector flush后执行
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (codex), collecting chunks...');
-            finalizeChunks();
-          });
-
-          // 备用：如果eventCollector的finish没有触发，监听res的finish
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (codex)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          // 监听 res 的错误事件
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for codex:', error);
-
-              // 记录到错误日志 - 包含请求详情和实际转发信息
-              try {
-                // 获取供应商信息
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  // 添加请求详情
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              // 尝试向客户端发送错误事件
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `data: ${JSON.stringify({
-                    error: 'Stream processing error occurred'
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        // Gemini / Gemini Chat -> Claude Code 流式转换
-        if (useLegacySpecialSSEBranches && targetType === 'claude-code' && (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType))) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new GeminiToClaudeEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            if (usage) {
-              usageForLog = {
-                inputTokens: usage?.input_tokens || 0,
-                outputTokens: usage?.output_tokens || 0,
-                cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
-              };
-            } else {
-              const extractedUsage = eventCollector.extractUsage();
-              if (extractedUsage) {
-                usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              }
-            }
-            streamChunksForLog = eventCollector.getChunks();
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Gemini stream request finished (claude-code), collected chunks:', streamChunksForLog?.length || 0);
-            void finalizeLog(res.statusCode);
-          };
-
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (gemini->claude-code), collecting chunks...');
-            finalizeChunks();
-          });
-
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (gemini->claude-code)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for gemini->claude-code:', error);
-
-              try {
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `event: error\ndata: ${JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'api_error',
-                      message: 'Stream processing error occurred'
-                    }
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
-        // Gemini / Gemini Chat -> Codex 流式转换
-        if (useLegacySpecialSSEBranches && targetType === 'codex' && (this.isGeminiSource(sourceType) || this.isGeminiChatSource(sourceType))) {
-          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-
-          const parser = new SSEParserTransform();
-          const eventCollector = new SSEEventCollectorTransform();
-          const converter = new GeminiToOpenAIChatEventTransform({ model: requestBody?.model });
-          const serializer = new SSESerializerTransform();
-
-          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
-
-          const finalizeChunks = () => {
-            const usage = converter.getUsage();
-            if (usage) {
-              usageForLog = {
-                inputTokens: usage.prompt_tokens,
-                outputTokens: usage.completion_tokens,
-                totalTokens: usage.total_tokens,
-              };
-            } else {
-              const extractedUsage = eventCollector.extractUsage();
-              if (extractedUsage) {
-                usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
-              }
-            }
-            streamChunksForLog = eventCollector.getChunks();
-            responseBodyForLog = streamChunksForLog.join('\n');
-            console.log('[Proxy] Gemini stream request finished (codex), collected chunks:', streamChunksForLog?.length || 0);
-            void finalizeLog(res.statusCode);
-          };
-
-          eventCollector.on('finish', () => {
-            console.log('[Proxy] EventCollector finished (gemini->codex), collecting chunks...');
-            finalizeChunks();
-          });
-
-          res.on('finish', () => {
-            console.log('[Proxy] Response finished (gemini->codex)');
-            if (!streamChunksForLog) {
-              console.log('[Proxy] Chunks not collected yet, forcing collection...');
-              finalizeChunks();
-            }
-          });
-
-          res.on('error', (err) => {
-            console.error('[Proxy] Response stream error:', err);
-          });
-
-          pipeline(response.data, parser, eventCollector, converter, serializer, res, async (error) => {
-            if (error) {
-              console.error('[Proxy] Pipeline error for gemini->codex:', error);
-
-              try {
-                const vendors = this.dbManager.getVendors();
-                const vendor = vendors.find(v => v.id === service.vendorId);
-
-                await this.dbManager.addErrorLog({
-                  timestamp: Date.now(),
-                  method: req.method,
-                  path: req.path,
-                  statusCode: 500,
-                  errorMessage: error.message || 'Stream processing error',
-                  errorStack: error.stack,
-                  requestHeaders: this.normalizeHeaders(req.headers),
-                  requestBody: req.body ? JSON.stringify(req.body) : undefined,
-                  upstreamRequest: upstreamRequestForLog,
-                  responseHeaders: responseHeadersForLog,
-                  ruleId: rule.id,
-                  targetType,
-                  targetServiceId: service.id,
-                  targetServiceName: service.name,
-                  targetModel: rule.targetModel || req.body?.model,
-                  vendorId: service.vendorId,
-                  vendorName: vendor?.name,
-                  requestModel: req.body?.model,
-                  responseTime: Date.now() - startTime,
-                });
-              } catch (logError) {
-                console.error('[Proxy] Failed to log error:', logError);
-              }
-
-              try {
-                if (!res.writableEnded) {
-                  const errorEvent = `data: ${JSON.stringify({
-                    error: 'Stream processing error occurred'
-                  })}\n\n`;
-                  res.write(errorEvent);
-                  res.end();
-                }
-              } catch (writeError) {
-                console.error('[Proxy] Failed to send error event:', writeError);
-              }
-
-              await finalizeLog(500, error.message);
-            }
-          });
-          return;
-        }
-
         // 默认stream处理(无转换)
         const parser = new SSEParserTransform();
         const eventCollector = new SSEEventCollectorTransform();
         const serializer = new SSESerializerTransform();
         const downstreamChunkCollector = new ChunkCollectorTransform();
+        const compactResponseSanitizer = rule.contentType === 'compact' && targetType === 'claude-code'
+          ? new ClaudeCompactResponseSanitizer()
+          : null;
         responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
 
         // 使用 transformSSEToTool 方法选择转换器
-        const { converter, extractUsage } = this.transformSSEToTool(targetType, sourceType, requestBody?.model);
+        const { converter, extractUsage } = this.transformSSEToTool(targetType, sourceType);
 
         this.copyResponseHeaders(responseHeaders, res);
 
@@ -4193,7 +3862,12 @@ export class ProxyServer {
           ensureResponseWritable();
           return await new Promise<void>((resolve, reject) => {
             if (converter) {
-              pipeline(response.data, parser, eventCollector, converter, serializer, downstreamChunkCollector, res, (error) => {
+              const streamStages: any[] = [response.data, parser, eventCollector, converter];
+              if (compactResponseSanitizer) {
+                streamStages.push(compactResponseSanitizer);
+              }
+              streamStages.push(serializer, downstreamChunkCollector, res);
+              pipeline(streamStages[0], streamStages[1], streamStages[2], streamStages[3], ...(streamStages.slice(4) as any[]), (error) => {
                 if (error) {
                   reject(error);
                   return;
@@ -4203,7 +3877,12 @@ export class ProxyServer {
               return;
             }
 
-            pipeline(response.data, parser, eventCollector, serializer, downstreamChunkCollector, res, (error) => {
+            const streamStages: any[] = [response.data, parser, eventCollector];
+            if (compactResponseSanitizer) {
+              streamStages.push(compactResponseSanitizer);
+            }
+            streamStages.push(serializer, downstreamChunkCollector, res);
+            pipeline(streamStages[0], streamStages[1], streamStages[2], ...(streamStages.slice(3) as any[]), (error) => {
               if (error) {
                 reject(error);
                 return;
@@ -4332,6 +4011,9 @@ export class ProxyServer {
 
       // 使用统一的响应转换方法
       const converted = this.transformResponseToTool(targetType, sourceType, responseData);
+      const normalizedConverted = rule.contentType === 'compact' && targetType === 'claude-code'
+        ? stripClaudeCompactResponseContent(converted)
+        : converted;
 
       // 提取 token usage（从原始响应数据中提取）
       usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
@@ -4339,11 +4021,11 @@ export class ProxyServer {
 
       this.copyResponseHeaders(responseHeaders, res);
 
-      if (converted && converted !== responseData) {
+      if (normalizedConverted && normalizedConverted !== responseData) {
         // 非流式：responseBody 记录上游原始响应，downstreamResponseBody 记录转换后下发内容
         responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
-        downstreamResponseBodyForLog = JSON.stringify(converted);
-        res.status(response.status).json(converted);
+        downstreamResponseBodyForLog = JSON.stringify(normalizedConverted);
+        res.status(response.status).json(normalizedConverted);
       } else {
         // 没有转换，使用原始数据
         responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
@@ -4475,7 +4157,7 @@ export class ProxyServer {
       // 根据请求类型返回适当格式的错误响应
       const streamRequested = this.isStreamRequested(req, req.body || {}, targetType, sourceType);
 
-      if (route.targetType === 'claude-code') {
+      if (targetType === 'claude-code') {
         // 对于 Claude Code，返回符合 Claude API 标准的错误响应
         const claudeError = {
           type: 'error',
@@ -4516,14 +4198,14 @@ export class ProxyServer {
     // 修改数据库后无需调用此方法，配置会自动生效
 
     const allRoutes = this.dbManager.getRoutes();
-    const activeRoutes = allRoutes.filter((g) => g.isActive);
+    const allRoutesList = allRoutes;
     const allServices = this.dbManager.getAPIServices();
 
     // 保留缓存以备将来可能的性能优化需求
-    this.routes! = activeRoutes;
+    this.routes! = allRoutesList;
     if (this.rules) {
       this.rules.clear();
-      for (const route of activeRoutes) {
+      for (const route of allRoutesList) {
         const routeRules = this.dbManager.getRules(route.id);
         const sortedRules = [...routeRules].sort((a, b) => (b.sortOrder || 0) - (a.sortOrder || 0));
         this.rules.set(route.id, sortedRules);
@@ -4537,7 +4219,7 @@ export class ProxyServer {
       });
     }
 
-    console.log(`Initialized with ${activeRoutes.length} active routes and ${allServices.length} services (all config read from database in real-time)`);
+    console.log(`Initialized with ${allRoutesList.length} routes and ${allServices.length} services (all config read from database in real-time)`);
   }
 
   async updateConfig(config: AppConfig) {
@@ -4547,5 +4229,574 @@ export class ProxyServer {
   async registerProxyRoutes() {
     this.addProxyRoutes();
     await this.reloadRoutes();
+  }
+
+  // ============================================================
+  // 标准 API 路径代理请求处理
+  // ============================================================
+
+  /**
+   * 处理通过标准 API 路径（/v1/messages, /v1/responses 等）进入的代理请求。
+   * 与原有 proxyRequest 逻辑独立，复用规则匹配、故障切换等机制。
+   */
+  private async handleApiPathProxyRequest(
+    req: Request,
+    res: Response,
+    route: Route,
+    clientFormat: Format,
+    apiPath: ApiPath
+  ) {
+    const requestStartAt = Date.now();
+
+    // 鉴权
+    if (this.config.apiKey) {
+      const authHeader = req.headers.authorization;
+      const providedKey = authHeader?.replace('Bearer ', '');
+      if (!providedKey || providedKey !== this.config.apiKey) {
+        await this.logToolRequest(req, {
+          statusCode: 401,
+          responseTime: Date.now() - requestStartAt,
+          error: 'Invalid API key',
+          tags: this.buildRelayTags(false),
+        });
+        // 根据客户端格式返回错误
+        if (clientFormat === 'claude') {
+          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
+        } else {
+          res.status(401).json({ error: { message: 'Invalid API key' } });
+        }
+        return;
+      }
+    }
+
+    const enableFailover = this.config?.enableFailover !== false;
+
+    if (!enableFailover) {
+      const rule = await this.findMatchingRule(route.id, req);
+      if (!rule) {
+        return res.status(404).json({ error: { message: 'No matching rule found' } });
+      }
+      const service = this.getServiceById(rule.targetServiceId);
+      if (!service) {
+        return res.status(500).json({ error: { message: 'Target service not configured' } });
+      }
+      try {
+        await this.proxyRequestForApiPath(req, res, route, rule, service, clientFormat, apiPath);
+      } catch (error: any) {
+        console.error('[ApiPathProxy] Error:', error.message);
+        this.sendFormatError(res, clientFormat, 500, error.message);
+      }
+      return;
+    }
+
+    // 故障切换模式
+    const allRules = this.getAllMatchingRules(route.id, req);
+    if (allRules.length === 0) {
+      return res.status(404).json({ error: { message: 'No matching rule found' } });
+    }
+
+    let lastError: Error | null = null;
+    let lastFailedRule: Rule | null = null;
+    let lastFailedService: APIService | null = null;
+
+    for (let i = 0; i < allRules.length; i++) {
+      const rule = allRules[i];
+      const service = this.getServiceById(rule.targetServiceId);
+      if (!service) continue;
+
+      const isBlacklisted = await this.dbManager.isServiceBlacklisted(
+        service.id, route.id, rule.contentType
+      );
+      if (isBlacklisted) {
+        console.log(`[ApiPathProxy] Service ${service.name} is blacklisted, skipping...`);
+        continue;
+      }
+
+      try {
+        const nextServiceName = await this.findNextAvailableServiceName(allRules, i + 1, route.id);
+        await this.proxyRequestForApiPath(req, res, route, rule, service, clientFormat, apiPath, {
+          failoverEnabled: true,
+          forwardedToServiceName: nextServiceName,
+        });
+        return;
+      } catch (error: any) {
+        console.error(`[ApiPathProxy] Service ${service.name} failed:`, error.message);
+        lastError = error;
+        lastFailedRule = rule;
+        lastFailedService = service;
+
+        const isTimeout = error.code === 'ECONNABORTED' ||
+          error.message?.toLowerCase().includes('timeout') ||
+          error.errno === 'ETIMEDOUT';
+
+        if (isTimeout) {
+          await this.dbManager.addToBlacklist(service.id, route.id, rule.contentType,
+            'Request timeout', undefined, 'timeout');
+          rulesStatusBroadcaster.markRuleSuspended(route.id, rule.id, service.id, rule.contentType,
+            '请求超时', 'timeout');
+        } else {
+          const statusCode = this.getErrorStatusCode(error, 500);
+          if (statusCode >= 400) {
+            await this.dbManager.addToBlacklist(service.id, route.id, rule.contentType,
+              error.message, statusCode, 'http');
+            rulesStatusBroadcaster.markRuleSuspended(route.id, rule.id, service.id, rule.contentType,
+              `HTTP ${statusCode} 错误`, 'http');
+          }
+        }
+        continue;
+      }
+    }
+
+    // Fallback: try the last failed service
+    if (lastFailedRule && lastFailedService) {
+      try {
+        await this.proxyRequestForApiPath(req, res, route, lastFailedRule, lastFailedService, clientFormat, apiPath, {
+          failoverEnabled: false,
+        });
+        return;
+      } catch (fallbackError: any) {
+        lastError = fallbackError;
+      }
+    }
+
+    await this.logToolRequest(req, {
+      statusCode: 503,
+      responseTime: Date.now() - requestStartAt,
+      error: lastError?.message || 'All services failed',
+      tags: this.buildRelayTags(true),
+    });
+
+    this.sendFormatError(res, clientFormat, 503, lastError?.message || 'All services failed');
+  }
+
+  /**
+   * 对单个规则执行代理请求（标准 API 路径入口）。
+   * 与原有 proxyRequest 类似，但使用 clientFormat 而非 targetType 推断格式。
+   */
+  private async proxyRequestForApiPath(
+    req: Request,
+    res: Response,
+    route: Route,
+    rule: Rule,
+    service: APIService,
+    clientFormat: Format,
+    apiPath: ApiPath,
+    options?: ProxyRequestOptions
+  ) {
+    const startTime = Date.now();
+    const rawSourceType = service.sourceType || 'openai-chat';
+    const sourceType = normalizeSourceType(rawSourceType);
+
+    const vendor = this.dbManager.getVendorByServiceId(service.id);
+    console.log(`\x1b[32m[ApiPathProxy]\x1b[0m path=${apiPath}, clientFormat=${clientFormat}, session=-, rule=${rule.id}(${rule.contentType}), vendor=${vendor?.name || '-'}, service=${service.name}`);
+
+    const failoverEnabled = options?.failoverEnabled === true;
+
+    let requestBody: any = this.cloneRequestBody(req.body || {});
+    let usageForLog: TokenUsage | undefined;
+    let responseBodyForLog: string | undefined;
+    let downstreamResponseBodyForLog: string | undefined;
+    let streamChunksForLog: string[] | undefined;
+    let responseHeadersForLog: Record<string, string> | undefined;
+    let upstreamRequestForLog: any;
+    let relayedForLog = true;
+    void downstreamResponseBodyForLog; void streamChunksForLog; void responseHeadersForLog; void upstreamRequestForLog;
+
+    // 编程套餐限制检查
+    if (!this.checkCodingPlan(req, res, service, clientFormat)) return;
+
+    // Compact 处理（针对 claude 格式的 compact）
+    if (rule.contentType === 'compact' && clientFormat === 'claude') {
+      if (Array.isArray(requestBody?.messages)) {
+        requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+        if (this.isClaudeSource(sourceType)) {
+          requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+        }
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+    }
+
+    const finalizeLog = async (statusCode: number, error?: string) => {
+      if (logged) return;
+      logged = true;
+
+      await this.logToolRequest(req, {
+        statusCode,
+        responseTime: Date.now() - startTime,
+        usage: usageForLog,
+        error,
+        tags: this.buildRelayTags(relayedForLog),
+      });
+    };
+    let logged = false;
+
+    // count_tokens 本地处理
+    if (this.isCountTokensPath(req.path)) {
+      const inputTokens = this.estimateClaudeCountTokens(requestBody);
+      const localTokenResponse = { input_tokens: inputTokens };
+      usageForLog = { inputTokens, outputTokens: 0, totalTokens: inputTokens };
+      res.status(200).json(localTokenResponse);
+      await finalizeLog(200);
+      return;
+    }
+
+    // 请求转换：使用 clientFormat 而非硬编码的 tool→format 映射
+    const payloadForTransform = this.cloneRequestBody(requestBody);
+    const effectiveApiUrl = this.resolveEffectiveApiUrl(service);
+    const effectiveModel = rule.targetModel || requestBody?.model;
+    const providerConfig = getReasoningConfig(service.name || '', effectiveApiUrl || '', effectiveModel || '');
+
+    const transformedRequestBody = this.transformRequestByFormat(clientFormat, sourceType, payloadForTransform, rule.targetModel as string, providerConfig);
+    requestBody = transformedRequestBody ?? this.cloneRequestBody(requestBody) ?? {};
+
+    // Compact final sanitize
+    if (rule.contentType === 'compact' && clientFormat === 'claude' && Array.isArray(requestBody?.messages)) {
+      requestBody.messages = sanitizeClaudeMessagesForCompact(requestBody.messages);
+      if (this.isClaudeSource(sourceType)) {
+        requestBody.messages = flattenClaudeToolBlocksForCompact(requestBody.messages);
+      }
+      requestBody = normalizeClaudeCompactRequestBody(requestBody);
+    }
+
+    // 应用 max_output_tokens 限制
+    requestBody = this.applyMaxOutputTokensLimit(requestBody, service);
+
+    // Stream 判断
+    const streamRequested = this.isStreamRequested(req, requestBody);
+
+    // 构建上游 URL
+    const model = rule.targetModel || requestBody?.model;
+    const apiUrl = this.resolveEffectiveApiUrl(service);
+    const upstreamUrl = this.mapApiPathToUpstreamUrl(apiPath, sourceType, apiUrl, model, streamRequested);
+
+    upstreamRequestForLog = { url: upstreamUrl, body: requestBody || undefined };
+
+    const upstreamHeaders = this.buildUpstreamHeaders(req, service, sourceType, streamRequested, requestBody);
+
+    const upstreamAbortController = new AbortController();
+    const abortUpstreamRequest = (reason: string) => {
+      if (!upstreamAbortController.signal.aborted) {
+        upstreamAbortController.abort(new Error(`Client disconnected: ${reason}`));
+      }
+    };
+    req.once('aborted', () => abortUpstreamRequest('request aborted'));
+    res.once('close', () => {
+      if (!res.writableEnded) abortUpstreamRequest('response stream closed');
+    });
+
+    try {
+      const axiosConfig: AxiosRequestConfig = {
+        method: req.method as any,
+        url: upstreamUrl,
+        headers: upstreamHeaders,
+        timeout: this.resolveEffectiveTimeout(rule),
+        validateStatus: () => true,
+        responseType: streamRequested ? 'stream' : 'json',
+        signal: upstreamAbortController.signal,
+      };
+      if (Object.keys(req.query).length > 0) {
+        axiosConfig.params = req.query;
+      }
+      if (['POST', 'PUT', 'PATCH'].includes(req.method.toUpperCase())) {
+        axiosConfig.data = requestBody;
+      }
+
+      // 代理配置
+      if (service.enableProxy) {
+        const appConfig = this.dbManager.getConfig();
+        if (appConfig.proxyEnabled && appConfig.proxyUrl) {
+          try {
+            const { HttpsProxyAgent } = await import('https-proxy-agent');
+            let proxyUrl = appConfig.proxyUrl;
+            const proxyAuth = appConfig.proxyUsername && appConfig.proxyPassword
+              ? `${appConfig.proxyUsername}:${appConfig.proxyPassword}@` : '';
+            if (!proxyUrl.startsWith('http://') && !proxyUrl.startsWith('https://')) {
+              proxyUrl = `http://${proxyAuth}${proxyUrl}`;
+            } else if (proxyAuth) {
+              const urlObj = new URL(proxyUrl);
+              urlObj.username = appConfig.proxyUsername!;
+              urlObj.password = appConfig.proxyPassword!;
+              proxyUrl = urlObj.toString();
+            }
+            axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
+            axiosConfig.httpAgent = new HttpsProxyAgent(proxyUrl);
+          } catch (error) {
+            console.error('[ApiPathProxy] Failed to create proxy agent:', error);
+          }
+        }
+      }
+
+      const response = await axios(axiosConfig);
+      const responseHeaders = response.headers || {};
+      const contentType = typeof responseHeaders['content-type'] === 'string' ? responseHeaders['content-type'] : '';
+      const isEventStream = streamRequested && contentType.includes('text/event-stream');
+
+      // Handle upstream errors
+      if (response.status >= 400) {
+        let errorResponseData = response.data;
+        if (streamRequested && response.data && typeof response.data.on === 'function') {
+          const raw = await this.readStreamBody(response.data);
+          errorResponseData = this.safeJsonParse(raw) ?? raw;
+        }
+        responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+        const errorMessage = typeof errorResponseData === 'string'
+          ? errorResponseData
+          : errorResponseData?.error?.message || errorResponseData?.error || JSON.stringify(errorResponseData);
+
+        if (failoverEnabled) {
+          await finalizeLog(response.status, errorMessage);
+          throw this.createFailoverError(errorMessage, response.status);
+        }
+
+        this.copyResponseHeaders(responseHeaders, res);
+        if (contentType.includes('application/json')) {
+          res.status(response.status).json(errorResponseData);
+        } else {
+          res.status(response.status).send(errorResponseData);
+        }
+        await finalizeLog(response.status);
+        return;
+      }
+
+      if (isEventStream && response.data) {
+        // Stream pipeline
+        const parser = new SSEParserTransform();
+        const eventCollector = new SSEEventCollectorTransform();
+        const serializer = new SSESerializerTransform();
+        const downstreamChunkCollector = new ChunkCollectorTransform();
+        responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+        const { converter, extractUsage } = this.transformSSEByFormat(clientFormat, sourceType);
+        this.copyResponseHeaders(responseHeaders, res);
+        res.status(response.status);
+
+        const finalizeStreamChunks = () => {
+          streamChunksForLog = eventCollector.getChunks();
+          responseBodyForLog = streamChunksForLog.join('\n');
+          downstreamResponseBodyForLog = downstreamChunkCollector.getChunks().join('');
+          let extractedUsage = eventCollector.extractUsage();
+          if (converter && typeof (converter as any).getUsage === 'function') {
+            const converterUsage = (converter as any).getUsage();
+            if (converterUsage) extractedUsage = converterUsage;
+          }
+          if (extractUsage && extractedUsage) {
+            usageForLog = extractUsage(extractedUsage);
+          } else if (extractedUsage) {
+            usageForLog = this.extractTokenUsageFromResponse(extractedUsage, sourceType);
+          }
+        };
+
+        try {
+          await new Promise<void>((resolve, reject) => {
+            if (converter) {
+              pipeline(response.data, parser, eventCollector, converter, serializer, downstreamChunkCollector, res, (error: any) => {
+                if (error) { reject(error); return; }
+                resolve();
+              });
+            } else {
+              pipeline(response.data, parser, eventCollector, serializer, downstreamChunkCollector, res, (error: any) => {
+                if (error) { reject(error); return; }
+                resolve();
+              });
+            }
+          });
+        } catch (error: any) {
+          if (this.isClientDisconnectError(error, res)) {
+            await finalizeLog(499, 'Client disconnected');
+            return;
+          }
+          console.error('[ApiPathProxy] Stream pipeline error:', error);
+          await finalizeLog(500, error.message);
+          if (failoverEnabled && !this.isResponseCommitted(res)) {
+            throw this.createFailoverError(error.message, 500, error);
+          }
+          return;
+        }
+
+        finalizeStreamChunks();
+        await finalizeLog(res.statusCode);
+        return;
+      }
+
+      // Non-stream response
+      let responseData = response.data;
+      if (streamRequested && response.data && typeof response.data.on === 'function' && !isEventStream) {
+        const raw = await this.readStreamBody(response.data);
+        responseData = this.safeJsonParse(raw) ?? raw;
+      }
+
+      responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+
+      if (this.isEmptyResponse(responseData)) {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        await finalizeLog(200);
+        res.status(200).end();
+        return;
+      }
+
+      // 使用 clientFormat 做响应转换
+      const converted = this.transformResponseByFormat(sourceType, clientFormat, responseData);
+      const normalizedConverted = rule.contentType === 'compact' && clientFormat === 'claude'
+        ? stripClaudeCompactResponseContent(converted)
+        : converted;
+
+      usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
+      this.copyResponseHeaders(responseHeaders, res);
+
+      if (normalizedConverted && normalizedConverted !== responseData) {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        downstreamResponseBodyForLog = JSON.stringify(normalizedConverted);
+        res.status(response.status).json(normalizedConverted);
+      } else {
+        responseBodyForLog = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
+        downstreamResponseBodyForLog = responseBodyForLog;
+        if (contentType.includes('application/json')) {
+          res.status(response.status).json(responseData);
+        } else {
+          res.status(response.status).send(responseData);
+        }
+      }
+
+      await finalizeLog(res.statusCode);
+    } finally {
+      rulesStatusBroadcaster.markRuleIdle(route.id, rule.id);
+    }
+  }
+
+  /**
+   * 使用显式 clientFormat 进行请求转换（取代 tool → format 的硬编码映射）
+   */
+  private transformRequestByFormat(clientFormat: Format, source: SourceType, payloadData: any, targetModel: string, providerConfig?: any): any {
+    const upstreamFormat = sourceTypeToFormat(source);
+    const result = convertRequest({ fromFormat: clientFormat, toFormat: upstreamFormat, body: payloadData, providerConfig });
+    const body = result.body;
+    if (targetModel) {
+      const isOpenAIModel = /^gpt-|o[123]/i.test(targetModel);
+      if (!isOpenAIModel) {
+        body.model = targetModel;
+      }
+    }
+    return body;
+  }
+
+  /**
+   * 使用显式格式进行响应转换
+   */
+  private transformResponseByFormat(upstreamFormat: SourceType, clientFormat: Format, responseData: any): any {
+    const upstream = sourceTypeToFormat(upstreamFormat);
+    return convertResponse({ fromFormat: upstream, toFormat: clientFormat, response: responseData });
+  }
+
+  /**
+   * 使用显式格式进行流式转换
+   */
+  private transformSSEByFormat(clientFormat: Format, sourceType: SourceType): {
+    converter: Transform | null;
+    extractUsage?: (usage: any) => any;
+  } {
+    const upstreamFormat = sourceTypeToFormat(sourceType);
+    if (upstreamFormat === clientFormat) {
+      return { converter: null };
+    }
+    const streamConverter = createStreamConverter({ fromFormat: upstreamFormat, toFormat: clientFormat });
+    const adapter = new StreamConverterAdapter(streamConverter);
+
+    const extractUsage = clientFormat === 'claude'
+      ? (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          cacheReadInputTokens: usage?.cache_read_input_tokens || 0,
+        })
+      : (usage: any) => ({
+          inputTokens: usage?.input_tokens || 0,
+          outputTokens: usage?.output_tokens || 0,
+          totalTokens: (usage?.input_tokens || 0) + (usage?.output_tokens || 0),
+        });
+
+    return { converter: adapter, extractUsage };
+  }
+
+  /**
+   * 为标准 API 路径构建上游 URL
+   */
+  private mapApiPathToUpstreamUrl(_apiPath: ApiPath, source: SourceType, apiUrl: string, modelName: string, isStream: boolean): string {
+    const geminiEndpoint = isStream ? 'streamGenerateContent' : 'generateContent';
+    const buildGeminiUrl = (url: string) => {
+      if (url.includes('streamGenerateContent')) {
+        const [pathname, search] = url.split('?');
+        if (search?.includes('alt=sse')) return url;
+        if (search) return `${pathname}?${search}&alt=sse`;
+        return `${pathname}?alt=sse`;
+      }
+      return url;
+    };
+
+    // Gemini chat 类型：URL 中包含 {modelName} 和 {endPoint} 占位符
+    if (this.isGeminiChatSource(source)) {
+      const url = apiUrl.replace('{modelName}', modelName).replace('{endPoint}', geminiEndpoint);
+      return buildGeminiUrl(url);
+    }
+
+    // Chat 类型（openai-chat, claude-chat）：直接使用 apiUrl
+    if (this.isChatType(source)) {
+      return apiUrl;
+    }
+
+    // Gemini base 类型
+    if (this.isGeminiSource(source)) {
+      const url = `${apiUrl}/v1beta/models/${modelName}:${geminiEndpoint}`;
+      return buildGeminiUrl(url);
+    }
+
+    // 对于标准 API 路径，直接根据上游格式拼接
+    const upstreamFormat = sourceTypeToFormat(source);
+    switch (upstreamFormat) {
+      case 'claude':
+        return `${apiUrl}/v1/messages`;
+      case 'responses':
+        return `${apiUrl}/v1/responses`;
+      case 'completions':
+        return `${apiUrl}/v1/chat/completions`;
+      case 'gemini':
+        return `${apiUrl}/v1beta/models/${modelName}:${geminiEndpoint}`;
+      default:
+        return apiUrl;
+    }
+  }
+
+  /**
+   * 编程套餐限制检查
+   * 当服务启用了 enableCodingPlan 时，仅允许编程工具发起的请求通过。
+   * @returns true 表示通过检查（可以继续），false 表示已被拒绝（已写入响应）
+   */
+  private checkCodingPlan(req: Request, res: Response, service: APIService, clientFormat: Format): boolean {
+    if (!service.enableCodingPlan) return true; // 未启用，直接通过
+
+    const headers = req.headers as Record<string, string | undefined>;
+    const codingCheck = isCodingToolRequest(req.body, clientFormat, headers);
+    if (codingCheck.isCoding) return true; // 是编程工具请求，通过
+
+    // 非编程工具请求，拒绝
+    console.warn(`\x1b[33m[CodingPlan]\x1b[0m Rejected non-coding request: service=${service.name}, reason=${codingCheck.reason}`);
+    this.sendFormatError(res, clientFormat, 403, '此 API 服务仅允许编程工具调用（如 Claude Code、Codex、Cursor 等）');
+    return false;
+  }
+
+  /**
+   * 根据客户端格式发送错误响应
+   */
+  private sendFormatError(res: Response, clientFormat: Format, statusCode: number, message: string) {
+    if (this.isResponseCommitted(res)) return;
+    switch (clientFormat) {
+      case 'claude':
+        res.status(statusCode).json({ type: 'error', error: { type: 'api_error', message } });
+        break;
+      case 'gemini':
+        res.status(statusCode).json({ error: { code: statusCode, message } });
+        break;
+      default:
+        res.status(statusCode).json({ error: { message } });
+    }
   }
 }

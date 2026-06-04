@@ -1,12 +1,12 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { api } from '../api/client';
-import type { Route, Rule, APIService, ContentType, Vendor, ServiceBlacklistEntry, MCPServer, ToolInstallationStatus, CodexReasoningEffort, ClaudeEffortLevel, AppConfig } from '../../types';
-import { useFlipAnimation } from '../hooks/useFlipAnimation';
+import type { Route, Rule, APIService, ContentType, Vendor, ServiceBlacklistEntry, MCPServer, ToolInstallationStatus, CodexReasoningEffort, ClaudeEffortLevel, AppConfig, ApiPathBinding, ToolName, ToolBindings } from '../../types';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
 import { useRulesStatus } from '../hooks/useRulesStatus';
 
 const CONTENT_TYPE_OPTIONS = [
+  { value: 'compact', label: '压缩对话', icon: '📦' },
   { value: 'image-understanding', label: '图像理解', icon: '🖼' },
   { value: 'high-iq', label: '高智商', icon: '🧠' },
   { value: 'long-context', label: '长上下文', icon: '📄' },
@@ -18,6 +18,7 @@ const CONTENT_TYPE_OPTIONS = [
 
 // 类型排序权重（数值越小越靠前）
 const CONTENT_TYPE_ORDER: Record<string, number> = {
+  'compact': 0,
   'image-understanding': 1,
   'high-iq': 2,
   'long-context': 3,
@@ -29,6 +30,7 @@ const CONTENT_TYPE_ORDER: Record<string, number> = {
 
 // 类型到图标的映射
 const CONTENT_TYPE_ICONS: Record<string, string> = {
+  'compact': '📦',
   'background': '🧱',
   'thinking': '💭',
   'high-iq': '🧠',
@@ -36,11 +38,6 @@ const CONTENT_TYPE_ICONS: Record<string, string> = {
   'image-understanding': '🖼️',
   'model-mapping': '🔄',
 };
-
-const TARGET_TYPE_OPTIONS = [
-  { value: 'claude-code', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
-];
 
 const CODEX_REASONING_EFFORT_OPTIONS: Array<{ value: CodexReasoningEffort; label: string }> = [
   { value: 'low', label: 'Low' },
@@ -98,6 +95,8 @@ export default function RoutesPage() {
   const [services, setServices] = useState<APIService[]>([]);
   const [mcps, setMCPs] = useState<MCPServer[]>([]);
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
+  const [apiPathBindings, setApiPathBindings] = useState<ApiPathBinding[]>([]);
+  const [apiPathModels, setApiPathModels] = useState('');
   const [selectedRoute, setSelectedRoute] = useState<Route | null>(null);
   const [showRouteModal, setShowRouteModal] = useState(false);
   const [showRuleModal, setShowRuleModal] = useState(false);
@@ -114,7 +113,6 @@ export default function RoutesPage() {
   const [selectedTokenResetBaseTime, setSelectedTokenResetBaseTime] = useState<Date | undefined>(undefined);
   const [selectedTimeout, setSelectedTimeout] = useState<number | undefined>(undefined);
   const [ruleGlobalTimeout, setRuleGlobalTimeout] = useState<string>('');
-  const [isUpdatingGlobalTimeout, setIsUpdatingGlobalTimeout] = useState(false);
   const [selectedRequestCountLimit, setSelectedRequestCountLimit] = useState<number | undefined>(undefined);
   const [selectedRequestResetInterval, setSelectedRequestResetInterval] = useState<number | undefined>(undefined);
   const [selectedRequestResetBaseTime, setSelectedRequestResetBaseTime] = useState<Date | undefined>(undefined);
@@ -141,20 +139,14 @@ export default function RoutesPage() {
   const [claudeVersionCheck, setClaudeVersionCheck] = useState<ToolInstallationStatus | null>(null);
 
   // 配置操作loading状态
-  const [isConfiguringRoute, setIsConfiguringRoute] = useState<string | null>(null);
   const [isUpdatingCodexReasoning, setIsUpdatingCodexReasoning] = useState(false);
   const [isUpdatingClaudeEffort, setIsUpdatingClaudeEffort] = useState(false);
   const [claudeDefaultModelInput, setClaudeDefaultModelInput] = useState<string>('');
   const [claudeDefaultModelDirty, setClaudeDefaultModelDirty] = useState(false);
-  const [isUpdatingClaudeDefaultModel, setIsUpdatingClaudeDefaultModel] = useState(false);
+  const [autocompactPctInput, setAutocompactPctInput] = useState<string>('');
+  const [autocompactPctDirty, setAutocompactPctDirty] = useState(false);
   const [codexDefaultModelInput, setCodexDefaultModelInput] = useState<string>('');
   const [codexDefaultModelDirty, setCodexDefaultModelDirty] = useState(false);
-  const [isUpdatingCodexDefaultModel, setIsUpdatingCodexDefaultModel] = useState(false);
-
-  // FLIP动画相关
-  const { recordPositions, applyAnimation } = useFlipAnimation();
-  const routeRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const activatingRouteIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     loadRoutes();
@@ -162,23 +154,43 @@ export default function RoutesPage() {
     loadAllServices();
     loadMCPs();
     loadAppConfig();
+    loadToolBindings();
+    loadApiPathBindings();
     checkClaudeVersion();
   }, []);
 
-  // 添加页面刷新保护
-  useEffect(() => {
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (isConfiguringRoute) {
-        e.preventDefault();
-        // 现代浏览器会忽略自定义消息，显示标准确认对话框
-        // 为了兼容性，仍然设置 returnValue（但会被浏览器忽略）
-        e.returnValue = '';
-      }
-    };
 
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [isConfiguringRoute]);
+  const loadApiPathBindings = async () => {
+    try {
+      const result = await api.getApiPathBindings();
+      setApiPathBindings(result.bindings || []);
+      setApiPathModels(result.models || '');
+    } catch (error) {
+      console.error('Failed to load API path bindings:', error);
+    }
+  };
+
+  const saveBindings = async (bindings: ApiPathBinding[], models: string) => {
+    try {
+      const result = await api.updateApiPathBindings(bindings, models);
+      setApiPathBindings(result.bindings);
+      toast.success('路由映射已保存');
+    } catch (error: any) {
+      toast.error(error.message || '保存失败');
+    }
+  };
+
+  const handleBindingChange = (apiPath: string, routeId: string | null) => {
+    const updated = apiPathBindings.map(b => b.apiPath === apiPath ? { ...b, routeId } : b);
+    setApiPathBindings(updated);
+    saveBindings(updated, apiPathModels);
+  };
+
+  const handleModelsBlur = () => {
+    saveBindings(apiPathBindings, apiPathModels);
+  };
+
+
 
   useEffect(() => {
     if (selectedRoute) {
@@ -198,15 +210,9 @@ export default function RoutesPage() {
 
   const loadRoutes = async () => {
     const data = await api.getRoutes();
-    // 将已激活的路由排在前面
-    const sortedData = data.sort((a, b) => {
-      if (a.isActive && !b.isActive) return -1;
-      if (!a.isActive && b.isActive) return 1;
-      return 0;
-    });
-    setRoutes(sortedData);
-    if (sortedData.length > 0 && !selectedRoute) {
-      setSelectedRoute(sortedData[0]);
+    setRoutes(data);
+    if (data.length > 0 && !selectedRoute) {
+      setSelectedRoute(data[0]);
     }
   };
 
@@ -275,12 +281,17 @@ export default function RoutesPage() {
     setMCPs(data);
   };
 
+  const [toolBindings, setToolBindings] = useState<ToolBindings | null>(null);
+  const [isConfiguringBinding, setIsConfiguringBinding] = useState<ToolName | null>(null);
+
   const loadAppConfig = async () => {
     try {
       const data = await api.getConfig();
       setAppConfig(data);
       setClaudeDefaultModelInput(data.claudeDefaultModel || '');
       setClaudeDefaultModelDirty(false);
+      setAutocompactPctInput(data.autocompactPctOverride != null ? String(data.autocompactPctOverride) : '');
+      setAutocompactPctDirty(false);
       setCodexDefaultModelInput(data.codexDefaultModel || '');
       setCodexDefaultModelDirty(false);
       setRuleGlobalTimeout(
@@ -293,55 +304,52 @@ export default function RoutesPage() {
     }
   };
 
-  const handleActivateRoute = async (id: string) => {
-    setIsConfiguringRoute(id);
-
+  const loadToolBindings = async () => {
     try {
-      // 仅激活路由（配置写入由服务生命周期统一处理）
-      const routeElement = routeRefs.current.get(id);
-      if (routeElement) {
-        recordPositions(id, routeElement);
-      }
+      const data = await api.getToolBindings();
+      setToolBindings(data);
+    } catch (error) {
+      console.error('Failed to load tool bindings:', error);
+    }
+  };
 
-      activatingRouteIdRef.current = id;
-      await api.activateRoute(id);
-      await loadRoutes();
-
-      // 在下一帧应用动画（Invert和Play阶段）
-      if (routeElement) {
-        setTimeout(() => {
-          const newRouteElement = routeRefs.current.get(id);
-          if (newRouteElement) {
-            applyAnimation(id, newRouteElement, 250);
-          }
-          activatingRouteIdRef.current = null;
-        }, 0);
+  const handleActivateToolRoute = async (tool: ToolName, routeId: string) => {
+    setIsConfiguringBinding(tool);
+    try {
+      const result = await api.activateToolRoute(tool, routeId);
+      if (result.success) {
+        await loadToolBindings();
+        await loadRoutes();
+        toast.success('路由已激活');
       } else {
-        activatingRouteIdRef.current = null;
+        toast.error('激活失败');
       }
     } catch (error: any) {
-      console.error('激活路由失败:', error);
-      activatingRouteIdRef.current = null;
-      toast.error(`路由激活失败: ${error.message || '未知错误'}`);
+      toast.error(`激活失败: ${error.message || '未知错误'}`);
     } finally {
-      setIsConfiguringRoute(null);
+      setIsConfiguringBinding(null);
     }
   };
 
-  const handleDeactivateRoute = async (id: string) => {
-    setIsConfiguringRoute(id);
-
+  const handleDeactivateToolRoute = async (tool: ToolName) => {
+    setIsConfiguringBinding(tool);
     try {
-      // 仅停用路由（配置恢复由服务生命周期统一处理）
-      await api.deactivateRoute(id);
-      await loadRoutes();
+      const result = await api.deactivateToolRoute(tool);
+      if (result.success) {
+        await loadToolBindings();
+        await loadRoutes();
+        toast.success('路由已停用');
+      } else {
+        toast.error('停用失败');
+      }
     } catch (error: any) {
-      console.error('停用路由失败:', error);
-      toast.error(`路由停用失败: ${error.message || '未知错误'}`);
+      toast.error(`停用失败: ${error.message || '未知错误'}`);
     } finally {
-      setIsConfiguringRoute(null);
+      setIsConfiguringBinding(null);
     }
   };
+
+
 
   const handleSaveRoute = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -349,8 +357,6 @@ export default function RoutesPage() {
     const route = {
       name: formData.get('name') as string,
       description: formData.get('description') as string,
-      targetType: formData.get('targetType') as 'claude-code' | 'codex',
-      isActive: false,
     };
 
     if (editingRoute) {
@@ -373,13 +379,17 @@ export default function RoutesPage() {
     });
 
     if (confirmed) {
-      await api.deleteRoute(id);
-      loadRoutes();
-      if (selectedRoute && selectedRoute.id === id) {
-        setSelectedRoute(null);
-        setRules([]);
+      try {
+        await api.deleteRoute(id);
+        loadRoutes();
+        if (selectedRoute && selectedRoute.id === id) {
+          setSelectedRoute(null);
+          setRules([]);
+        }
+        toast.success('路由已删除');
+      } catch (error: any) {
+        toast.error(error.message || '删除失败');
       }
-      toast.success('路由已删除');
     }
   };
 
@@ -494,7 +504,7 @@ export default function RoutesPage() {
   // 统一的规则恢复处理（同时清除黑名单和 WebSocket 实时状态）
   const handleRuleRecovery = async (ruleId: string) => {
     try {
-      const promises: Promise<void>[] = [];
+      const promises: Promise<any>[] = [];
 
       // 清除黑名单状态
       if (blacklistStatuses[ruleId]?.isBlacklisted) {
@@ -643,7 +653,6 @@ export default function RoutesPage() {
 
   const handleSaveClaudeDefaultModel = async () => {
     try {
-      setIsUpdatingClaudeDefaultModel(true);
       const current = appConfig || {};
       await api.updateConfig({
         ...current,
@@ -654,14 +663,48 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('保存失败: ' + error.message);
-    } finally {
-      setIsUpdatingClaudeDefaultModel(false);
+    }
+  };
+
+  const handleSaveAutocompactPct = async () => {
+    const trimmed = autocompactPctInput.trim();
+    if (trimmed === '') {
+      // 清除设置
+      try {
+        const current = appConfig || {};
+        await api.updateConfig({
+          ...current,
+          autocompactPctOverride: undefined,
+        });
+        toast.success('自动压缩百分比已清除（重启 Claude Code 后生效）');
+        setAutocompactPctDirty(false);
+        await loadAppConfig();
+      } catch (error: any) {
+        toast.error('保存失败: ' + error.message);
+      }
+      return;
+    }
+    const num = Number(trimmed);
+    if (!Number.isInteger(num) || num < 1 || num > 100) {
+      toast.error('自动压缩百分比必须为 1-100 的整数');
+      return;
+    }
+    try {
+      const current = appConfig || {};
+      await api.updateConfig({
+        ...current,
+        autocompactPctOverride: num,
+      });
+      toast.success('自动压缩百分比已保存（重启 Claude Code 后生效）');
+      setAutocompactPctDirty(false);
+      await loadAppConfig();
+    } catch (error: any) {
+      toast.error('保存失败: ' + error.message);
     }
   };
 
   const handleSaveCodexDefaultModel = async () => {
     try {
-      setIsUpdatingCodexDefaultModel(true);
       const current = appConfig || {};
       await api.updateConfig({
         ...current,
@@ -672,14 +715,11 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('保存失败: ' + error.message);
-    } finally {
-      setIsUpdatingCodexDefaultModel(false);
     }
   };
 
   const handleUpdateRuleGlobalTimeout = async () => {
     try {
-      setIsUpdatingGlobalTimeout(true);
       const current = appConfig || {};
       const parsed = Number(ruleGlobalTimeout);
       const value = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
@@ -693,8 +733,6 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('更新失败: ' + error.message);
-    } finally {
-      setIsUpdatingGlobalTimeout(false);
     }
   };
 
@@ -949,13 +987,7 @@ export default function RoutesPage() {
                 {routes.map((route) => (
                   <div
                     key={route.id}
-                    ref={(el) => {
-                      if (el) {
-                        routeRefs.current.set(route.id, el);
-                      } else {
-                        routeRefs.current.delete(route.id);
-                      }
-                    }}
+
                     onClick={() => setSelectedRoute(route)}
                     style={{
                       padding: '12px',
@@ -970,44 +1002,13 @@ export default function RoutesPage() {
                     }}
                   >
                     <div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={{ fontWeight: 500 }}>{route.name}</div>
-                        {route.isActive && <span className={`badge ${route.targetType === 'claude-code' ? 'badge-claude-code' : 'badge-codex'}`}
-                          style={{
-                            position: 'absolute',
-                            top: -16,
-                            right: -8
-                          }}>{TARGET_TYPE_OPTIONS.find(opt => opt.value === route.targetType)?.label} 已激活</span>}
-                      </div>
-                      <div style={{ fontSize: '12px', color: 'var(--text-route-muted)', marginTop: '2px' }}>
-                        客户端工具: {TARGET_TYPE_OPTIONS.find(opt => opt.value === route.targetType)?.label}
-                      </div>
+                      <div style={{ fontWeight: 500 }}>{route.name}</div>
+                      {route.description && (
+                        <div style={{ fontSize: '12px', color: 'var(--text-route-muted)', marginTop: '2px' }}>
+                          {route.description}
+                        </div>
+                      )}
                       <div className="action-buttons" style={{ marginTop: '8px' }}>
-                        {!route.isActive ? (
-                          <button
-                            className="btn btn-success"
-                            style={{ padding: '4px 8px', fontSize: '12px' }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleActivateRoute(route.id);
-                            }}
-                            disabled={isConfiguringRoute !== null}
-                          >
-                            {isConfiguringRoute === route.id ? '处理中...' : '激活'}
-                          </button>
-                        ) : (
-                          <button
-                            className="btn btn-warning"
-                            style={{ padding: '4px 8px', fontSize: '12px' }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDeactivateRoute(route.id);
-                            }}
-                            disabled={isConfiguringRoute !== null}
-                          >
-                            {isConfiguringRoute === route.id ? '处理中...' : '停用'}
-                          </button>
-                        )}
                         <button
                           className="btn btn-secondary"
                           style={{ padding: '4px 8px', fontSize: '12px' }}
@@ -1024,7 +1025,6 @@ export default function RoutesPage() {
                             e.stopPropagation();
                             handleDeleteRoute(route.id);
                           }}
-                          disabled={route.isActive}
                         >删除</button>
                       </div>
                     </div>
@@ -1076,7 +1076,7 @@ export default function RoutesPage() {
                       const contentTypeLabel = CONTENT_TYPE_OPTIONS.find(opt => opt.value === rule.contentType)?.label;
                       return (
                         <tr key={rule.id}>
-                          <td className="col-priority">
+                          <td className="col-priority" style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div className='col-priority-box'>
                               <span>{rule.sortOrder || 0}</span>
                               <button
@@ -1095,7 +1095,7 @@ export default function RoutesPage() {
                               </button>
                             </div>
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div style={{ fontSize: '12px', whiteSpace: 'nowrap' }}>
                               {/* 为非默认类型添加图标 */}
                               {rule.contentType !== 'default' && CONTENT_TYPE_ICONS[rule.contentType] && (
@@ -1157,7 +1157,7 @@ export default function RoutesPage() {
                               )}
                             </div>
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             <div className='vendor-sevices-col' style={{ fontSize: '0.6em' }}>
                               {rule.useMCP ? (
                                 <>
@@ -1173,7 +1173,7 @@ export default function RoutesPage() {
                               )}
                             </div>
                           </td>
-                          <td style={{ whiteSpace: 'nowrap' }}>
+                          <td style={{ whiteSpace: 'nowrap', ...(rule.isDisabled ? { opacity: 0.4 } : {}) }}>
                             {/* 新增：状态列 */}
                             {(() => {
                               const ruleStatus = getRuleStatus(rule);
@@ -1292,7 +1292,7 @@ export default function RoutesPage() {
                               );
                             })()}
                           </td>
-                          <td>
+                          <td style={rule.isDisabled ? { opacity: 0.4 } : undefined}>
                             {/* 当 tokenLimit 和 requestCountLimit 都不限制时，不显示用量情况 */}
                             {(rule.tokenLimit || rule.requestCountLimit) ? (
                             <div style={{ fontSize: '13px' }}>
@@ -1387,7 +1387,7 @@ export default function RoutesPage() {
                   <div style={{ marginTop: '6px' }}>
                     • 先创建一条 <strong>默认</strong> 规则作为兜底，避免请求无规则可走<br />
                     • 再按你的实际场景增加规则：如图像理解、长上下文、思考、高智商等<br />
-                    • 按类型匹配顺序：<strong>图像理解 → 高智商 → 长上下文 → 思考 → 后台 → 模型顶替 → 默认</strong><br />
+                    • 按类型匹配顺序：<strong>压缩对话 → 图像理解 → 高智商 → 长上下文 → 思考 → 后台 → 模型顶替 → 默认</strong><br />
                     • 如果要“指定模型走指定服务”，再加 <strong>模型顶替</strong> 规则<br />
                     • 同一类型可配多条：<strong>把主力服务放上面（优先级更大），备用服务放下面</strong><br />
                     • 开启智能故障切换后，系统会在主力不可用时自动切到下一个可用规则<br />
@@ -1426,7 +1426,7 @@ export default function RoutesPage() {
       </div>
 
       {/* 规则配置 */}
-      <div className="card" style={{ marginTop: '20px' }}>
+      <div className="card">
         <div className="toolbar">
           <h3>规则配置</h3>
         </div>
@@ -1452,18 +1452,11 @@ export default function RoutesPage() {
               type="number"
               value={ruleGlobalTimeout}
               onChange={(e) => setRuleGlobalTimeout(e.target.value)}
+              onBlur={() => handleUpdateRuleGlobalTimeout()}
               min="1"
               placeholder="默认300秒"
               style={{ flex: 1, minWidth: 0 }}
             />
-            <button
-              onClick={handleUpdateRuleGlobalTimeout}
-              disabled={isUpdatingGlobalTimeout}
-              className="btn btn-primary"
-              style={{ whiteSpace: 'nowrap' }}
-            >
-              保存
-            </button>
           </div>
           <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
             设置规则的全局超时时间。当单个规则未配置超时时间时，将使用此值作为超时上限。
@@ -1472,11 +1465,102 @@ export default function RoutesPage() {
         </div>
       </div>
 
+      {/* API 路径路由映射 */}
+      <div className="card api-binding-card" style={{ marginTop: '20px' }}>
+        <div className="api-binding-header">
+          <h3>API 路径路由映射</h3>
+        </div>
+        <p className="api-binding-desc">
+          将标准 API 路径绑定到路由，使任何兼容该 API 的编程工具都可以通过对应路径使用服务。
+        </p>
+        <div className="api-binding-baseurl-row">
+          <span className="api-binding-baseurl-prefix">Base URL</span>
+          <span className="api-binding-baseurl-value">{window.location.origin}</span>
+        </div>
+        <div className="api-binding-list">
+          {apiPathBindings.map(binding => {
+            const isModelsPath = binding.apiPath === '/v1/models';
+            const isBound = isModelsPath ? !!apiPathModels.trim() : !!binding.routeId;
+            return (
+              <div key={binding.apiPath} className="api-binding-row">
+                <span className={`api-binding-status ${isBound ? 'api-binding-status--bound' : ''}`} />
+                <span className={`api-binding-path`}>
+                  {binding.apiPath === '/v1beta/models' ? '/v1beta/models/{model}:{action}' : binding.apiPath}
+                </span>
+                <span className="api-binding-arrow">→</span>
+                <div className="api-binding-control">
+                  {isModelsPath ? (
+                    <input
+                      type="text"
+                      value={apiPathModels}
+                      onChange={(e) => setApiPathModels(e.target.value)}
+                      onBlur={handleModelsBlur}
+                      placeholder="自定义模型列表，英文逗号分隔，留空使用默认列表"
+                    />
+                  ) : (
+                    <select
+                      value={binding.routeId || ''}
+                      onChange={(e) => handleBindingChange(binding.apiPath, e.target.value || null)}
+                    >
+                      <option value="">无</option>
+                      {routes.map(r => (
+                        <option key={r.id} value={r.id}>
+                          {r.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="card" style={{ marginTop: '20px' }}>
         <div className="toolbar">
           <h3>Claude Code 全局配置</h3>
         </div>
         <div style={{ padding: '20px' }}>
+          <div className="tool-binding-block">
+            <div className="tool-binding-label">
+              <span className="tool-binding-label-icon">⚡</span>
+              激活路由
+            </div>
+            <div className="tool-binding-row">
+              <select
+                id="claude-route-binding"
+                value={toolBindings?.['claude-code']?.routeId || ''}
+                onChange={(e) => {
+                  const routeId = e.target.value || null;
+                  if (routeId) {
+                    handleActivateToolRoute('claude-code', routeId);
+                  }
+                }}
+                disabled={isConfiguringBinding === 'claude-code'}
+              >
+                <option value="">选择要激活的路由...</option>
+                {routes.map(r => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}{toolBindings?.['claude-code']?.routeId === r.id ? ' (已激活)' : ''}
+                  </option>
+                ))}
+              </select>
+              {toolBindings?.['claude-code']?.routeId && (
+                <button
+                  className="btn btn-warning tool-binding-deactivate-btn"
+                  onClick={() => handleDeactivateToolRoute('claude-code')}
+                  disabled={isConfiguringBinding === 'claude-code'}
+                >
+                  {isConfiguringBinding === 'claude-code' ? '处理中...' : '停用'}
+                </button>
+              )}
+            </div>
+            <div className="tool-binding-desc">
+              选择一条路由用于 Claude Code 代理请求。激活后，/claude-code/ 路径的请求将使用该路由的规则。
+            </div>
+          </div>
+
           {!isAgentTeamsSupported() && claudeVersionCheck?.claudeCode?.version && (
             <div style={{
               backgroundColor: 'var(--bg-warning, #fff3cd)',
@@ -1592,25 +1676,49 @@ export default function RoutesPage() {
                   setClaudeDefaultModelInput(e.target.value);
                   setClaudeDefaultModelDirty(e.target.value !== (appConfig?.claudeDefaultModel || ''));
                 }}
+                onBlur={() => { if (claudeDefaultModelDirty) handleSaveClaudeDefaultModel(); }}
                 placeholder="例如：claude-3-5-sonnet-20241022"
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button
-                onClick={handleSaveClaudeDefaultModel}
-                disabled={isUpdatingClaudeDefaultModel}
-                className="btn btn-primary"
-                style={{ whiteSpace: 'nowrap' }}
-              >
-                保存
-              </button>
-              {claudeDefaultModelDirty && (
-                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
-                  未保存
-                </span>
-              )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置后写入 ~/.claude/settings.json 的 model 字段，重启 Claude Code 后生效。留空则不写入。
+            </div>
+          </div>
+          <div style={{ marginTop: '20px' }}>
+            <div
+              className="form-group"
+              style={{
+                marginBottom: '0',
+                maxWidth: '420px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+              }}
+            >
+              <label
+                htmlFor="claude-autocompact-pct"
+                style={{ marginBottom: 0, minWidth: '100px', whiteSpace: 'nowrap' }}
+              >
+                Autocompact PCT
+              </label>
+              <input
+                id="claude-autocompact-pct"
+                type="number"
+                min="1"
+                max="100"
+                value={autocompactPctInput}
+                onChange={(e) => {
+                  setAutocompactPctInput(e.target.value);
+                  setAutocompactPctDirty(e.target.value !== (appConfig?.autocompactPctOverride != null ? String(appConfig.autocompactPctOverride) : ''));
+                }}
+                onBlur={() => { if (autocompactPctDirty) handleSaveAutocompactPct(); }}
+                placeholder="1-100"
+                style={{ flex: 1, minWidth: 0 }}
+              />
+            </div>
+            <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
+              设置自动压缩百分比阈值（1-100），写入 ~/.claude/settings.json 的 env 字段，重启 Claude Code 后生效。留空则不写入。
             </div>
           </div>
         </div>
@@ -1621,6 +1729,44 @@ export default function RoutesPage() {
           <h3>Codex 全局配置</h3>
         </div>
         <div style={{ padding: '20px' }}>
+          <div className="tool-binding-block">
+            <div className="tool-binding-label">
+              <span className="tool-binding-label-icon">⚡</span>
+              激活路由
+            </div>
+            <div className="tool-binding-row">
+              <select
+                id="codex-route-binding"
+                value={toolBindings?.['codex']?.routeId || ''}
+                onChange={(e) => {
+                  const routeId = e.target.value || null;
+                  if (routeId) {
+                    handleActivateToolRoute('codex', routeId);
+                  }
+                }}
+                disabled={isConfiguringBinding === 'codex'}
+              >
+                <option value="">选择要激活的路由...</option>
+                {routes.map(r => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}{toolBindings?.['codex']?.routeId === r.id ? ' (已激活)' : ''}
+                  </option>
+                ))}
+              </select>
+              {toolBindings?.['codex']?.routeId && (
+                <button
+                  className="btn btn-warning tool-binding-deactivate-btn"
+                  onClick={() => handleDeactivateToolRoute('codex')}
+                  disabled={isConfiguringBinding === 'codex'}
+                >
+                  {isConfiguringBinding === 'codex' ? '处理中...' : '停用'}
+                </button>
+              )}
+            </div>
+            <div className="tool-binding-desc">
+              选择一条路由用于 Codex 代理请求。激活后，/codex/ 路径的请求将使用该路由的规则。
+            </div>
+          </div>
           <div
             className="form-group"
             style={{
@@ -1677,22 +1823,10 @@ export default function RoutesPage() {
                   setCodexDefaultModelInput(e.target.value);
                   setCodexDefaultModelDirty(e.target.value !== (appConfig?.codexDefaultModel || ''));
                 }}
+                onBlur={() => { if (codexDefaultModelDirty) handleSaveCodexDefaultModel(); }}
                 placeholder="例如：o1"
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button
-                onClick={handleSaveCodexDefaultModel}
-                disabled={isUpdatingCodexDefaultModel}
-                className="btn btn-primary"
-                style={{ whiteSpace: 'nowrap' }}
-              >
-                保存
-              </button>
-              {codexDefaultModelDirty && (
-                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
-                  未保存
-                </span>
-              )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置后写入 ~/.codex/config.toml 的 model 字段，重启 Codex 后生效。留空则使用默认值 gpt-5.3-codex。
@@ -1796,14 +1930,7 @@ export default function RoutesPage() {
                   <label>描述</label>
                   <textarea name="description" rows={3} defaultValue={editingRoute ? editingRoute.description : ''} />
                 </div>
-                <div className="form-group">
-                  <label>客户端工具</label>
-                  <select name="targetType" defaultValue={editingRoute ? editingRoute.targetType : 'claude-code'} required>
-                    {TARGET_TYPE_OPTIONS.map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </div>
+
 
                 <div className="modal-footer">
                   <button type="button" className="btn btn-secondary" onClick={() => setShowRouteModal(false)}>取消</button>

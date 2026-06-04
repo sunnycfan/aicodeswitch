@@ -114,6 +114,8 @@ src/server/
 - **图像格式**: 支持 base64 和 URL 两种格式互转
 - **流式响应**: SSE 事件实时解析与格式转换
 - **token 用量**: 统一转换为 Claude 格式的 `input_tokens` / `output_tokens`
+- **Claude Code compact**: 转发 compact 请求前需清理未配对的 `tool_use/server_tool_use`，并强制移除 `thinking`、`tools`、`tool_choice` 等会诱发思考块/工具块的字段；compact 响应回传给 Claude Code 时仅保留纯文本摘要，不下发 thinking/tool_use 内容
+- **Claude Code compact**: 对 `compact` 类型请求会先补齐/降级历史中的 `tool_use` / `tool_result`，再强制移除 `thinking`、`tools`、`tool_choice` 等会诱发推理或工具调用的字段；若上游仍返回 `thinking`/`tool_use` SSE block，代理层会在下发前过滤，只保留纯文本摘要
 
 ## Conventions
 
@@ -781,4 +783,3 @@ const [selectedFrequencyWindow, setSelectedFrequencyWindow] = useState<number | 
 | `types/index.ts` | 修改：Rule 接口添加 `frequencyLimit` 和 `frequencyWindow` |
 | `server/proxy-server.ts` | 修改：添加频率限制跟踪和检查逻辑 |
 | `ui/pages/RoutesPage.tsx` | 修改：前端频率限制配置界面 |
-

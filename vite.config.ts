@@ -27,6 +27,10 @@ export default defineConfig(({ mode }) => {
           target: `http://${env.HOST || '127.0.0.1'}:${env.PORT || 4567}`,
           changeOrigin: true,
         },
+        '/v1': {
+          target: `http://${env.HOST || '127.0.0.1'}:${env.PORT || 4567}`,
+          changeOrigin: true,
+        },
       },
     },
   };

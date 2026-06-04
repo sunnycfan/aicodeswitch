@@ -16,12 +16,16 @@ export interface SSEEvent {
  */
 function isClientDisconnectError(error: any): boolean {
   const code = error?.code;
+  const name = error?.name;
   const message = typeof error?.message === 'string' ? error.message.toLowerCase() : '';
   return (
     code === 'ERR_STREAM_PREMATURE_CLOSE' ||
     code === 'ERR_STREAM_UNABLE_TO_PIPE' ||
     code === 'ERR_STREAM_DESTROYED' ||
-    message.includes('premature close')
+    code === 'ERR_CANCELED' ||
+    name === 'CanceledError' ||
+    message.includes('premature close') ||
+    message.includes('canceled')
   );
 }
 
