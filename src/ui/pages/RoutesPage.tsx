@@ -113,7 +113,6 @@ export default function RoutesPage() {
   const [selectedTokenResetBaseTime, setSelectedTokenResetBaseTime] = useState<Date | undefined>(undefined);
   const [selectedTimeout, setSelectedTimeout] = useState<number | undefined>(undefined);
   const [ruleGlobalTimeout, setRuleGlobalTimeout] = useState<string>('');
-  const [isUpdatingGlobalTimeout, setIsUpdatingGlobalTimeout] = useState(false);
   const [selectedRequestCountLimit, setSelectedRequestCountLimit] = useState<number | undefined>(undefined);
   const [selectedRequestResetInterval, setSelectedRequestResetInterval] = useState<number | undefined>(undefined);
   const [selectedRequestResetBaseTime, setSelectedRequestResetBaseTime] = useState<Date | undefined>(undefined);
@@ -144,13 +143,10 @@ export default function RoutesPage() {
   const [isUpdatingClaudeEffort, setIsUpdatingClaudeEffort] = useState(false);
   const [claudeDefaultModelInput, setClaudeDefaultModelInput] = useState<string>('');
   const [claudeDefaultModelDirty, setClaudeDefaultModelDirty] = useState(false);
-  const [isUpdatingClaudeDefaultModel, setIsUpdatingClaudeDefaultModel] = useState(false);
   const [autocompactPctInput, setAutocompactPctInput] = useState<string>('');
   const [autocompactPctDirty, setAutocompactPctDirty] = useState(false);
-  const [isUpdatingAutocompactPct, setIsUpdatingAutocompactPct] = useState(false);
   const [codexDefaultModelInput, setCodexDefaultModelInput] = useState<string>('');
   const [codexDefaultModelDirty, setCodexDefaultModelDirty] = useState(false);
-  const [isUpdatingCodexDefaultModel, setIsUpdatingCodexDefaultModel] = useState(false);
 
   useEffect(() => {
     loadRoutes();
@@ -158,6 +154,7 @@ export default function RoutesPage() {
     loadAllServices();
     loadMCPs();
     loadAppConfig();
+    loadToolBindings();
     loadApiPathBindings();
     checkClaudeVersion();
   }, []);
@@ -656,7 +653,6 @@ export default function RoutesPage() {
 
   const handleSaveClaudeDefaultModel = async () => {
     try {
-      setIsUpdatingClaudeDefaultModel(true);
       const current = appConfig || {};
       await api.updateConfig({
         ...current,
@@ -667,8 +663,6 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('保存失败: ' + error.message);
-    } finally {
-      setIsUpdatingClaudeDefaultModel(false);
     }
   };
 
@@ -677,7 +671,6 @@ export default function RoutesPage() {
     if (trimmed === '') {
       // 清除设置
       try {
-        setIsUpdatingAutocompactPct(true);
         const current = appConfig || {};
         await api.updateConfig({
           ...current,
@@ -688,8 +681,6 @@ export default function RoutesPage() {
         await loadAppConfig();
       } catch (error: any) {
         toast.error('保存失败: ' + error.message);
-      } finally {
-        setIsUpdatingAutocompactPct(false);
       }
       return;
     }
@@ -699,7 +690,6 @@ export default function RoutesPage() {
       return;
     }
     try {
-      setIsUpdatingAutocompactPct(true);
       const current = appConfig || {};
       await api.updateConfig({
         ...current,
@@ -710,14 +700,11 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('保存失败: ' + error.message);
-    } finally {
-      setIsUpdatingAutocompactPct(false);
     }
   };
 
   const handleSaveCodexDefaultModel = async () => {
     try {
-      setIsUpdatingCodexDefaultModel(true);
       const current = appConfig || {};
       await api.updateConfig({
         ...current,
@@ -728,14 +715,11 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('保存失败: ' + error.message);
-    } finally {
-      setIsUpdatingCodexDefaultModel(false);
     }
   };
 
   const handleUpdateRuleGlobalTimeout = async () => {
     try {
-      setIsUpdatingGlobalTimeout(true);
       const current = appConfig || {};
       const parsed = Number(ruleGlobalTimeout);
       const value = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
@@ -749,8 +733,6 @@ export default function RoutesPage() {
       await loadAppConfig();
     } catch (error: any) {
       toast.error('更新失败: ' + error.message);
-    } finally {
-      setIsUpdatingGlobalTimeout(false);
     }
   };
 
@@ -992,58 +974,6 @@ export default function RoutesPage() {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {/* API 路径路由映射 */}
-        <div className="card api-binding-card" style={{ marginBottom: 20 }}>
-          <div className="api-binding-header">
-            <h3>API 路径路由映射</h3>
-          </div>
-          <p className="api-binding-desc">
-            将标准 API 路径绑定到路由，使任何兼容该 API 的编程工具都可以通过对应路径使用服务。
-          </p>
-          <div className="api-binding-baseurl-row">
-            <span className="api-binding-baseurl-prefix">Base URL</span>
-            <span className="api-binding-baseurl-value">{window.location.origin}</span>
-          </div>
-          <div className="api-binding-list">
-            {apiPathBindings.map(binding => {
-              const isModelsPath = binding.apiPath === '/v1/models';
-              const isBound = isModelsPath ? !!apiPathModels.trim() : !!binding.routeId;
-              return (
-                <div key={binding.apiPath} className="api-binding-row">
-                  <span className={`api-binding-status ${isBound ? 'api-binding-status--bound' : ''}`} />
-                  <span className={`api-binding-path ${isModelsPath ? 'api-binding-path--disabled' : ''}`}>
-                    {binding.apiPath === '/v1beta/models' ? '/v1beta/models/{model}:{action}' : binding.apiPath}
-                  </span>
-                  <span className="api-binding-arrow">→</span>
-                  <div className="api-binding-control">
-                    {isModelsPath ? (
-                      <input
-                        type="text"
-                        value={apiPathModels}
-                        onChange={(e) => setApiPathModels(e.target.value)}
-                        onBlur={handleModelsBlur}
-                        placeholder="自定义模型列表，英文逗号分隔，留空使用默认列表"
-                      />
-                    ) : (
-                      <select
-                        value={binding.routeId || ''}
-                        onChange={(e) => handleBindingChange(binding.apiPath, e.target.value || null)}
-                      >
-                        <option value="">无</option>
-                        {routes.map(r => (
-                          <option key={r.id} value={r.id}>
-                            {r.name}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
         <div style={{ display: 'flex', gap: '20px' }}>
           <div className="card" style={{ flex: '0 0 25%', minWidth: 300 }}>
             <div className="toolbar">
@@ -1522,23 +1452,68 @@ export default function RoutesPage() {
               type="number"
               value={ruleGlobalTimeout}
               onChange={(e) => setRuleGlobalTimeout(e.target.value)}
+              onBlur={() => handleUpdateRuleGlobalTimeout()}
               min="1"
               placeholder="默认300秒"
               style={{ flex: 1, minWidth: 0 }}
             />
-            <button
-              onClick={handleUpdateRuleGlobalTimeout}
-              disabled={isUpdatingGlobalTimeout}
-              className="btn btn-primary"
-              style={{ whiteSpace: 'nowrap' }}
-            >
-              保存
-            </button>
           </div>
           <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
             设置规则的全局超时时间。当单个规则未配置超时时间时，将使用此值作为超时上限。
             不设置则默认为300秒（5分钟）。超时后会自动触发故障切换到下一个可用规则。
           </div>
+        </div>
+      </div>
+
+      {/* API 路径路由映射 */}
+      <div className="card api-binding-card" style={{ marginTop: '20px' }}>
+        <div className="api-binding-header">
+          <h3>API 路径路由映射</h3>
+        </div>
+        <p className="api-binding-desc">
+          将标准 API 路径绑定到路由，使任何兼容该 API 的编程工具都可以通过对应路径使用服务。
+        </p>
+        <div className="api-binding-baseurl-row">
+          <span className="api-binding-baseurl-prefix">Base URL</span>
+          <span className="api-binding-baseurl-value">{window.location.origin}</span>
+        </div>
+        <div className="api-binding-list">
+          {apiPathBindings.map(binding => {
+            const isModelsPath = binding.apiPath === '/v1/models';
+            const isBound = isModelsPath ? !!apiPathModels.trim() : !!binding.routeId;
+            return (
+              <div key={binding.apiPath} className="api-binding-row">
+                <span className={`api-binding-status ${isBound ? 'api-binding-status--bound' : ''}`} />
+                <span className={`api-binding-path`}>
+                  {binding.apiPath === '/v1beta/models' ? '/v1beta/models/{model}:{action}' : binding.apiPath}
+                </span>
+                <span className="api-binding-arrow">→</span>
+                <div className="api-binding-control">
+                  {isModelsPath ? (
+                    <input
+                      type="text"
+                      value={apiPathModels}
+                      onChange={(e) => setApiPathModels(e.target.value)}
+                      onBlur={handleModelsBlur}
+                      placeholder="自定义模型列表，英文逗号分隔，留空使用默认列表"
+                    />
+                  ) : (
+                    <select
+                      value={binding.routeId || ''}
+                      onChange={(e) => handleBindingChange(binding.apiPath, e.target.value || null)}
+                    >
+                      <option value="">无</option>
+                      {routes.map(r => (
+                        <option key={r.id} value={r.id}>
+                          {r.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -1701,22 +1676,10 @@ export default function RoutesPage() {
                   setClaudeDefaultModelInput(e.target.value);
                   setClaudeDefaultModelDirty(e.target.value !== (appConfig?.claudeDefaultModel || ''));
                 }}
+                onBlur={() => { if (claudeDefaultModelDirty) handleSaveClaudeDefaultModel(); }}
                 placeholder="例如：claude-3-5-sonnet-20241022"
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button
-                onClick={handleSaveClaudeDefaultModel}
-                disabled={isUpdatingClaudeDefaultModel}
-                className="btn btn-primary"
-                style={{ whiteSpace: 'nowrap' }}
-              >
-                保存
-              </button>
-              {claudeDefaultModelDirty && (
-                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
-                  未保存
-                </span>
-              )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置后写入 ~/.claude/settings.json 的 model 字段，重启 Claude Code 后生效。留空则不写入。
@@ -1749,22 +1712,10 @@ export default function RoutesPage() {
                   setAutocompactPctInput(e.target.value);
                   setAutocompactPctDirty(e.target.value !== (appConfig?.autocompactPctOverride != null ? String(appConfig.autocompactPctOverride) : ''));
                 }}
+                onBlur={() => { if (autocompactPctDirty) handleSaveAutocompactPct(); }}
                 placeholder="1-100"
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button
-                onClick={handleSaveAutocompactPct}
-                disabled={isUpdatingAutocompactPct}
-                className="btn btn-primary"
-                style={{ whiteSpace: 'nowrap' }}
-              >
-                保存
-              </button>
-              {autocompactPctDirty && (
-                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
-                  未保存
-                </span>
-              )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置自动压缩百分比阈值（1-100），写入 ~/.claude/settings.json 的 env 字段，重启 Claude Code 后生效。留空则不写入。
@@ -1872,22 +1823,10 @@ export default function RoutesPage() {
                   setCodexDefaultModelInput(e.target.value);
                   setCodexDefaultModelDirty(e.target.value !== (appConfig?.codexDefaultModel || ''));
                 }}
+                onBlur={() => { if (codexDefaultModelDirty) handleSaveCodexDefaultModel(); }}
                 placeholder="例如：o1"
                 style={{ flex: 1, minWidth: 0 }}
               />
-              <button
-                onClick={handleSaveCodexDefaultModel}
-                disabled={isUpdatingCodexDefaultModel}
-                className="btn btn-primary"
-                style={{ whiteSpace: 'nowrap' }}
-              >
-                保存
-              </button>
-              {codexDefaultModelDirty && (
-                <span style={{ fontSize: '12px', color: 'var(--warning-color, #e6a817)', whiteSpace: 'nowrap' }}>
-                  未保存
-                </span>
-              )}
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '12px' }}>
               设置后写入 ~/.codex/config.toml 的 model 字段，重启 Codex 后生效。留空则使用默认值 gpt-5.3-codex。
