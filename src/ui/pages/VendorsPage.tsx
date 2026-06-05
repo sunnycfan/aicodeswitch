@@ -622,6 +622,7 @@ function VendorsPage() {
           authType: serviceConfig.authType,
           supportedModels: serviceConfig.models ? serviceConfig.models.split(',').map(m => m.trim()) : undefined,
           modelLimits: serviceConfig.modelLimits || {},
+          enableCodingPlan: true,  // 一键配置强制启用编程套餐限制
         };
 
         console.log(`[一键配置] 创建服务 ${index + 1}/${services.length}:`, {
