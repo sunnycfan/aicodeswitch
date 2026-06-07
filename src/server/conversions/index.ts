@@ -23,6 +23,10 @@ import { applyReasoningConfig } from './thinking/providers.js';
 export { getServerToolSupport } from './server-tool/providers.js';
 import { convertServerToolUseToToolUse } from './server-tool/mapper.js';
 
+// --- Body sanitizer ---
+export { sanitizeRequestBody } from './body-sanitizer.js';
+export type { SanitizeResult } from './body-sanitizer.js';
+
 // --- Compact API ---
 export {
   extractConversationText,

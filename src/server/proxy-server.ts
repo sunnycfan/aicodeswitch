@@ -16,6 +16,7 @@ import {
   sourceTypeToFormat,
   getReasoningConfig,
   getServerToolSupport,
+  sanitizeRequestBody,
 } from './conversions/index';
 import type { Format } from './conversions/types';
 import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
@@ -3248,6 +3249,12 @@ export class ProxyServer {
     const useOriginalConfig = options?.useOriginalConfig === true;
     let relayedForLog = !useOriginalConfig;
     let originalToolRequestBody = this.cloneRequestBody(req.body || {});
+    // 请求体安全性清理：修复控制字符、无效 JSON arguments、undefined 值等问题
+    const sanitizeResult = sanitizeRequestBody(originalToolRequestBody);
+    if (sanitizeResult.changes.length > 0) {
+      console.log(`[Body-Sanitize] ${sanitizeResult.changes.length} fix(es): ${sanitizeResult.changes.join('; ')}`);
+    }
+    originalToolRequestBody = sanitizeResult.body;
     let requestBody: any = this.cloneRequestBody(originalToolRequestBody) || {};
     let usageForLog: TokenUsage | undefined;
     let logged = false;
@@ -4395,6 +4402,12 @@ export class ProxyServer {
     const failoverEnabled = options?.failoverEnabled === true;
 
     let requestBody: any = this.cloneRequestBody(req.body || {});
+    // 请求体安全性清理：修复控制字符、无效 JSON arguments、undefined 值等问题
+    const sanitizeResult = sanitizeRequestBody(requestBody);
+    if (sanitizeResult.changes.length > 0) {
+      console.log(`[Body-Sanitize] ${sanitizeResult.changes.length} fix(es): ${sanitizeResult.changes.join('; ')}`);
+    }
+    requestBody = sanitizeResult.body;
     let usageForLog: TokenUsage | undefined;
     let responseBodyForLog: string | undefined;
     let downstreamResponseBodyForLog: string | undefined;

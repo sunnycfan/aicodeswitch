@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-07: 新增请求体 JSON 安全性清理
+
+### 新增
+- 新增请求体安全性清理模块 `body-sanitizer.ts`，在转发前自动修复请求体中的潜在问题
+- 清除字符串中的非法 C0 控制字符（保留 TAB/LF/CR）
+- 修复 Responses API `function_call.arguments` 中的无效 JSON 字符串
+- 移除对象树中的 `undefined` 值，防止序列化时 content-length 不匹配
+- 防循环引用和最大递归深度保护
+
 ## 2026-06-07: 实现 Codex MCP 配置写入
 
 ### 新增
