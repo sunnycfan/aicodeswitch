@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
 import type { RequestLog, ErrorLog, Vendor, APIService, Session } from '../../types';
 import dayjs from 'dayjs';
@@ -286,6 +286,7 @@ function LogsPage() {
   const [sessionsPage, setSessionsPage] = useState(1);
   const [sessionsPageSize, setSessionsPageSize] = useState(20);
   const [logsLoading, setLogsLoading] = useState(false);
+  const [chatViewMode, setChatViewMode] = useState<'logs' | 'chat'>('logs');
 
   // 分页状态
   const [requestLogsPage, setRequestLogsPage] = useState(1);
@@ -544,9 +545,10 @@ function LogsPage() {
 
   const handleSessionClick = async (session: Session) => {
     setSelectedSession(session);
+    setChatViewMode('logs');
     setLogsLoading(true);
     try {
-      const logs = await api.getSessionLogs(session.id, 100);
+      const logs = await api.getSessionLogs(session.id, 10000);
       setSelectedSessionLogs(logs);
     } catch (error) {
       console.error('Failed to load session logs:', error);
@@ -809,7 +811,7 @@ function LogsPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    const safeTitle = (s.title || s.id.slice(0, 8)).replace(/[\\/:*?"<>|]/g, '_');
+    const safeTitle = (cleanSessionTitle(s.title) || s.id.slice(0, 8)).replace(/[\\/:*?"<>|]/g, '_');
     a.download = `${safeTitle}.json`;
     document.body.appendChild(a);
     a.click();
@@ -939,7 +941,7 @@ function LogsPage() {
               style={{ cursor: 'pointer', backgroundColor: selectedSession?.id === session.id ? 'var(--bg-selected)' : undefined }}
             >
               <td style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {session.title || session.id.slice(0, 8)}
+                {cleanSessionTitle(session.title) || session.id.slice(0, 8)}
               </td>
               <td>{getTargetTypeBadge(session.targetType)}</td>
               <td>{session.requestCount}</td>
@@ -1871,106 +1873,566 @@ function LogsPage() {
           >
             ×
           </button>
-          <div className="modal" style={{ width: '900px', maxWidth: '90vw' }}>
-            <div className="modal-container">
-              <div className="modal-header">
+          <div className="modal modal--sticky-layout" style={{ width: '900px', maxWidth: '90vw' }}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <h2>会话详情</h2>
+                <button
+                  className="session-refresh-btn"
+                  onClick={async () => {
+                    if (!selectedSession || logsLoading) return;
+                    setLogsLoading(true);
+                    try {
+                      const logs = await api.getSessionLogs(selectedSession.id, 10000);
+                      setSelectedSessionLogs(logs);
+                    } catch (error) {
+                      console.error('Failed to refresh session logs:', error);
+                    } finally {
+                      setLogsLoading(false);
+                    }
+                  }}
+                  disabled={logsLoading}
+                  title="刷新"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={logsLoading ? 'spin-icon' : ''}>
+                    <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"/>
+                  </svg>
+                </button>
               </div>
-              <div>
-                <div className="form-group">
-                  <label>会话ID</label>
-                  <input type="text" value={selectedSession.id} readOnly />
+              <div className="session-view-toggle">
+                  <button
+                    className={chatViewMode === 'logs' ? 'active' : ''}
+                    onClick={() => setChatViewMode('logs')}
+                  >日志</button>
+                  <button
+                    className={chatViewMode === 'chat' ? 'active' : ''}
+                    onClick={() => setChatViewMode('chat')}
+                  >对话</button>
                 </div>
-                <div className="form-group">
-                  <label>标题</label>
-                  <input type="text" value={selectedSession.title || '(无标题)'} readOnly />
-                </div>
-                <div className="form-group">
-                  <label>客户端类型</label>
-                  <input type="text" value={selectedSession.targetType === 'claude-code' ? 'Claude Code' : 'Codex'} readOnly />
-                </div>
-                <div style={{ display: 'flex', gap: '15px' }}>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label>请求数</label>
-                    <input type="text" value={selectedSession.requestCount.toString()} readOnly />
+            </div>
+            <div className="modal-body-scrollable">
+              {chatViewMode === 'logs' ? (
+                <>
+                  <div className="form-group">
+                    <label>会话ID</label>
+                    <input type="text" value={selectedSession.id} readOnly />
                   </div>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label>Tokens</label>
-                    <input type="text" value={selectedSession.totalTokens.toLocaleString()} readOnly />
+                  <div className="form-group">
+                    <label>标题</label>
+                    <input type="text" value={cleanSessionTitle(selectedSession.title)} readOnly />
                   </div>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label>时长</label>
-                    <input type="text" value={formatDuration(selectedSession.firstRequestAt, selectedSession.lastRequestAt)} readOnly />
+                  <div className="form-group">
+                    <label>客户端类型</label>
+                    <input type="text" value={selectedSession.targetType === 'claude-code' ? 'Claude Code' : 'Codex'} readOnly />
                   </div>
-                </div>
-                <div style={{ display: 'flex', gap: '15px' }}>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label>首次请求</label>
-                    <input type="text" value={dayjs(selectedSession.firstRequestAt).format('YYYY-MM-DD HH:mm:ss')} readOnly />
+                  <div style={{ display: 'flex', gap: '15px' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>请求数</label>
+                      <input type="text" value={selectedSession.requestCount.toString()} readOnly />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>Tokens</label>
+                      <input type="text" value={selectedSession.totalTokens.toLocaleString()} readOnly />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>时长</label>
+                      <input type="text" value={formatDuration(selectedSession.firstRequestAt, selectedSession.lastRequestAt)} readOnly />
+                    </div>
                   </div>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label>最后请求</label>
-                    <input type="text" value={dayjs(selectedSession.lastRequestAt).format('YYYY-MM-DD HH:mm:ss')} readOnly />
+                  <div style={{ display: 'flex', gap: '15px' }}>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>首次请求</label>
+                      <input type="text" value={dayjs(selectedSession.firstRequestAt).format('YYYY-MM-DD HH:mm:ss')} readOnly />
+                    </div>
+                    <div className="form-group" style={{ flex: 1 }}>
+                      <label>最后请求</label>
+                      <input type="text" value={dayjs(selectedSession.lastRequestAt).format('YYYY-MM-DD HH:mm:ss')} readOnly />
+                    </div>
                   </div>
-                </div>
 
-                <h3 style={{ marginTop: '20px', marginBottom: '10px' }}>会话日志 ({selectedSessionLogs.length})</h3>
-                {logsLoading ? (
-                  <div style={{ textAlign: 'center', padding: '20px' }}>加载中...</div>
-                ) : selectedSessionLogs.length === 0 ? (
-                  <div style={{ textAlign: 'center', padding: '20px', color: '#7f8c8d' }}>暂无日志</div>
-                ) : (
-                  <div style={{ maxHeight: '400px', overflowY: 'auto', border: '1px solid var(--border-color)', borderRadius: '8px' }}>
-                    <table style={{ fontSize: '14px' }}>
-                      <thead style={{ position: 'sticky', top: 0, background: 'var(--bg-card)' }}>
-                        <tr>
-                          <th>时间</th>
-                          <th>状态</th>
-                          <th>响应时间</th>
-                          <th>Tokens</th>
-                          <th>操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {selectedSessionLogs.map((log) => (
-                          <tr key={log.id}>
-                            <td>{dayjs(log.timestamp).format('HH:mm:ss')}</td>
-                            <td>
-                              <span className={`badge ${getStatusBadge(log.statusCode)}`}>
-                                {log.statusCode || 'Error'}
-                              </span>
-                            </td>
-                            <td>{log.responseTime ? `${log.responseTime}ms` : '-'}</td>
-                            <td>
-                              {log.usage ? (
-                                <span>{log.usage.totalTokens || log.usage.inputTokens + log.usage.outputTokens}</span>
-                              ) : '-'}
-                            </td>
-                            <td>
-                              <button
-                                className="btn btn-sm btn-secondary"
-                                onClick={() => setSelectedRequestLog(log)}
-                              >
-                                详情
-                              </button>
-                            </td>
+                  <h3 style={{ marginTop: '20px', marginBottom: '10px' }}>会话日志 ({selectedSessionLogs.length})</h3>
+                  {logsLoading ? (
+                    <div style={{ textAlign: 'center', padding: '20px' }}>加载中...</div>
+                  ) : selectedSessionLogs.length === 0 ? (
+                    <div style={{ textAlign: 'center', padding: '20px', color: '#7f8c8d' }}>暂无日志</div>
+                  ) : (
+                    <div style={{ border: '1px solid var(--border-color)', borderRadius: '8px', overflow: 'hidden' }}>
+                      <table style={{ fontSize: '14px' }}>
+                        <thead>
+                          <tr>
+                            <th>时间</th>
+                            <th>状态</th>
+                            <th>响应时间</th>
+                            <th>Tokens</th>
+                            <th>操作</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-              <div className="modal-footer">
-                <button className="btn btn-primary" onClick={exportSessionAsJson}
-                  disabled={selectedSessionLogs.length === 0}>导出</button>
-                <button className="btn btn-secondary" onClick={() => {
-                  setSelectedSession(null);
-                  setSelectedSessionLogs([]);
-                }}>关闭</button>
-              </div>
+                        </thead>
+                        <tbody>
+                          {[...selectedSessionLogs].sort((a, b) => a.timestamp - b.timestamp).map((log) => (
+                            <tr key={log.id}>
+                              <td>{dayjs(log.timestamp).format('HH:mm:ss')}</td>
+                              <td>
+                                <span className={`badge ${getStatusBadge(log.statusCode)}`}>
+                                  {log.statusCode || 'Error'}
+                                </span>
+                              </td>
+                              <td>{log.responseTime ? `${log.responseTime}ms` : '-'}</td>
+                              <td>
+                                {log.usage ? (
+                                  <span>{log.usage.totalTokens || log.usage.inputTokens + log.usage.outputTokens}</span>
+                                ) : '-'}
+                              </td>
+                              <td>
+                                <button
+                                  className="btn btn-sm btn-secondary"
+                                  onClick={() => setSelectedRequestLog(log)}
+                                >
+                                  详情
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  {logsLoading ? (
+                    <div style={{ textAlign: 'center', padding: '20px' }}>加载中...</div>
+                  ) : (
+                    <ChatViewFromSessionLogs logs={selectedSessionLogs} />
+                  )}
+                </>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-primary" onClick={exportSessionAsJson}
+                disabled={selectedSessionLogs.length === 0}>导出</button>
+              <button className="btn btn-secondary" onClick={() => {
+                setSelectedSession(null);
+                setSelectedSessionLogs([]);
+              }}>关闭</button>
             </div>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 清理会话标题中的 XML 标签
+ */
+function cleanSessionTitle(title?: string): string {
+  return (title || '').replace('<session>', '').replace('</session>', '').trim() || '(无标题)';
+}
+
+interface ChatMessageItem {
+  role: 'user' | 'assistant';
+  type?: 'tool_result' | 'tool_use';
+  header?: string;
+  content: string;
+  thinking?: string;
+  timestamp: number;
+  model?: string;
+  tokens?: number;
+}
+
+/**
+ * 从单条消息对象中提取 ChatMessageItem
+ * toolNameMap: tool_use_id → tool name 的映射，用于给 tool_result 显示工具名
+ */
+function extractChatItemsFromMessage(msg: any, timestamp: number, model?: string, toolNameMap?: Map<string, string>): ChatMessageItem[] {
+  if (!msg) return [];
+  const items: ChatMessageItem[] = [];
+
+  if (msg.role === 'user') {
+    const content = msg.content;
+    if (typeof content === 'string') {
+      items.push({ role: 'user', content, timestamp, model });
+    } else if (Array.isArray(content)) {
+      let textParts: string[] = [];
+      const flushText = () => {
+        if (textParts.length > 0) {
+          items.push({ role: 'user', content: textParts.join('\n'), timestamp, model });
+          textParts = [];
+        }
+      };
+      for (const block of content) {
+        if (block?.type === 'text' && block?.text) {
+          textParts.push(block.text);
+        } else if (block?.type === 'image' || block?.type === 'image_url') {
+          textParts.push('[图片]');
+        } else if (block?.type === 'tool_result') {
+          flushText();
+          let resultText = '';
+          if (block.content) {
+            if (typeof block.content === 'string') {
+              resultText = block.content;
+            } else if (Array.isArray(block.content)) {
+              resultText = block.content.map((c: any) => {
+                if (typeof c === 'string') return c;
+                if (c?.type === 'text' && c?.text) return c.text;
+                if (c?.type === 'image') return '[图片]';
+                if (c?.type === 'image_url') return '[图片]';
+                return JSON.stringify(c);
+              }).join('\n');
+            } else {
+              resultText = JSON.stringify(block.content);
+            }
+          }
+          // 通过 tool_use_id 查找工具名
+          const resolvedName = (block.tool_use_id && toolNameMap?.get(block.tool_use_id))
+            || block.name || '';
+          const shortId = block.tool_use_id ? block.tool_use_id.slice(-8) : '';
+          const headerText = resolvedName
+            ? `[工具结果: ${resolvedName}${shortId ? ` · ...${shortId}` : ''}]`
+            : (shortId ? `[工具结果: ...${shortId}]` : '[工具结果]');
+          items.push({ role: 'user', type: 'tool_result', header: headerText, content: resultText || headerText, timestamp, model });
+        }
+      }
+      flushText();
+    }
+  } else if (msg.role === 'assistant') {
+    const content = msg.content;
+    if (typeof content === 'string') {
+      if (content) items.push({ role: 'assistant', content, timestamp, model });
+    } else if (Array.isArray(content)) {
+      let text = '';
+      let thinking = '';
+      for (const block of content) {
+        if (block.type === 'text' && block.text) text += block.text;
+        if (block.type === 'thinking' && block.thinking) thinking += block.thinking;
+        if (block.type === 'tool_use') {
+          if (text || thinking) {
+            items.push({ role: 'assistant', content: text, thinking: thinking || undefined, timestamp, model });
+            text = '';
+            thinking = '';
+          }
+          const toolName = block.name || '';
+          const toolId = block.id ? block.id.slice(-8) : '';
+          const headerLabel = toolName + (toolId ? ` · ...${toolId}` : '');
+          const input = block.input ? JSON.stringify(block.input, null, 2) : '';
+          items.push({ role: 'assistant', type: 'tool_use', header: `[工具调用: ${headerLabel}]`, content: input || `[工具调用: ${headerLabel}]`, timestamp, model });
+        }
+      }
+      if (text || thinking) {
+        items.push({ role: 'assistant', content: text || '', thinking: thinking || undefined, timestamp, model });
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * 从会话日志中提取聊天消息列表
+ * 使用增量对比：每个 log 的 body.messages 包含完整历史，
+ * 通过与前一个 log 对比，只提取新增的 messages，
+ * 最后再补充当前 log 的 response
+ */
+function extractChatMessagesFromLogs(logs: RequestLog[]): ChatMessageItem[] {
+  const messages: ChatMessageItem[] = [];
+  let prevMsgCount = 0;
+
+  // 预扫描所有 log 的 messages，构建 tool_use_id → tool name 映射
+  const toolNameMap = new Map<string, string>();
+  for (const log of logs) {
+    const allMessages = log.body?.messages || [];
+    for (const msg of allMessages) {
+      if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === 'tool_use' && block.id && block.name) {
+            toolNameMap.set(block.id, block.name);
+          }
+        }
+      }
+    }
+  }
+
+  for (const log of logs) {
+    const allMessages = log.body?.messages || [];
+    // 提取新增的消息（增量部分）
+    const newMessages = allMessages.slice(prevMsgCount);
+    prevMsgCount = allMessages.length;
+
+    for (const msg of newMessages) {
+      const items = extractChatItemsFromMessage(msg, log.timestamp, log.requestModel, toolNameMap);
+      messages.push(...items);
+    }
+
+    // 提取当前 log 的响应（助手回复）
+    const assistantItems = extractAssistantMessagesFromLog(log);
+    messages.push(...assistantItems);
+  }
+
+  return messages;
+}
+
+/**
+ * 从日志中提取助手回复 — 拆分为多条消息（text/tool_use 各自独立）
+ */
+function extractAssistantMessagesFromLog(log: RequestLog): ChatMessageItem[] {
+  const items: ChatMessageItem[] = [];
+  const baseMeta = {
+    timestamp: log.timestamp,
+    model: log.targetModel,
+    tokens: log.usage?.totalTokens || (log.usage ? log.usage.inputTokens + log.usage.outputTokens : undefined),
+  };
+
+  // 优先从 downstreamResponseBody 提取（SSE 格式）
+  const sourceText = log.downstreamResponseBody;
+  if (typeof sourceText === 'string' &&
+      (sourceText.includes('event:') || sourceText.includes('data:'))) {
+    const events = parseSSEChunks(sourceText);
+    const { text, thinking } = assembleStreamText(events);
+    if (text || thinking) {
+      items.push({ role: 'assistant', content: text || '', thinking: thinking || undefined, ...baseMeta });
+      return items;
+    }
+  }
+
+  // 从 responseBody 提取（JSON 格式）
+  if (log.responseBody) {
+    try {
+      const parsed = typeof log.responseBody === 'string'
+        ? JSON.parse(log.responseBody)
+        : log.responseBody;
+
+      // Claude 格式 — 按 content block 类型拆分
+      if (parsed.content && Array.isArray(parsed.content)) {
+        let text = '';
+        let thinking = '';
+        for (const block of parsed.content) {
+          if (block.type === 'text' && block.text) text += block.text;
+          if (block.type === 'thinking' && block.thinking) thinking += block.thinking;
+          if (block.type === 'tool_use') {
+            // 先 flush 已积累的 text/thinking
+            if (text || thinking) {
+              items.push({ role: 'assistant', content: text, thinking: thinking || undefined, ...baseMeta });
+              text = '';
+              thinking = '';
+            }
+            const toolName = block.name || '';
+            const toolId = block.id ? block.id.slice(-8) : '';
+            const headerLabel = toolName + (toolId ? ` · ...${toolId}` : '');
+            const input = block.input ? JSON.stringify(block.input, null, 2) : '';
+            items.push({ role: 'assistant', type: 'tool_use', header: `[工具调用: ${headerLabel}]`, content: input || `[工具调用: ${headerLabel}]`, ...baseMeta });
+          }
+        }
+        if (text || thinking) {
+          items.push({ role: 'assistant', content: text || '', thinking: thinking || undefined, ...baseMeta });
+        }
+        if (items.length > 0) return items;
+      }
+
+      // OpenAI 格式
+      if (parsed.choices?.[0]?.message) {
+        const msg = parsed.choices[0].message;
+        if (msg.content) {
+          items.push({ role: 'assistant', content: msg.content, ...baseMeta });
+        }
+        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            const toolName = tc.function?.name || '';
+            const toolId = tc.id ? tc.id.slice(-8) : '';
+            const headerLabel = toolName + (toolId ? ` · ...${toolId}` : '');
+            const args = tc.function?.arguments || '';
+            items.push({ role: 'assistant', type: 'tool_use', header: `[工具调用: ${headerLabel}]`, content: args || `[工具调用: ${headerLabel}]`, ...baseMeta });
+          }
+        }
+        if (items.length > 0) return items;
+      }
+
+      // Responses API 格式
+      if (parsed.output) {
+        let text = '';
+        const outputs = Array.isArray(parsed.output) ? parsed.output : [parsed.output];
+        for (const item of outputs) {
+          if (item.type === 'message' && item.content) {
+            const contents = Array.isArray(item.content) ? item.content : [item.content];
+            for (const c of contents) {
+              if (c.type === 'output_text' && c.text) text += c.text;
+              else if (typeof c === 'string') text += c;
+            }
+          }
+          if (item.type === 'function_call') {
+            if (text) {
+              items.push({ role: 'assistant', content: text, ...baseMeta });
+              text = '';
+            }
+            const toolName = item.name || '';
+            const toolId = item.call_id ? item.call_id.slice(-8) : '';
+            const headerLabel = toolName + (toolId ? ` · ...${toolId}` : '');
+            const args = item.arguments || '';
+            items.push({ role: 'assistant', type: 'tool_use', header: `[工具调用: ${headerLabel}]`, content: args || `[工具调用: ${headerLabel}]`, ...baseMeta });
+          }
+        }
+        if (text) items.push({ role: 'assistant', content: text, ...baseMeta });
+        if (items.length > 0) return items;
+      }
+    } catch { /* ignore */ }
+  }
+
+  return items;
+}
+
+interface ChatViewFromSessionLogsProps {
+  logs: RequestLog[];
+}
+
+/**
+ * 聊天视图组件：以聊天气泡形式展示会话日志
+ */
+/**
+ * 可折叠的消息内容（超过 10 行时支持展开/收起）
+ * 默认展开全部，按钮 sticky 悬浮在消息顶部
+ * 收起时自动滚动到该消息顶部，避免视觉跳跃
+ */
+function CollapsibleChatContent({ content, header, forceCollapsible, hideContentWhenCollapsed }: { content: string; header?: string; forceCollapsible?: boolean; hideContentWhenCollapsed?: boolean }) {
+  const lines = content.split('\n');
+  const COLLAPSE_THRESHOLD = 10;
+  const TOOL_COLLAPSE_LINES = 3;
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  const isTool = !!forceCollapsible;
+  const shouldCollapse = forceCollapsible || lines.length > COLLAPSE_THRESHOLD;
+  const collapsedLines = isTool ? TOOL_COLLAPSE_LINES : COLLAPSE_THRESHOLD;
+  const [expanded, setExpanded] = useState(!shouldCollapse);
+
+  const handleToggle = () => {
+    if (expanded) {
+      // 收起后检查 top bar 是否在可见区域，不在时才滚动
+      requestAnimationFrame(() => {
+        const wrapper = wrapperRef.current;
+        const scrollParent = wrapper?.parentElement; // chat-bubble
+        const scrollContainer = scrollParent?.closest('.modal-body-scrollable');
+        if (wrapper && scrollContainer) {
+          const wrapperRect = wrapper.getBoundingClientRect();
+          const containerRect = scrollContainer.getBoundingClientRect();
+          // top bar 不在可见区域时，滚动到可见
+          if (wrapperRect.top < containerRect.top || wrapperRect.top > containerRect.bottom) {
+            wrapper.scrollIntoView({ block: 'start', behavior: 'smooth' });
+          }
+        }
+      });
+      setExpanded(false);
+    } else {
+      setExpanded(true);
+    }
+  };
+
+  if (!shouldCollapse) {
+    return (
+      <>
+        {header && <div className="chat-tool-header">{header}</div>}
+        <div className="chat-content-text">{content}</div>
+      </>
+    );
+  }
+
+  // 收起且 hideContentWhenCollapsed 时，只展示 header + 展开按钮，不展示内容
+  if (!expanded && hideContentWhenCollapsed) {
+    return (
+      <div className="chat-collapsible-wrapper" ref={wrapperRef} style={{ width: '400px' }}>
+        <div className="chat-collapse-top-bar">
+          {header && <div className="chat-tool-header">{header}</div>}
+          <div className="chat-collapse-btn-sticky">
+            <button
+              className="chat-collapse-btn"
+              onClick={handleToggle}
+            >
+              展开 ({lines.length} 行)
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-collapsible-wrapper" ref={wrapperRef} style={!expanded && isTool ? { width: '400px' } : undefined}>
+      <div className="chat-collapse-top-bar">
+        {header && <div className="chat-tool-header">{header}</div>}
+        <div className="chat-collapse-btn-sticky">
+          <button
+            className="chat-collapse-btn"
+            onClick={handleToggle}
+          >
+            {expanded ? '收起' : `展开全部 (${lines.length} 行)`}
+          </button>
+        </div>
+      </div>
+      <div className="chat-content-text">
+        {expanded ? content : lines.slice(0, collapsedLines).join('\n')}
+      </div>
+      {!expanded && (
+        <div className="chat-collapse-fade" onClick={handleToggle}>
+          <span className="chat-collapse-fade-btn">展开全部 ({lines.length} 行)</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatViewFromSessionLogs({ logs }: ChatViewFromSessionLogsProps) {
+  // 按时间升序排列，最早的在顶部
+  const sortedLogs = [...logs].sort((a, b) => a.timestamp - b.timestamp);
+  const chatMessages = extractChatMessagesFromLogs(sortedLogs);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [showScrollBtn, setShowScrollBtn] = useState(true);
+
+  const handleScroll = () => {
+    const el = containerRef.current?.parentElement;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    setShowScrollBtn(!atBottom);
+  };
+
+  const scrollToBottom = () => {
+    const el = containerRef.current?.parentElement;
+    if (el) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    }
+  };
+
+  if (chatMessages.length === 0) {
+    return <div style={{ textAlign: 'center', padding: '20px', color: 'var(--text-tertiary)' }}>暂无对话内容</div>;
+  }
+
+  return (
+    <div className="chat-view-container" ref={containerRef} onScroll={handleScroll}>
+      {chatMessages.map((msg, index) => (
+        <div key={index} className={`chat-message chat-message--${msg.role}${msg.type ? ` chat-message--${msg.type}` : ''}`}>
+          <div className="chat-bubble">
+            {msg.role === 'assistant' && msg.thinking && (
+              <details className="chat-thinking">
+                <summary>思考内容 ({msg.thinking.length} 字符)</summary>
+                <pre>{msg.thinking}</pre>
+              </details>
+            )}
+            {msg.content && (
+              <CollapsibleChatContent content={msg.content} header={msg.header} forceCollapsible={!!msg.type} hideContentWhenCollapsed={msg.type === 'tool_use'} />
+            )}
+          </div>
+          {!msg.type && (
+          <div className="chat-meta">
+            {dayjs(msg.timestamp).format('HH:mm:ss')}
+            {msg.model && ` · ${msg.model}`}
+            {msg.tokens && ` · ${msg.tokens.toLocaleString()} tokens`}
+          </div>
+          )}
+        </div>
+      ))}
+      {showScrollBtn && (
+        <div className="chat-scroll-bottom">
+          <button className="chat-scroll-bottom-btn" onClick={scrollToBottom}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 5v14M5 12l7 7 7-7"/>
+            </svg>
+          </button>
         </div>
       )}
     </div>

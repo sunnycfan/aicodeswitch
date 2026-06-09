@@ -3004,6 +3004,7 @@ export class ProxyServer {
   private formatSessionTitle(text: string): string {
     // 去除多余空白和换行符，替换为单个空格
     let formatted = text
+      .replace(/<\/?session>/g, '')  // 移除 <session></session> 标签
       .replace(/\s+/g, ' ')  // 多个空白字符替换为单个空格
       .replace(/[\r\n]+/g, ' ')  // 换行符替换为空格
       .trim();
