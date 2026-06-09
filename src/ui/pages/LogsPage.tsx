@@ -2002,7 +2002,16 @@ function LogsPage() {
                   {logsLoading ? (
                     <div style={{ textAlign: 'center', padding: '20px' }}>加载中...</div>
                   ) : (
-                    <ChatViewFromSessionLogs logs={selectedSessionLogs} />
+                    <ChatViewFromSessionLogs
+                      logs={selectedSessionLogs}
+                      onFetchNew={async () => {
+                        if (!selectedSession) return [];
+                        const freshLogs = await api.getSessionLogs(selectedSession.id, 10000);
+                        // 同步更新外部 state，保持一致性
+                        setSelectedSessionLogs(freshLogs);
+                        return freshLogs;
+                      }}
+                    />
                   )}
                 </>
               )}
@@ -2377,19 +2386,33 @@ function CollapsibleChatContent({ content, header, forceCollapsible, hideContent
   );
 }
 
-function ChatViewFromSessionLogs({ logs }: ChatViewFromSessionLogsProps) {
-  // 按时间升序排列，最早的在顶部
+function ChatViewFromSessionLogs({ logs, onFetchNew }: ChatViewFromSessionLogsProps & { onFetchNew?: () => Promise<RequestLog[]> }) {
+  // 本地维护消息列表，支持增量追加
   const sortedLogs = [...logs].sort((a, b) => a.timestamp - b.timestamp);
-  const chatMessages = extractChatMessagesFromLogs(sortedLogs);
+  const [localLogs, setLocalLogs] = useState<RequestLog[]>(sortedLogs);
+  const chatMessages = extractChatMessagesFromLogs(localLogs);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [showScrollBtn, setShowScrollBtn] = useState(true);
+  const [isAtBottom, setIsAtBottom] = useState(false);
+  const [fetchingNew, setFetchingNew] = useState(false);
 
-  const handleScroll = () => {
-    const el = containerRef.current?.parentElement;
-    if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    setShowScrollBtn(!atBottom);
-  };
+  // 当外部 logs 变化时同步到本地
+  useEffect(() => {
+    setLocalLogs([...logs].sort((a, b) => a.timestamp - b.timestamp));
+  }, [logs]);
+
+  // 监听滚动容器的 scroll 事件（实际滚动的是 modal-body-scrollable）
+  useEffect(() => {
+    const scrollEl = containerRef.current?.parentElement;
+    if (!scrollEl) return;
+    const onScroll = () => {
+      const atBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 60;
+      setIsAtBottom(atBottom);
+    };
+    scrollEl.addEventListener('scroll', onScroll);
+    // 初始检测
+    onScroll();
+    return () => scrollEl.removeEventListener('scroll', onScroll);
+  }, [localLogs]);
 
   const scrollToBottom = () => {
     const el = containerRef.current?.parentElement;
@@ -2398,12 +2421,34 @@ function ChatViewFromSessionLogs({ logs }: ChatViewFromSessionLogsProps) {
     }
   };
 
+  const handleBtnClick = async () => {
+    if (isAtBottom && onFetchNew) {
+      // 已在底部 → 拉取新数据并追加
+      setFetchingNew(true);
+      try {
+        const newLogs = await onFetchNew();
+        const existingIds = new Set(localLogs.map(l => l.id));
+        const freshSorted = [...newLogs].sort((a, b) => a.timestamp - b.timestamp);
+        const appended = freshSorted.filter(l => !existingIds.has(l.id));
+        if (appended.length > 0) {
+          setLocalLogs(prev => [...prev, ...appended]);
+          // 追加后滚动到底部
+          requestAnimationFrame(() => scrollToBottom());
+        }
+      } finally {
+        setFetchingNew(false);
+      }
+    } else {
+      scrollToBottom();
+    }
+  };
+
   if (chatMessages.length === 0) {
     return <div style={{ textAlign: 'center', padding: '20px', color: 'var(--text-tertiary)' }}>暂无对话内容</div>;
   }
 
   return (
-    <div className="chat-view-container" ref={containerRef} onScroll={handleScroll}>
+    <div className="chat-view-container" ref={containerRef}>
       {chatMessages.map((msg, index) => (
         <div key={index} className={`chat-message chat-message--${msg.role}${msg.type ? ` chat-message--${msg.type}` : ''}`}>
           <div className="chat-bubble">
@@ -2426,15 +2471,19 @@ function ChatViewFromSessionLogs({ logs }: ChatViewFromSessionLogsProps) {
           )}
         </div>
       ))}
-      {showScrollBtn && (
-        <div className="chat-scroll-bottom">
-          <button className="chat-scroll-bottom-btn" onClick={scrollToBottom}>
+      <div className="chat-scroll-bottom">
+        <button className="chat-scroll-bottom-btn" onClick={handleBtnClick} disabled={fetchingNew}>
+          {fetchingNew ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="spin-icon">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"/>
+            </svg>
+          ) : (
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 5v14M5 12l7 7 7-7"/>
             </svg>
-          </button>
-        </div>
-      )}
+          )}
+        </button>
+      </div>
     </div>
   );
 }
