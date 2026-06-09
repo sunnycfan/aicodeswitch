@@ -5,6 +5,7 @@ import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import { Pagination } from '../components/Pagination';
 import { toast } from '../components/Toast';
+import { SessionMigrationModal } from '../components/SessionMigrationModal';
 
 dayjs.extend(relativeTime);
 
@@ -606,6 +607,7 @@ function SessionsPage() {
   // 自动刷新
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [countdown, setCountdown] = useState(10);
+  const [migrationSession, setMigrationSession] = useState<Session | null>(null);
 
   useEffect(() => {
     loadSessions();
@@ -968,6 +970,12 @@ function SessionsPage() {
                           className="btn btn-sm btn-primary"
                           onClick={(e) => { e.stopPropagation(); handleSessionClick(session, true); }}
                         >对话</button>
+                        <button
+                          className="btn btn-sm"
+                          style={{ backgroundColor: '#8e44ad', color: 'white', border: 'none' }}
+                          onClick={(e) => { e.stopPropagation(); setMigrationSession(session); }}
+                          title="迁移到另一个工具"
+                        >迁移</button>
                       </div>
                     </td>
                   </tr>
@@ -1133,6 +1141,14 @@ function SessionsPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Migration Modal */}
+      {migrationSession && (
+        <SessionMigrationModal
+          session={migrationSession}
+          onClose={() => setMigrationSession(null)}
+        />
       )}
     </div>
   );

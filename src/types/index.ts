@@ -497,6 +497,61 @@ export interface ConfigFileState {
   managedFieldsChanged?: boolean;
 }
 
+/** 会话迁移相关类型 */
+
+export interface MigrationOptions {
+  sourceSessionId: string;
+  targetTool: ToolType;
+  includeThinking?: boolean;
+  includeToolCalls?: boolean;
+  maxRounds?: number;
+}
+
+export interface MigrationRound {
+  index: number;
+  userMessage: string;
+  assistantResponse: string;
+  toolCallSummaries: string[];
+  thinking?: string;
+  timestamp: number;
+}
+
+export interface MigrationContent {
+  sessionId: string;
+  sessionTitle: string;
+  sourceTool: ToolType;
+  rounds: MigrationRound[];
+  totalRounds: number;
+  extractedRounds: number;
+}
+
+export interface MigrationPreview {
+  content: MigrationContent;
+  generatedPrompt: string;
+  estimatedTokens: number;
+  warnings: string[];
+}
+
+export interface MigrationResult {
+  success: boolean;
+  prompt: string;
+  format: 'markdown';
+  estimatedTokens: number;
+  warnings: string[];
+}
+
+export interface LaunchResult {
+  success: boolean;
+  method: 'cli-launch' | 'fallback';
+  pid?: number;
+  command?: string;
+  promptFilePath?: string;
+  reason?: string;
+  prompt?: string;
+  estimatedTokens?: number;
+  fallbackSuggestions?: string[];
+}
+
 /** 标准 API 路径枚举 */
 export type ApiPath =
   | '/v1/messages'
