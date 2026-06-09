@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-09: 修复 Streaming/Thinking 过程中规则状态未保持使用中
+
+### 修复
+- 修复 streaming 响应（包括 thinking 思考过程）超过 10 秒后规则状态错误变为空闲的问题
+- 新增 `refreshRuleInUse` 方法，仅在状态已为 `in_use` 时轻量刷新不活动定时器
+- 在 `ChunkCollectorTransform` 中增加节流回调（每 5 秒），streaming 期间持续刷新定时器保持使用中状态
+
 ## 2026-06-09: 会话对话视图去重与导出优化
 
 ### 修复

@@ -3828,7 +3828,9 @@ export class ProxyServer {
         const parser = new SSEParserTransform();
         const eventCollector = new SSEEventCollectorTransform();
         const serializer = new SSESerializerTransform();
-        const downstreamChunkCollector = new ChunkCollectorTransform();
+        const downstreamChunkCollector = new ChunkCollectorTransform(() => {
+          rulesStatusBroadcaster.refreshRuleInUse(route.id, rule.id);
+        });
         const compactResponseSanitizer = rule.contentType === 'compact' && targetType === 'claude-code'
           ? new ClaudeCompactResponseSanitizer()
           : null;
@@ -4583,7 +4585,9 @@ export class ProxyServer {
         const parser = new SSEParserTransform();
         const eventCollector = new SSEEventCollectorTransform();
         const serializer = new SSESerializerTransform();
-        const downstreamChunkCollector = new ChunkCollectorTransform();
+        const downstreamChunkCollector = new ChunkCollectorTransform(() => {
+          rulesStatusBroadcaster.refreshRuleInUse(route.id, rule.id);
+        });
         responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
 
         const { converter, extractUsage } = this.transformSSEByFormat(clientFormat, sourceType);
