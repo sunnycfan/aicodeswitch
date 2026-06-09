@@ -567,3 +567,117 @@ export interface ApiPathBinding {
   apiPath: ApiPath;
   routeId: string | null;
 }
+
+// ============================================================================
+// AccessKey 接入密钥共享相关类型
+// ============================================================================
+
+/** 接入密钥 */
+export interface AccessKey {
+  id: string;                     // 系统生成的唯一标识，如 "key_abc123"
+  name: string;                   // 名称，如 "张三 - 前端组"
+  remark?: string;                // 备注信息
+  apiKey: string;                 // API Key（sk_ 前缀）
+  apiKeyHash: string;             // API Key 的 SHA-256 前16字符哈希值（用于快速查找）
+  policyId?: string;              // 绑定的策略 ID
+  status: 'active' | 'disabled'; // 状态
+  createdAt: number;              // 创建时间（Unix 时间戳）
+  updatedAt: number;              // 更新时间
+  lastActiveAt?: number;          // 最后活跃时间
+}
+
+/** 策略 */
+export interface Policy {
+  id: string;                     // 系统生成的唯一标识
+  name: string;                   // 策略名称
+  description?: string;           // 策略描述
+
+  // 路由绑定
+  routeId?: string;               // 绑定的路由 ID
+
+  // Token 配额（单位：千 Token）
+  dailyTokenLimit?: number;       // 日 Token 限额（k）
+  weeklyTokenLimit?: number;      // 周 Token 限额（k）
+  monthlyTokenLimit?: number;     // 月 Token 限额（k）
+  customTokenLimit?: number;      // 自定义周期 Token 限额（k）
+  customTokenResetHours?: number; // 自定义周期小时数
+
+  // 请求次数配额
+  dailyRequestLimit?: number;     // 日请求限额
+  weeklyRequestLimit?: number;    // 周请求限额
+  monthlyRequestLimit?: number;   // 月请求限额
+  customRequestLimit?: number;    // 自定义周期请求限额
+  customRequestResetHours?: number; // 自定义周期小时数
+
+  // 频率与并发
+  rpmLimit?: number;              // 每分钟请求数上限
+  concurrentLimit?: number;       // 最大并发数
+
+  // 模型过滤
+  allowedModels?: string[];       // 模型白名单
+  blockedModels?: string[];       // 模型黑名单
+
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Key 级用量统计 */
+export interface KeyUsage {
+  keyId: string;
+
+  // 累计用量（全生命周期）
+  lifetime: {
+    totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalRequests: number;
+    errorCount: number;
+  };
+
+  // 周期性用量（按维度分别跟踪）
+  periods: {
+    daily: KeyUsagePeriod;
+    weekly: KeyUsagePeriod;
+    monthly: KeyUsagePeriod;
+    custom?: KeyUsagePeriod & { resetHours: number };
+  };
+
+  // 历史趋势（按天汇总，保留 90 天）
+  dailyHistory: KeyUsageDailyRecord[];
+}
+
+export interface KeyUsagePeriod {
+  tokens: number;
+  requests: number;
+  periodStart: number;  // 当前周期的起始时间戳
+}
+
+export interface KeyUsageDailyRecord {
+  date: string;         // "YYYY-MM-DD"
+  tokens: number;
+  requests: number;
+  errors: number;
+}
+
+/** AccessKey 请求的日志（复用 RequestLog 结构，额外附加 keyId/keyName） */
+export interface AccessKeyRequestLog extends RequestLog {
+  keyId: string;
+  keyName: string;
+}
+
+/** 接入密钥创建响应 */
+export interface AccessKeyCreateResponse {
+  key: AccessKey;
+  apiKey: string;  // 仅创建时返回完整的 apiKey
+}
+
+/** 配额告警 */
+export interface QuotaAlert {
+  keyId: string;
+  keyName: string;
+  dimension: string;
+  usage: number;
+  limit: number;
+  percentage: number;
+  level: 'warning' | 'critical' | 'exceeded';
+}

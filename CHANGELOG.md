@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-06-10: AccessKey 接入密钥共享功能
+
+### 新增
+- 新增 AccessKey（接入密钥）功能模块，支持通过 `sk_` 前缀的 API Key 实现多端接入共享
+- 新增 Policy（策略）管理功能，支持可复用的策略模板（路由绑定 + 配额限制 + 模型过滤）
+- 新增 Key 级独立日志和统计系统，AccessKey 请求完全独立于现有系统
+- 新增配额检查：Token 日/周/月限额、请求次数限额、RPM 限制、并发限制、模型过滤
+- 新增接入指引功能，为每个密钥生成 Claude Code/Codex/OpenAI 兼容工具的接入配置
+- 新增批量操作：批量启用/停用、批量绑定策略、批量删除
+- 新增 Key 详情页：统计概览、Token 趋势图、最近请求列表
+- 新增全局统计 API：Key 用量排行、配额告警
+- 新增预置策略模板：不限/轻度/中度/严格限制
+- 新增 `src/server/access-keys/` 模块目录（manager/policy-manager/quota-checker/usage-tracker/key-logger/key-resolver）
+- 新增 `src/ui/pages/AccessKeysPage.tsx`：接入密钥管理页面（含策略管理折叠面板）
+- 新增 `src/ui/pages/AccessKeyDetailPage.tsx`：密钥详情页面
+- 新增侧边栏导航入口：接入密钥
+- 接入密钥与策略管理合并为单一页面，策略面板默认折叠，通过右上角「📜 策略管理」按钮展开
+- 创建密钥弹窗样式美化：使用现有 `.modal` 体系，增加关闭按钮、标题描述、成功态大图标+虚线边框 Key 展示
+
+### 修改
+- 代理引擎支持 `sk_` 前缀 Key 识别，通过策略路由处理请求
+- 代理请求流程支持三种 Header 认证：`Authorization: Bearer`、`x-api-key`、`x-goog-api-key`
+- AccessKey 请求完全绕过现有日志和统计系统，写入独立存储空间
+- 管理面板 JWT 认证从 `Authorization: Bearer` 迁移到 `Access-Token` Header，避免与 AccessKey 认证冲突
+- 当 AUTH 开启时，带有 `Authorization` Header 的请求自动跳过管理面板认证，由代理引擎在业务前置对 AccessKey 进行鉴权
+
+### 认证体系重构
+- **管理面板认证**：JWT token 从 `Authorization: Bearer` 迁移到 `Access-Token` header，前后端同步调整
+- **代理 API 认证**：`config.apiKey` 和 AccessKey 均通过 `Authorization: Bearer`（以及 `x-api-key`、`x-goog-api-key`）传递，代理引擎通过 `sk_` 前缀区分
+- **AUTH 强制认证**：当 AUTH 环境变量启用后，代理请求必须通过 `config.apiKey` 或 AccessKey 认证，不再允许匿名访问
+  - AUTH 开启 + `config.apiKey` 已配置 → 支持 `config.apiKey` 或 AccessKey
+  - AUTH 开启 + `config.apiKey` 未配置 → 仅允许 AccessKey (`sk_` 前缀)
+  - AUTH 未开启 → 保持原有行为（可选认证）
+- 修复 `handleApiPathProxyRequest` 中 `config.apiKey` 校验只读取 `Authorization` header 的问题，现统一使用 `extractApiKey()` 方法同时支持三种 Header
+
 ## 2026-06-09: 会话路由绑定功能
 
 ### 新增

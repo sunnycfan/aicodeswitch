@@ -62,6 +62,10 @@ export function verifyToken(token: string): boolean {
  *
  * 如果未启用鉴权,直接放行
  * 如果启用鉴权但 token 无效,返回 401
+ *
+ * 认证 Header 策略：
+ * - `Access-Token: <jwt_token>` — 管理面板 JWT 认证
+ * - `Authorization: Bearer ...` — 可能是 AccessKey（sk_ 前缀），跳过此中间件，由代理引擎处理
  */
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   // 如果未启用鉴权,直接放行
@@ -70,16 +74,22 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     return;
   }
 
-  // 从 Authorization header 中提取 token
+  // 如果请求带有 Authorization header，视为 AccessKey 请求，跳过管理面板认证
+  // 由代理引擎在业务前置对 AccessKey 进行鉴权
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (authHeader) {
+    next();
+    return;
+  }
+
+  // 从 Access-Token header 中提取 JWT token
+  const accessToken = req.headers['access-token'] as string | undefined;
+  if (!accessToken) {
     res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
     return;
   }
 
-  const token = authHeader.substring(7); // 移除 "Bearer " 前缀
-
-  if (verifyToken(token)) {
+  if (verifyToken(accessToken)) {
     next();
   } else {
     res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
