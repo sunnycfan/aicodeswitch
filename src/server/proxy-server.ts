@@ -2957,9 +2957,9 @@ export class ProxyServer {
       }
     }
 
-    // 确定认证方式：优先使用服务配置的 authType
+    // 确定认证方式：优先使用服务配置的 authType，若继承供应商则使用供应商的 authType
     // 注意：向下兼容 'auto' 字符串值（前端已移除 AuthType.AUTO 枚举，但旧数据可能包含此值）
-    const authType = service.authType || AuthType.AUTH_TOKEN;
+    const authType = this.resolveEffectiveAuthType(service);
     // 向下兼容：检测旧数据的 'auto' 值
     // TODO: 删除
     const isAuto = authType === 'auto' as any;
@@ -3040,6 +3040,20 @@ export class ProxyServer {
     }
 
     return vendor.apiBaseUrl;
+  }
+
+  private resolveEffectiveAuthType(service: APIService): AuthType {
+    if (service.inheritVendorAuthType !== true) {
+      return service.authType || AuthType.AUTH_TOKEN;
+    }
+
+    const vendor = this.dbManager.getVendorByServiceId(service.id);
+    if (!vendor || !vendor.authType) {
+      console.warn(`[Proxy] Service ${service.id} is set to inherit vendor authType, but vendor/authType is missing`);
+      return service.authType || AuthType.AUTH_TOKEN;
+    }
+
+    return vendor.authType;
   }
 
   private copyResponseHeaders(responseHeaders: Record<string, any>, res: Response) {

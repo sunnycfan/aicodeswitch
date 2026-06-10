@@ -2432,6 +2432,9 @@ export class FileSystemDatabaseManager {
       if (service.inheritVendorApiBaseUrl !== undefined && typeof service.inheritVendorApiBaseUrl !== 'boolean') {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiBaseUrl 必须是布尔值` };
       }
+      if (service.inheritVendorAuthType !== undefined && typeof service.inheritVendorAuthType !== 'boolean') {
+        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorAuthType 必须是布尔值` };
+      }
     }
     return { valid: true };
   }
