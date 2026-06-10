@@ -1,4 +1,4 @@
-import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort, ApiPathBinding, ToolName, ToolBindings, MigrationOptions, MigrationPreview, MigrationResult, LaunchResult } from '../../types';
+import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort, ApiPathBinding, ToolName, ToolBindings, MigrationOptions, MigrationPreview, MigrationResult, LaunchResult, AccessKey, Policy, KeyUsage, AccessKeyRequestLog, KeyUsageDailyRecord, QuotaAlert } from '../../types';
 
 interface BackendAPI {
   // 鉴权相关
@@ -159,6 +159,39 @@ interface BackendAPI {
   // API 路径路由映射
   getApiPathBindings: () => Promise<{ bindings: ApiPathBinding[]; models: string }>;
   updateApiPathBindings: (bindings: ApiPathBinding[], models?: string) => Promise<{ success: boolean; bindings: ApiPathBinding[] }>;
+
+  // AccessKey 接入密钥
+  getAccessKeys: (params?: { page?: number; pageSize?: number; status?: string; policyId?: string; search?: string }) => Promise<{ data: (AccessKey & { policyName?: string })[]; total: number; page: number; pageSize: number }>;
+  createAccessKey: (data: { name: string; remark?: string; policyId?: string }) => Promise<{ key: AccessKey; apiKey: string }>;
+  getAccessKey: (id: string) => Promise<AccessKey & { policyName?: string }>;
+  updateAccessKey: (id: string, data: Partial<Pick<AccessKey, 'name' | 'remark' | 'policyId' | 'status'>>) => Promise<boolean>;
+  deleteAccessKey: (id: string) => Promise<boolean>;
+  regenerateAccessKey: (id: string) => Promise<{ apiKey: string }>;
+  batchUpdateAccessKeyStatus: (keyIds: string[], status: 'active' | 'disabled') => Promise<{ count: number }>;
+  batchBindAccessKeyPolicy: (keyIds: string[], policyId: string) => Promise<{ count: number }>;
+  batchDeleteAccessKeys: (keyIds: string[]) => Promise<{ count: number }>;
+  getAccessKeyUsage: (id: string) => Promise<KeyUsage>;
+  getAccessKeyUsageTrend: (id: string, days?: number) => Promise<KeyUsageDailyRecord[]>;
+  getAccessKeyLogs: (id: string, params?: { page?: number; pageSize?: number; startDate?: string; endDate?: string }) => Promise<{ data: AccessKeyRequestLog[]; total: number }>;
+  getAccessKeyGuide: (id: string, host?: string, port?: string) => Promise<{
+    claudeCode: { description: string; envVars: Record<string, string> };
+    codex: { description: string; envVars: Record<string, string> };
+    openai: { description: string; envVars: Record<string, string> };
+  }>;
+
+  // Policy 策略
+  getPolicies: () => Promise<(Policy & { keyCount?: number })[]>;
+  createPolicy: (data: Omit<Policy, 'id' | 'createdAt' | 'updatedAt'>) => Promise<Policy>;
+  getPolicy: (id: string) => Promise<Policy>;
+  updatePolicy: (id: string, data: Partial<Omit<Policy, 'id' | 'createdAt' | 'updatedAt'>>) => Promise<boolean>;
+  deletePolicy: (id: string) => Promise<boolean>;
+  duplicatePolicy: (id: string) => Promise<Policy>;
+  getPolicyKeys: (id: string) => Promise<AccessKey[]>;
+  getPolicyTemplates: () => Promise<Array<{ name: string; description: string; config: Omit<Policy, 'id' | 'createdAt' | 'updatedAt'> }>>;
+
+  // AccessKey 统计
+  getAccessKeyRanking: (params?: { sortBy?: string; order?: string; limit?: number }) => Promise<Array<{ keyId: string; keyName: string; totalTokens: number; totalRequests: number; lastActiveAt?: number }>>;
+  getQuotaAlerts: () => Promise<QuotaAlert[]>;
 }
 
 const buildUrl = (
@@ -186,7 +219,7 @@ const requestJson = async <T>(path: string, options: RequestInit = {}): Promise<
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { 'Access-Token': token } : {}),
       ...(options.headers || {}),
     },
   });
@@ -555,4 +588,33 @@ export const api: BackendAPI = {
 
     return cancelFn;
   },
+
+  // AccessKey 接入密钥
+  getAccessKeys: (params) => requestJson(buildUrl('/api/access-keys', params as Record<string, string | number | undefined>)),
+  createAccessKey: (data) => requestJson(buildUrl('/api/access-keys'), { method: 'POST', body: JSON.stringify(data) }),
+  getAccessKey: (id) => requestJson(buildUrl(`/api/access-keys/${id}`)),
+  updateAccessKey: (id, data) => requestJson(buildUrl(`/api/access-keys/${id}`), { method: 'PUT', body: JSON.stringify(data) }),
+  deleteAccessKey: (id) => requestJson(buildUrl(`/api/access-keys/${id}`), { method: 'DELETE' }),
+  regenerateAccessKey: (id) => requestJson(buildUrl(`/api/access-keys/${id}/regenerate`), { method: 'POST' }),
+  batchUpdateAccessKeyStatus: (keyIds, status) => requestJson(buildUrl('/api/access-keys/batch/status'), { method: 'PUT', body: JSON.stringify({ keyIds, status }) }),
+  batchBindAccessKeyPolicy: (keyIds, policyId) => requestJson(buildUrl('/api/access-keys/batch/policy'), { method: 'PUT', body: JSON.stringify({ keyIds, policyId }) }),
+  batchDeleteAccessKeys: (keyIds) => requestJson(buildUrl('/api/access-keys/batch'), { method: 'DELETE', body: JSON.stringify({ keyIds }) }),
+  getAccessKeyUsage: (id) => requestJson(buildUrl(`/api/access-keys/${id}/usage`)),
+  getAccessKeyUsageTrend: (id, days) => requestJson(buildUrl(`/api/access-keys/${id}/usage/trend`, { days })),
+  getAccessKeyLogs: (id, params) => requestJson(buildUrl(`/api/access-keys/${id}/logs`, params as Record<string, string | number | undefined>)),
+  getAccessKeyGuide: (id, host, port) => requestJson(buildUrl(`/api/access-keys/${id}/guide`, { host, port })),
+
+  // Policy 策略
+  getPolicies: () => requestJson(buildUrl('/api/policies')),
+  createPolicy: (data) => requestJson(buildUrl('/api/policies'), { method: 'POST', body: JSON.stringify(data) }),
+  getPolicy: (id) => requestJson(buildUrl(`/api/policies/${id}`)),
+  updatePolicy: (id, data) => requestJson(buildUrl(`/api/policies/${id}`), { method: 'PUT', body: JSON.stringify(data) }),
+  deletePolicy: (id) => requestJson(buildUrl(`/api/policies/${id}`), { method: 'DELETE' }),
+  duplicatePolicy: (id) => requestJson(buildUrl(`/api/policies/${id}/duplicate`), { method: 'POST' }),
+  getPolicyKeys: (id) => requestJson(buildUrl(`/api/policies/${id}/keys`)),
+  getPolicyTemplates: () => requestJson(buildUrl('/api/policies/templates')),
+
+  // AccessKey 统计
+  getAccessKeyRanking: (params) => requestJson(buildUrl('/api/statistics/access-keys', params as Record<string, string | number | undefined>)),
+  getQuotaAlerts: () => requestJson(buildUrl('/api/statistics/quota-alerts')),
 };

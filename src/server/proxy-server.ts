@@ -42,6 +42,9 @@ import {
 } from './conversions/compact';
 import { isCodingToolRequest } from './coding-plan';
 import { applyCodingPlanHeaders } from './coding-plan-headers';
+import { isAuthEnabled } from './auth';
+import type { AccessKeyModule } from './access-keys/index';
+import type { AccessKey, Policy } from '../types';
 
 type ContentTypeDetector = {
   type: ContentType;
@@ -196,6 +199,7 @@ export class ProxyServer {
   private rules?: Map<string, Rule[]> = new Map();
   private services?: Map<string, APIService> = new Map();
   private config: AppConfig;
+  private accessKeyModule: AccessKeyModule | null = null;
   // 请求去重缓存：用于防止同一个请求被重复计数（如网络重试）
   // key: requestHash, value: timestamp
   private requestDedupeCache = new Map<string, number>();
@@ -210,6 +214,44 @@ export class ProxyServer {
     this.config = dbManager.getConfig();
     this.app = app;
   }
+
+  /** 设置 AccessKey 模块引用 */
+  setAccessKeyModule(module: AccessKeyModule): void {
+    this.accessKeyModule = module;
+  }
+
+  /** 获取 AccessKey 模块引用 */
+  getAccessKeyModule(): AccessKeyModule | null {
+    return this.accessKeyModule;
+  }
+
+  /**
+   * 从请求中提取 API Key（支持三种 Header，按优先级依次尝试）
+   */
+  private extractApiKey(req: Request): string | null {
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const key = authHeader.replace('Bearer ', '').trim();
+      if (key) return key;
+    }
+    const xApiKey = req.headers['x-api-key'];
+    if (typeof xApiKey === 'string' && xApiKey.trim()) return xApiKey.trim();
+    const xGoogApiKey = req.headers['x-goog-api-key'];
+    if (typeof xGoogApiKey === 'string' && xGoogApiKey.trim()) return xGoogApiKey.trim();
+    return null;
+  }
+
+  /** 构建 AccessKey 相关的错误响应（匹配错误码格式） */
+  private sendAccessKeyError(res: Response, error: { type: string; code: string; message: string; httpStatus: number }): void {
+    res.status(error.httpStatus).json({
+      error: {
+        type: error.type,
+        code: error.code,
+        message: error.message,
+      }
+    });
+  }
+
 
   private inferTargetTypeFromPath(path: string): ToolType | undefined {
     if (path === '/claude-code' || path.startsWith('/claude-code/')) {
@@ -284,10 +326,21 @@ export class ProxyServer {
       // /v1/models: 直接返回静态模型列表
       if (apiPath === '/v1/models') {
         // 鉴权
-        if (this.config.apiKey) {
-          const authHeader = req.headers.authorization;
-          const providedKey = authHeader?.replace('Bearer ', '');
-          if (!providedKey || providedKey !== this.config.apiKey) {
+        const apiKeyValue = this.extractApiKey(req);
+        if (apiKeyValue?.startsWith('sk_')) {
+          // AccessKey 鉴权
+          if (!this.accessKeyModule) {
+            res.status(401).json({ error: { type: 'authentication_error', code: 'INVALID_API_KEY', message: 'AccessKey 功能未启用' } });
+            return;
+          }
+          const result = this.accessKeyModule.keyResolver.resolve(apiKeyValue);
+          if (!result || 'error' in result) {
+            const err = result ? (result as any).error : { type: 'authentication_error', code: 'INVALID_API_KEY', message: '无效的 API Key', httpStatus: 401 };
+            this.sendAccessKeyError(res, err);
+            return;
+          }
+        } else if (this.config.apiKey) {
+          if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
             res.status(401).json({ error: { message: 'Invalid API key' } });
             return;
           }
@@ -297,42 +350,81 @@ export class ProxyServer {
       }
 
       // 其余 4 个路径：查找绑定
-      const bindings = this.dbManager.getApiPathBindings();
-      const binding = bindings.find((b: ApiPathBinding) => b.apiPath === apiPath);
-      if (!binding || !binding.routeId) {
-        res.status(404).json({ error: { message: `API path ${apiPath} is not bound to any route. Please configure it in Route Mapping settings.` } });
+      // 检查是否为 AccessKey 请求
+      const apiKeyValue = this.extractApiKey(req);
+      let accessKeyCtx: { accessKey: AccessKey; policy: Policy } | null = null;
+
+      if (apiKeyValue?.startsWith('sk_') && this.accessKeyModule) {
+        const result = this.accessKeyModule.keyResolver.resolve(apiKeyValue);
+        if (!result || 'error' in result) {
+          const err = result ? (result as any).error : { type: 'authentication_error', code: 'INVALID_API_KEY', message: '无效的 API Key', httpStatus: 401 };
+          this.sendAccessKeyError(res, err);
+          return;
+        }
+        accessKeyCtx = result;
+      } else if (this.config.apiKey) {
+        // 全局 apiKey 校验
+        if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
+          res.status(401).json({ error: { message: 'Invalid API key' } });
+          return;
+        }
+      } else if (isAuthEnabled()) {
+        // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
+        res.status(401).json({ error: { type: 'authentication_error', code: 'INVALID_API_KEY', message: 'Authentication required. Please provide a valid AccessKey.' } });
         return;
       }
 
       // 推断客户端格式
       const clientFormat = apiPathToClientFormat(apiPath)!;
 
-      // 加载绑定的路由（默认从 API 路径绑定获取）
+      // 确定路由来源
       const allRoutes = this.dbManager.getRoutes();
-      let route = allRoutes.find((r: Route) => r.id === binding.routeId);
+      let route: Route | undefined;
 
-      // 会话级路由覆盖：优先检查会话是否绑定了特定路由
-      const sessionId = this.extractSessionIdForFormat(req, clientFormat);
-      if (sessionId) {
-        const session = this.dbManager.getSession(sessionId);
-        if (session?.routeId) {
-          const boundRoute = allRoutes.find((r: Route) => r.id === session.routeId);
-          if (boundRoute) {
-            console.log(`[SESSION-ROUTE] API path ${apiPath} session ${sessionId} using bound route: ${boundRoute.name}`);
-            route = boundRoute;
-          } else {
-            console.log(`[SESSION-ROUTE] Bound route ${session.routeId} not found for session ${sessionId}, clearing binding`);
-            this.dbManager.unbindSessionRoute(sessionId).catch(console.error);
+      if (accessKeyCtx) {
+        // AccessKey 请求：从策略的 routeId 获取路由
+        if (accessKeyCtx.policy.routeId) {
+          route = allRoutes.find((r: Route) => r.id === accessKeyCtx.policy.routeId);
+        }
+        if (!route) {
+          this.sendAccessKeyError(res, { type: 'permission_error', code: 'NO_ROUTE_CONFIGURED', message: '策略未绑定路由', httpStatus: 403 });
+          return;
+        }
+      } else {
+        // 正常请求：从 API 路径绑定获取路由
+        const bindings = this.dbManager.getApiPathBindings();
+        const binding = bindings.find((b: ApiPathBinding) => b.apiPath === apiPath);
+        if (!binding || !binding.routeId) {
+          res.status(404).json({ error: { message: `API path ${apiPath} is not bound to any route. Please configure it in Route Mapping settings.` } });
+          return;
+        }
+        route = allRoutes.find((r: Route) => r.id === binding.routeId);
+      }
+
+      // 会话级路由覆盖：仅对非 AccessKey 请求生效
+      if (!accessKeyCtx) {
+        const sessionId = this.extractSessionIdForFormat(req, clientFormat);
+        if (sessionId) {
+          const session = this.dbManager.getSession(sessionId);
+          if (session?.routeId) {
+            const boundRoute = allRoutes.find((r: Route) => r.id === session.routeId);
+            if (boundRoute) {
+              console.log(`[SESSION-ROUTE] API path ${apiPath} session ${sessionId} using bound route: ${boundRoute.name}`);
+              route = boundRoute;
+            } else {
+              console.log(`[SESSION-ROUTE] Bound route ${session.routeId} not found for session ${sessionId}, clearing binding`);
+              this.dbManager.unbindSessionRoute(sessionId).catch(console.error);
+            }
           }
         }
       }
 
       if (!route) {
-        return res.status(404).json({ error: { message: `Bound route '${binding.routeId}' not found or inactive. Please check Route Mapping settings.` } });
+        return res.status(404).json({ error: { message: `Bound route not found or inactive.` } });
       }
 
       // 复用完整的代理请求处理
-      await this.handleApiPathProxyRequest(req, res, route, clientFormat, apiPath);
+      await this.handleApiPathProxyRequest(req, res, route, clientFormat, apiPath, accessKeyCtx);
     });
 
     // Dynamic proxy middleware (原有的 /claude-code, /codex 逻辑)
@@ -608,29 +700,37 @@ export class ProxyServer {
         }
       } catch (error: any) {
         console.error('Proxy error:', error);
-        await this.logToolRequest(req, {
-          statusCode: 500,
-          responseTime: Date.now() - requestStartAt,
-          targetType: this.inferTargetTypeFromPath(req.path),
-          error: error.message,
-          tags: this.buildRelayTags(hasRelayAttempt),
-        });
+        // AccessKey 错误处理：递减并发计数
+        const accessKeyCtx = (req as any)._accessKeyCtx as { accessKey: AccessKey; policy: Policy } | undefined;
+        if (accessKeyCtx && this.accessKeyModule) {
+          this.accessKeyModule.quotaChecker.onRequestEnd(accessKeyCtx.accessKey.id);
+          await this.accessKeyModule.usageTracker.recordError(accessKeyCtx.accessKey.id);
+        } else {
+          await this.logToolRequest(req, {
+            statusCode: 500,
+            responseTime: Date.now() - requestStartAt,
+            targetType: this.inferTargetTypeFromPath(req.path),
+            error: error.message,
+            tags: this.buildRelayTags(hasRelayAttempt),
+          });
+        }
         // Add error log - 包含请求详情
-        const targetType: ToolType = req.path.startsWith('/claude-code/') ? 'claude-code' : 'codex';
-        await this.dbManager.addErrorLog({
-          timestamp: Date.now(),
-          method: req.method,
-          path: req.path,
-          statusCode: 500,
-          errorMessage: error.message,
-          errorStack: error.stack,
-          requestHeaders: this.normalizeHeaders(req.headers),
-          requestBody: req.body ? JSON.stringify(req.body) : undefined,
-          // 添加请求详情
-          targetType,
-          requestModel: req.body?.model,
-          responseTime: Date.now() - requestStartAt,
-        });
+        if (!accessKeyCtx) {
+          const targetType: ToolType = req.path.startsWith('/claude-code/') ? 'claude-code' : 'codex';
+          await this.dbManager.addErrorLog({
+            timestamp: Date.now(),
+            method: req.method,
+            path: req.path,
+            statusCode: 500,
+            errorMessage: error.message,
+            errorStack: error.stack,
+            requestHeaders: this.normalizeHeaders(req.headers),
+            requestBody: req.body ? JSON.stringify(req.body) : undefined,
+            targetType,
+            requestModel: req.body?.model,
+            responseTime: Date.now() - requestStartAt,
+          });
+        }
 
         // 根据路径判断目标类型并返回适当的错误格式
         const isClaudeCode = req.path.startsWith('/claude-code/');
@@ -665,13 +765,35 @@ export class ProxyServer {
     return async (req: Request, res: Response) => {
       const requestStartAt = Date.now();
       let hasRelayAttempt = false;
+      let accessKeyCtx: { accessKey: AccessKey; policy: Policy } | null = null;
 
       try {
-        // 检查API Key验证
-        if (this.config.apiKey) {
-          const authHeader = req.headers.authorization;
-          const providedKey = authHeader?.replace('Bearer ', '');
-          if (!providedKey || providedKey !== this.config.apiKey) {
+        // 检查 API Key 验证（支持 AccessKey 和全局 apiKey）
+        const apiKeyValue = this.extractApiKey(req);
+
+        if (apiKeyValue?.startsWith('sk_') && this.accessKeyModule) {
+          // AccessKey 鉴权
+          const result = this.accessKeyModule.keyResolver.resolve(apiKeyValue);
+          if (!result || 'error' in result) {
+            const err = result ? (result as any).error : { type: 'authentication_error', code: 'INVALID_API_KEY', message: '无效的 API Key', httpStatus: 401 };
+            this.sendAccessKeyError(res, err);
+            return;
+          }
+          accessKeyCtx = result;
+
+          // 配额检查
+          const model = req.body?.model;
+          const usage = await this.accessKeyModule.usageTracker.getUsage(accessKeyCtx.accessKey.id);
+          const quotaResult = this.accessKeyModule.quotaChecker.checkQuota(accessKeyCtx.policy, usage, accessKeyCtx.accessKey.id, model);
+          if (quotaResult) {
+            this.sendAccessKeyError(res, { type: 'rate_limit_error', code: quotaResult.error, message: quotaResult.message, httpStatus: quotaResult.httpStatus });
+            return;
+          }
+          // 并发 +1
+          this.accessKeyModule.quotaChecker.onRequestStart(accessKeyCtx.accessKey.id, accessKeyCtx.policy);
+        } else if (this.config.apiKey) {
+          // 全局 apiKey 校验
+          if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
             await this.logToolRequest(req, {
               statusCode: 401,
               responseTime: Date.now() - requestStartAt,
@@ -681,9 +803,32 @@ export class ProxyServer {
             });
             return res.status(401).json({ error: 'Invalid API key' });
           }
+        } else if (isAuthEnabled()) {
+          // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
+          return res.status(401).json({ error: 'Authentication required. Please provide a valid AccessKey.' });
         }
 
-        const route = this.findRouteByTargetType(targetType);
+        // 注入 AccessKey 上下文到请求对象，供 proxyRequest 内部的 finalizeLog 使用
+        if (accessKeyCtx) {
+          (req as any)._accessKeyCtx = accessKeyCtx;
+        }
+
+        // 确定路由：AccessKey 请求从策略获取，否则从工具绑定获取
+        let route: Route | undefined;
+        if (accessKeyCtx) {
+          if (accessKeyCtx!.policy.routeId) {
+            const allRoutes = this.dbManager.getRoutes();
+            route = allRoutes.find((r: Route) => r.id === accessKeyCtx!.policy.routeId);
+          }
+          if (!route) {
+            this.accessKeyModule!.quotaChecker.onRequestEnd(accessKeyCtx.accessKey.id);
+            this.sendAccessKeyError(res, { type: 'permission_error', code: 'NO_ROUTE_CONFIGURED', message: '策略未绑定路由', httpStatus: 403 });
+            return;
+          }
+        } else {
+          route = this.findRouteByTargetType(targetType);
+        }
+
         if (!route) {
           await this.logToolRequest(req, {
             statusCode: 404,
@@ -935,28 +1080,34 @@ export class ProxyServer {
         }
       } catch (error: any) {
         console.error(`Fixed route error for ${targetType}:`, error);
-        await this.logToolRequest(req, {
-          statusCode: 500,
-          responseTime: Date.now() - requestStartAt,
-          targetType,
-          error: error.message,
-          tags: this.buildRelayTags(hasRelayAttempt),
-        });
-        // Add error log - 包含请求详情（使用函数参数 targetType）
-        await this.dbManager.addErrorLog({
-          timestamp: Date.now(),
-          method: req.method,
-          path: req.path,
-          statusCode: 500,
-          errorMessage: error.message,
-          errorStack: error.stack,
-          requestHeaders: this.normalizeHeaders(req.headers),
-          requestBody: req.body ? JSON.stringify(req.body) : undefined,
-          // 添加请求详情
-          targetType,
-          requestModel: req.body?.model,
-          responseTime: Date.now() - requestStartAt,
-        });
+        // AccessKey 错误处理：递减并发计数
+        const accessKeyCtx = (req as any)._accessKeyCtx as { accessKey: AccessKey; policy: Policy } | undefined;
+        if (accessKeyCtx && this.accessKeyModule) {
+          this.accessKeyModule.quotaChecker.onRequestEnd(accessKeyCtx.accessKey.id);
+          await this.accessKeyModule.usageTracker.recordError(accessKeyCtx.accessKey.id);
+        } else {
+          await this.logToolRequest(req, {
+            statusCode: 500,
+            responseTime: Date.now() - requestStartAt,
+            targetType,
+            error: error.message,
+            tags: this.buildRelayTags(hasRelayAttempt),
+          });
+          // Add error log - 包含请求详情（使用函数参数 targetType）
+          await this.dbManager.addErrorLog({
+            timestamp: Date.now(),
+            method: req.method,
+            path: req.path,
+            statusCode: 500,
+            errorMessage: error.message,
+            errorStack: error.stack,
+            requestHeaders: this.normalizeHeaders(req.headers),
+            requestBody: req.body ? JSON.stringify(req.body) : undefined,
+            targetType,
+            requestModel: req.body?.model,
+            responseTime: Date.now() - requestStartAt,
+          });
+        }
         if (this.isResponseCommitted(res)) {
           return;
         }
@@ -3495,6 +3646,58 @@ export class ProxyServer {
 
       logged = true;
 
+      // ========== AccessKey 独立日志和统计 ==========
+      const accessKeyCtx = (req as any)._accessKeyCtx as { accessKey: AccessKey; policy: Policy } | undefined;
+      if (accessKeyCtx && this.accessKeyModule) {
+        const { accessKey } = accessKeyCtx;
+        try {
+          // 写入 Key 独立日志
+          await this.accessKeyModule.keyLogger.addLog(accessKey.id, accessKey.name, {
+            timestamp: Date.now(),
+            method: req.method,
+            path: req.originalUrl || req.path,
+            headers: this.normalizeHeaders(req.headers),
+            body: req.body,
+            statusCode,
+            responseTime: Date.now() - startTime,
+            targetProvider: service.name,
+            usage: usageForLog,
+            error,
+            contentType: rule.contentType,
+            ruleId: rule.id,
+            targetType,
+            targetServiceId: service.id,
+            targetServiceName: service.name,
+            targetModel: rule.targetModel || req.body?.model,
+            vendorId: service.vendorId,
+            vendorName: vendor?.name,
+            requestModel: req.body?.model,
+            tags: this.buildRelayTags(relayedForLog, useOriginalConfig),
+            responseHeaders: responseHeadersForLog,
+            responseBody: responseBodyForLog,
+            streamChunks: streamChunksForLog,
+            upstreamRequest: upstreamRequestForLog,
+            downstreamResponseBody: downstreamResponseBodyForLog ?? responseBodyForLog,
+          });
+
+          // Token 回写
+          if (usageForLog && statusCode < 400) {
+            await this.accessKeyModule.usageTracker.recordTokenUsage(accessKey.id, usageForLog);
+          } else if (statusCode < 400) {
+            await this.accessKeyModule.usageTracker.recordRequest(accessKey.id);
+          }
+
+          // 错误记录
+          if (statusCode >= 400) {
+            await this.accessKeyModule.usageTracker.recordError(accessKey.id);
+          }
+        } finally {
+          // 并发 -1（无论成功失败）
+          this.accessKeyModule.quotaChecker.onRequestEnd(accessKey.id);
+        }
+        return; // ⛔ 跳过现有日志系统和统计系统
+      }
+
       // 供应商信息已在函数顶部获取
       const vendors = this.dbManager.getVendors();
       const vendorForLog = vendors.find(v => v.id === service.vendorId);
@@ -4314,29 +4517,52 @@ export class ProxyServer {
     res: Response,
     route: Route,
     clientFormat: Format,
-    apiPath: ApiPath
+    apiPath: ApiPath,
+    accessKeyCtx?: { accessKey: AccessKey; policy: Policy } | null
   ) {
     const requestStartAt = Date.now();
 
-    // 鉴权
-    if (this.config.apiKey) {
-      const authHeader = req.headers.authorization;
-      const providedKey = authHeader?.replace('Bearer ', '');
-      if (!providedKey || providedKey !== this.config.apiKey) {
-        await this.logToolRequest(req, {
-          statusCode: 401,
-          responseTime: Date.now() - requestStartAt,
-          error: 'Invalid API key',
-          tags: this.buildRelayTags(false),
-        });
-        // 根据客户端格式返回错误
+    // AccessKey 请求已在上层完成鉴权；非 AccessKey 请求在此鉴权
+    if (!accessKeyCtx) {
+      if (this.config.apiKey) {
+        const providedKey = this.extractApiKey(req);
+        if (!providedKey || providedKey !== this.config.apiKey) {
+          await this.logToolRequest(req, {
+            statusCode: 401,
+            responseTime: Date.now() - requestStartAt,
+            error: 'Invalid API key',
+            tags: this.buildRelayTags(false),
+          });
+          // 根据客户端格式返回错误
+          if (clientFormat === 'claude') {
+            res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
+          } else {
+            res.status(401).json({ error: { message: 'Invalid API key' } });
+          }
+          return;
+        }
+      } else if (isAuthEnabled()) {
+        // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
         if (clientFormat === 'claude') {
-          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
+          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Authentication required. Please provide a valid AccessKey.' } });
         } else {
-          res.status(401).json({ error: { message: 'Invalid API key' } });
+          res.status(401).json({ error: { message: 'Authentication required. Please provide a valid AccessKey.' } });
         }
         return;
       }
+    }
+    if (accessKeyCtx) {
+      const model = req.body?.model;
+      const usage = await this.accessKeyModule!.usageTracker.getUsage(accessKeyCtx.accessKey.id);
+      const quotaResult = this.accessKeyModule!.quotaChecker.checkQuota(accessKeyCtx.policy, usage, accessKeyCtx.accessKey.id, model);
+      if (quotaResult) {
+        this.sendAccessKeyError(res, { type: 'rate_limit_error', code: quotaResult.error, message: quotaResult.message, httpStatus: quotaResult.httpStatus });
+        return;
+      }
+      // 并发 +1
+      this.accessKeyModule!.quotaChecker.onRequestStart(accessKeyCtx.accessKey.id, accessKeyCtx.policy);
+      // 注入上下文到 req 对象，供 proxyRequestForApiPath 内部的 finalizeLog 使用
+      (req as any)._accessKeyCtx = accessKeyCtx;
     }
 
     const enableFailover = this.config?.enableFailover !== false;
@@ -4495,6 +4721,42 @@ export class ProxyServer {
     const finalizeLog = async (statusCode: number, error?: string) => {
       if (logged) return;
       logged = true;
+
+      // AccessKey 独立日志处理
+      const accessKeyCtx = (req as any)._accessKeyCtx as { accessKey: AccessKey; policy: Policy } | undefined;
+      if (accessKeyCtx && this.accessKeyModule) {
+        try {
+          await this.accessKeyModule.keyLogger.addLog(accessKeyCtx.accessKey.id, accessKeyCtx.accessKey.name, {
+            timestamp: Date.now(),
+            method: req.method,
+            path: req.originalUrl || req.path,
+            headers: this.normalizeHeaders(req.headers),
+            body: req.body,
+            statusCode,
+            responseTime: Date.now() - startTime,
+            usage: usageForLog,
+            error,
+            contentType: rule.contentType,
+            ruleId: rule.id,
+            targetServiceId: service.id,
+            targetServiceName: service.name,
+            targetModel: rule.targetModel || req.body?.model,
+            vendorId: service.vendorId,
+            vendorName: vendor?.name,
+            requestModel: req.body?.model,
+            tags: this.buildRelayTags(relayedForLog),
+          });
+          if (usageForLog && statusCode < 400) {
+            await this.accessKeyModule.usageTracker.recordTokenUsage(accessKeyCtx.accessKey.id, usageForLog);
+          }
+          if (statusCode >= 400) {
+            await this.accessKeyModule.usageTracker.recordError(accessKeyCtx.accessKey.id);
+          }
+        } finally {
+          this.accessKeyModule.quotaChecker.onRequestEnd(accessKeyCtx.accessKey.id);
+        }
+        return;
+      }
 
       await this.logToolRequest(req, {
         statusCode,

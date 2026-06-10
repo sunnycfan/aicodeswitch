@@ -12,6 +12,8 @@ import UsagePage from './pages/UsagePage';
 import StatisticsPage from './pages/StatisticsPage';
 import SkillsPage from './pages/SkillsPage';
 import MCPPage from './pages/MCPPage';
+import AccessKeysPage from './pages/AccessKeysPage';
+import AccessKeyDetailPage from './pages/AccessKeyDetailPage';
 import { ToastContainer } from './components/Toast';
 import { ConfirmProvider } from './components/Confirm';
 import ToolsInstallModal from './components/ToolsInstallModal';
@@ -409,6 +411,13 @@ function AppContent() {
               <NavLink to="/mcp"><span className="nav-icon">🧰</span><span className="nav-text">MCP 管理</span></NavLink>
             </NavItemWithTooltip>
           </li>
+          <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
+          <li>
+            <NavItemWithTooltip text="接入密钥" showTooltip={sidebarCollapsed}>
+              <NavLink to="/access-keys"><span className="nav-icon">🔑</span><span className="nav-text">接入密钥</span></NavLink>
+            </NavItemWithTooltip>
+          </li>
+          <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
           <li>
             <NavItemWithTooltip text="数据统计" showTooltip={sidebarCollapsed}>
               <NavLink to="/statistics"><span className="nav-icon">📊</span><span className="nav-text">数据统计</span></NavLink>
@@ -482,6 +491,8 @@ function AppContent() {
             <Route path="/vendors" element={<VendorsPage />} />
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/mcp" element={<MCPPage />} />
+            <Route path="/access-keys" element={<AccessKeysPage />} />
+            <Route path="/access-keys/:id" element={<AccessKeyDetailPage />} />
             <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/write-config" element={<WriteConfigPage />} />

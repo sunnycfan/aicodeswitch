@@ -215,6 +215,26 @@ aicos version            # Show current version information
 - Services are no longer stored in a separate file, they are embedded within their parent vendor
 - This structure ensures data consistency and simplifies cascade operations
 
+#### 5.5. AccessKey Module - `server/access-keys/`
+- **Purpose**: Multi-client API Key sharing without user accounts
+- **Key Files**:
+  - `index.ts` - Module entry point, initialization and persistence
+  - `manager.ts` - AccessKey CRUD, hash-based O(1) lookup
+  - `policy-manager.ts` - Policy CRUD with template support
+  - `quota-checker.ts` - Token/request/RPM/concurrent quota checking
+  - `usage-tracker.ts` - Per-key usage persistence with auto-flush
+  - `key-logger.ts` - Per-key isolated log storage (sharded by date)
+  - `key-resolver.ts` - sk_ Key authentication and resolution
+- **Data Storage**:
+  - `access-keys.json` - AccessKey records (with apiKeyHash for fast lookup)
+  - `policies.json` - Policy configurations
+  - `key-usage/{keyId}.json` - Per-key usage statistics
+  - `key-logs/{keyId}/` - Per-key isolated log directories
+- **Request Flow**: sk_ key → resolve AccessKey → get Policy → quota check → route from policy → proxy → independent logging
+- **API Key Prefixes**: `sk_` = AccessKey, `skr_` = routing key (existing)
+- **Authentication Headers**: Supports `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`
+- **Key Design**: AccessKey requests completely bypass existing log/statistics systems
+
 #### 6. UI (React) - `ui/`
 - Main app: `App.tsx` - Navigation and layout with collapsible sidebar
 - Components:
@@ -656,6 +676,14 @@ aicodeswitch/
 │       ├── database-factory.ts  # Database factory
 │       ├── fs-database.ts       # JSON file-based database manager
 │       ├── proxy-server.ts
+│       ├── access-keys/           # AccessKey sharing module
+│       │   ├── index.ts           # Module entry point
+│       │   ├── manager.ts         # AccessKey CRUD
+│       │   ├── policy-manager.ts  # Policy CRUD
+│       │   ├── quota-checker.ts   # Quota checking
+│       │   ├── usage-tracker.ts   # Per-key usage tracking
+│       │   ├── key-logger.ts      # Per-key isolated logging
+│       │   └── key-resolver.ts    # sk_ Key resolution
 │       └── transformers/
 ├── tauri/                   # Tauri desktop application
 │   ├── src/
@@ -870,6 +898,14 @@ npm 发布成功后，自动触发 Tauri 应用构建：
 - `.github/workflows/build-tauri.yaml` - Tauri 构建和发布
 
 ## 最近变更
+
+- 2026-06-10: 新增 AccessKey 接入密钥共享功能
+  - 通过 `sk_` 前缀 API Key 实现多端接入共享，无需用户体系
+  - 策略（Policy）管理：路由绑定 + 多维配额限制 + 模型过滤
+  - 每个 Key 独立的日志和统计空间，与现有系统完全隔离
+  - 支持三种认证 Header：`Authorization: Bearer`、`x-api-key`、`x-goog-api-key`
+  - 管理面板 JWT 认证从 `Authorization` 迁移到 `Access-Token` Header
+  - 当 AUTH 开启时，带有 `Authorization` Header 的请求跳过管理面板认证，由代理引擎处理 AccessKey 鉴权
 
 - 2026-03-11: 修复 Claude Code → Gemini thinking 参数冲突
   - 当存在 `budget_tokens` 时，Gemini `thinkingConfig` 仅写入 `thinkingBudget`，不再同时写入 `thinkingLevel`

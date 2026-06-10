@@ -7,6 +7,9 @@ import { createHash } from 'crypto';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { DatabaseFactory } from './database-factory';
 import { ProxyServer } from './proxy-server';
+import { AccessKeyModule } from './access-keys/index';
+import { AccessKeyManager } from './access-keys/manager';
+import { PolicyManager } from './access-keys/policy-manager';
 import type { FileSystemDatabaseManager } from './fs-database';
 import type {
   AppConfig,
@@ -2683,6 +2686,480 @@ ${instruction}
     res.json(result);
   }));
 
+  // ============================================================
+  // AccessKey 接入密钥 API
+  // ============================================================
+
+  // 获取密钥列表（支持分页和筛选）
+  app.get('/api/access-keys', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.json({ data: [], total: 0, page: 1, pageSize: 20 });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 20));
+    const status = req.query.status as 'active' | 'disabled' | undefined;
+    const policyId = req.query.policyId as string | undefined;
+    const search = req.query.search as string | undefined;
+
+    let keys = accessKeyModule.keyManager.list({ status, policyId, search });
+
+    // 附加策略名称和用量信息
+    const result = keys.map(key => {
+      const policy = key.policyId ? accessKeyModule.policyManager.get(key.policyId) : null;
+      return {
+        ...key,
+        apiKey: AccessKeyManager.maskApiKey(key.apiKey),
+        policyName: policy?.name,
+      };
+    });
+
+    const total = result.length;
+    const start = (page - 1) * pageSize;
+    const paged = result.slice(start, start + pageSize);
+
+    res.json({ data: paged, total, page, pageSize });
+  }));
+
+  // 创建密钥
+  app.post('/api/access-keys', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const { name, remark, policyId } = req.body;
+    if (!name || !name.trim()) {
+      res.status(400).json({ error: '名称不能为空' });
+      return;
+    }
+
+    const result = accessKeyModule.keyManager.create({ name: name.trim(), remark, policyId });
+    await accessKeyModule.save();
+
+    res.json({
+      key: { ...result.key, apiKey: AccessKeyManager.maskApiKey(result.key.apiKey) },
+      apiKey: result.apiKey,
+    });
+  }));
+
+  // 获取密钥详情
+  app.get('/api/access-keys/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const key = accessKeyModule.keyManager.get(req.params.id);
+    if (!key) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+
+    const policy = key.policyId ? accessKeyModule.policyManager.get(key.policyId) : null;
+    res.json({ ...key, apiKey: AccessKeyManager.maskApiKey(key.apiKey), policyName: policy?.name });
+  }));
+
+  // 编辑密钥
+  app.put('/api/access-keys/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const result = accessKeyModule.keyManager.update(req.params.id, req.body);
+    if (!result) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+    await accessKeyModule.save();
+    res.json(true);
+  }));
+
+  // 删除密钥
+  app.delete('/api/access-keys/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const result = accessKeyModule.keyManager.delete(req.params.id);
+    await accessKeyModule.save();
+    res.json(result);
+  }));
+
+  // 重新生成 API Key
+  app.post('/api/access-keys/:id/regenerate', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const result = accessKeyModule.keyManager.regenerate(req.params.id);
+    if (!result) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+    await accessKeyModule.save();
+    res.json({ apiKey: result.apiKey });
+  }));
+
+  // 批量更新状态
+  app.put('/api/access-keys/batch/status', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const { keyIds, status } = req.body;
+    if (!Array.isArray(keyIds) || !status) {
+      res.status(400).json({ error: '参数错误' });
+      return;
+    }
+    const count = accessKeyModule.keyManager.batchUpdateStatus(keyIds, status);
+    await accessKeyModule.save();
+    res.json({ count });
+  }));
+
+  // 批量绑定策略
+  app.put('/api/access-keys/batch/policy', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const { keyIds, policyId } = req.body;
+    if (!Array.isArray(keyIds) || !policyId) {
+      res.status(400).json({ error: '参数错误' });
+      return;
+    }
+    const count = accessKeyModule.keyManager.batchBindPolicy(keyIds, policyId);
+    await accessKeyModule.save();
+    res.json({ count });
+  }));
+
+  // 批量删除
+  app.delete('/api/access-keys/batch', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const { keyIds } = req.body;
+    if (!Array.isArray(keyIds)) {
+      res.status(400).json({ error: '参数错误' });
+      return;
+    }
+    const count = accessKeyModule.keyManager.batchDelete(keyIds);
+    await accessKeyModule.save();
+    res.json({ count });
+  }));
+
+  // Key 用量统计
+  app.get('/api/access-keys/:id/usage', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const usage = await accessKeyModule.usageTracker.getUsage(req.params.id);
+    res.json(usage);
+  }));
+
+  // Key 用量趋势
+  app.get('/api/access-keys/:id/usage/trend', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const days = parseInt(req.query.days as string) || 30;
+    const trend = await accessKeyModule.usageTracker.getTrend(req.params.id, days);
+    res.json(trend);
+  }));
+
+  // Key 日志
+  app.get('/api/access-keys/:id/logs', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 50));
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    const result = await accessKeyModule.keyLogger.getLogs(req.params.id, { page, pageSize, startDate, endDate });
+    res.json(result);
+  }));
+
+  // Key 接入指引
+  app.get('/api/access-keys/:id/guide', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const key = accessKeyModule.keyManager.get(req.params.id);
+    if (!key) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+
+    const host = (req.query.host as string) || req.hostname || 'localhost';
+    const port = (req.query.port as string) || (req.socket.localAddress ? String(req.socket.localPort) : '4567');
+    const baseUrl = `http://${host}:${port}`;
+    const maskedKey = AccessKeyManager.maskApiKey(key.apiKey);
+
+    res.json({
+      claudeCode: {
+        description: 'Claude Code 接入',
+        envVars: {
+          ANTHROPIC_BASE_URL: `${baseUrl}/claude-code`,
+          ANTHROPIC_AUTH_TOKEN: maskedKey,
+        },
+      },
+      codex: {
+        description: 'Codex 接入',
+        envVars: {
+          OPENAI_API_KEY: maskedKey,
+          OPENAI_BASE_URL: `${baseUrl}/codex`,
+        },
+      },
+      openai: {
+        description: 'OpenAI 兼容工具 (Cursor / Continue 等)',
+        envVars: {
+          OPENAI_API_KEY: maskedKey,
+          OPENAI_BASE_URL: `${baseUrl}/v1`,
+        },
+      },
+    });
+  }));
+
+  // ============================================================
+  // Policy 策略 API
+  // ============================================================
+
+  // 策略列表
+  app.get('/api/policies', asyncHandler(async (_req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.json([]);
+      return;
+    }
+
+    const policies = accessKeyModule.policyManager.list();
+    const result = policies.map(p => ({
+      ...p,
+      keyCount: accessKeyModule.keyManager.countByPolicyId(p.id),
+    }));
+    res.json(result);
+  }));
+
+  // 创建策略
+  app.post('/api/policies', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const policy = accessKeyModule.policyManager.create(req.body);
+    await accessKeyModule.save();
+    res.json(policy);
+  }));
+
+  // 策略详情
+  app.get('/api/policies/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const policy = accessKeyModule.policyManager.get(req.params.id);
+    if (!policy) {
+      res.status(404).json({ error: '策略不存在' });
+      return;
+    }
+    res.json(policy);
+  }));
+
+  // 编辑策略
+  app.put('/api/policies/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const result = accessKeyModule.policyManager.update(req.params.id, req.body);
+    if (!result) {
+      res.status(404).json({ error: '策略不存在' });
+      return;
+    }
+    await accessKeyModule.save();
+    res.json(true);
+  }));
+
+  // 删除策略
+  app.delete('/api/policies/:id', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const keyCount = accessKeyModule.keyManager.countByPolicyId(req.params.id);
+    if (keyCount > 0) {
+      res.status(400).json({ error: `有 ${keyCount} 个密钥正在使用此策略，请先解除绑定` });
+      return;
+    }
+
+    const result = accessKeyModule.policyManager.delete(req.params.id);
+    await accessKeyModule.save();
+    res.json(result);
+  }));
+
+  // 复制策略
+  app.post('/api/policies/:id/duplicate', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(500).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const result = accessKeyModule.policyManager.duplicate(req.params.id);
+    if (!result) {
+      res.status(404).json({ error: '策略不存在' });
+      return;
+    }
+    await accessKeyModule.save();
+    res.json(result);
+  }));
+
+  // 使用策略的密钥列表
+  app.get('/api/policies/:id/keys', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.json([]);
+      return;
+    }
+
+    const keys = accessKeyModule.keyManager.listByPolicyId(req.params.id);
+    res.json(keys.map(k => ({ ...k, apiKey: AccessKeyManager.maskApiKey(k.apiKey) })));
+  }));
+
+  // 策略模板
+  app.get('/api/policies/templates', asyncHandler(async (_req, res) => {
+    res.json(PolicyManager.getTemplates());
+  }));
+
+  // ============================================================
+  // AccessKey 全局统计 API
+  // ============================================================
+
+  // Key 用量排行
+  app.get('/api/statistics/access-keys', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.json([]);
+      return;
+    }
+
+    const keys = accessKeyModule.keyManager.list();
+    const result = await Promise.all(keys.map(async k => {
+      const usage = await accessKeyModule.usageTracker.getUsage(k.id);
+      return {
+        keyId: k.id,
+        keyName: k.name,
+        totalTokens: usage.lifetime.totalTokens,
+        totalRequests: usage.lifetime.totalRequests,
+        lastActiveAt: k.lastActiveAt,
+      };
+    }));
+
+    // 排序
+    const sortBy = (req.query.sortBy as string) || 'totalTokens';
+    const order = (req.query.order as string) || 'desc';
+    result.sort((a, b) => {
+      const va = (a as any)[sortBy] || 0;
+      const vb = (b as any)[sortBy] || 0;
+      return order === 'desc' ? vb - va : va - vb;
+    });
+
+    const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+    res.json(result.slice(0, limit));
+  }));
+
+  // 配额告警
+  app.get('/api/statistics/quota-alerts', asyncHandler(async (_req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.json([]);
+      return;
+    }
+
+    const keys = accessKeyModule.keyManager.list({ status: 'active' });
+    const alerts: any[] = [];
+
+    for (const key of keys) {
+      if (!key.policyId) continue;
+      const policy = accessKeyModule.policyManager.get(key.policyId);
+      if (!policy) continue;
+
+      const usage = await accessKeyModule.usageTracker.getUsage(key.id);
+
+      // 检查各维度
+      const checks: Array<{ dimension: string; usage: number; limit: number }> = [];
+      if (policy.dailyTokenLimit) {
+        checks.push({ dimension: 'dailyTokenLimit', usage: usage.periods.daily.tokens, limit: policy.dailyTokenLimit * 1000 });
+      }
+      if (policy.monthlyTokenLimit) {
+        checks.push({ dimension: 'monthlyTokenLimit', usage: usage.periods.monthly.tokens, limit: policy.monthlyTokenLimit * 1000 });
+      }
+      if (policy.dailyRequestLimit) {
+        checks.push({ dimension: 'dailyRequestLimit', usage: usage.periods.daily.requests, limit: policy.dailyRequestLimit });
+      }
+      if (policy.monthlyRequestLimit) {
+        checks.push({ dimension: 'monthlyRequestLimit', usage: usage.periods.monthly.requests, limit: policy.monthlyRequestLimit });
+      }
+
+      for (const check of checks) {
+        if (check.limit <= 0) continue;
+        const pct = Math.round((check.usage / check.limit) * 100);
+        if (pct >= 80) {
+          alerts.push({
+            keyId: key.id,
+            keyName: key.name,
+            dimension: check.dimension,
+            usage: check.usage,
+            limit: check.limit,
+            percentage: pct,
+            level: pct >= 100 ? 'exceeded' : pct >= 95 ? 'critical' : 'warning',
+          });
+        }
+      }
+    }
+
+    res.json(alerts);
+  }));
+
   // 写入MCP配置到Claude Code或Codex的全局配置文件
   const writeMCPConfig = async (targetType: TargetType): Promise<boolean> => {
     try {
@@ -2946,6 +3423,16 @@ const start = async () => {
   } catch { /* ignore */ }
 
   const proxyServer = new ProxyServer(dbManager, app);
+
+  // Initialize AccessKey module
+  const accessKeyModule = new AccessKeyModule(dataDir);
+  try {
+    await accessKeyModule.initialize();
+    proxyServer.setAccessKeyModule(accessKeyModule);
+  } catch (error) {
+    console.error('[Server] AccessKey module initialization failed:', error);
+  }
+
   // Initialize proxy server and register proxy routes last
   proxyServer.initialize();
 
@@ -3037,6 +3524,13 @@ const start = async () => {
         console.log(`[Shutdown ...] Codex config ${codexRestored ? 'restored' : 'was not modified'}`);
       } catch (error) {
         console.error('[Shutdown ...] Failed to restore Codex config:', error);
+      }
+
+      // Shutdown AccessKey module
+      try {
+        await accessKeyModule.shutdown();
+      } catch (error) {
+        console.error('[Shutdown ...] AccessKey module shutdown failed:', error);
       }
 
       dbManager.close();
