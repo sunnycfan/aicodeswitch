@@ -7,6 +7,11 @@
   - 仅更新统计，不写入全局日志（AccessKey 日志仍独立存储）
   - 覆盖 `/claude-code/`、`/codex/` 和 API 路径（`/v1/*`）所有代理入口
 
+### 修复
+- 修复 AUTH 启用后，动态代理中间件未执行认证检查的漏洞（`proxy-server.ts` 的 Dynamic proxy middleware 分支）
+  - 该中间件先于 `createFixedRouteHandler` 注册，会先拦截 `/claude-code/` 和 `/codex/` 路径的请求
+  - 现已补充完整的 AccessKey 鉴权 + 配额检查 + 策略路由解析逻辑
+
 ### 变更
 - 移除全局 `config.apiKey` 认证机制，简化为 AUTH 驱动的 AccessKey-only 认证
 - AUTH 未配置时：不展示"接入密钥"菜单，所有代理请求无需认证直接通过

@@ -427,12 +427,49 @@ export class ProxyServer {
         return next();
       }
 
+      // AUTH 鉴权检查
+      const apiKeyValue = this.extractApiKey(req);
+      if (apiKeyValue?.startsWith('sk_') && this.accessKeyModule) {
+        const result = this.accessKeyModule.keyResolver.resolve(apiKeyValue);
+        if (!result || 'error' in result) {
+          const err = result ? (result as any).error : { type: 'authentication_error', code: 'INVALID_API_KEY', message: '无效的 API Key', httpStatus: 401 };
+          this.sendAccessKeyError(res, err);
+          return;
+        }
+        // 配额检查
+        const usage = await this.accessKeyModule.usageTracker.getUsage(result.accessKey.id);
+        const quotaResult = this.accessKeyModule.quotaChecker.checkQuota(result.policy, usage, result.accessKey.id, req.body?.model);
+        if (quotaResult) {
+          this.sendAccessKeyError(res, { type: 'rate_limit_error', code: quotaResult.error, message: quotaResult.message, httpStatus: quotaResult.httpStatus });
+          return;
+        }
+        this.accessKeyModule.quotaChecker.onRequestStart(result.accessKey.id, result.policy);
+        (req as any)._accessKeyCtx = result;
+      } else if (isAuthEnabled()) {
+        // AUTH 已启用 → 仅允许 AccessKey 认证
+        return res.status(401).json({ error: 'Authentication required. Please provide a valid AccessKey.' });
+      }
+
       const requestStartAt = Date.now();
       let hasRelayAttempt = false;
 
       try {
         const pathTargetType = this.inferTargetTypeFromPath(req.path);
-        const route = this.findMatchingRoute(req);
+
+        // AccessKey 请求：从策略的 routeId 获取路由；否则从工具绑定获取
+        const accessKeyCtx = (req as any)._accessKeyCtx as { accessKey: AccessKey; policy: Policy } | undefined;
+        let route: Route | undefined;
+        if (accessKeyCtx?.policy.routeId) {
+          route = this.dbManager.getRoutes().find((r: Route) => r.id === accessKeyCtx.policy.routeId);
+          if (!route) {
+            this.accessKeyModule!.quotaChecker.onRequestEnd(accessKeyCtx.accessKey.id);
+            this.sendAccessKeyError(res, { type: 'permission_error', code: 'NO_ROUTE_CONFIGURED', message: '策略未绑定路由', httpStatus: 403 });
+            return;
+          }
+        } else {
+          route = this.findMatchingRoute(req);
+        }
+
         if (!route) {
           // 没有找到激活的路由，尝试使用原始配置
           const fallbackResult = await this.handleFallbackToOriginalConfig(req, res, requestStartAt);

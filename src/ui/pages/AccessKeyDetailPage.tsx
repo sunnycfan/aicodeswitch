@@ -1,14 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import type { AccessKey, Policy, KeyUsage, KeyUsageDailyRecord, AccessKeyRequestLog } from '../../types';
+import type { AccessKey, Policy, Route, KeyUsage, KeyUsageDailyRecord, AccessKeyRequestLog } from '../../types';
 import { toast } from '../components/Toast';
 import { useConfirm } from '../components/Confirm';
 import { Pagination } from '../components/Pagination';
 import LogDetailModal from '../components/LogDetailModal';
 import AccessKeyGuideModal from '../components/AccessKeyGuideModal';
 
-type DetailTab = 'info' | 'stats' | 'logs';
+type DetailTab = 'info' | 'policy' | 'stats' | 'logs';
 
 export default function AccessKeyDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -18,6 +18,7 @@ export default function AccessKeyDetailPage() {
   // 基础数据
   const [key, setKey] = useState<(AccessKey & { policyName?: string }) | null>(null);
   const [policies, setPolicies] = useState<Policy[]>([]);
+  const [routes, setRoutes] = useState<Route[]>([]);
   const [loading, setLoading] = useState(true);
 
   // Tab 状态
@@ -55,9 +56,10 @@ export default function AccessKeyDetailPage() {
   const loadKeyData = useCallback(async () => {
     if (!id) return;
     try {
-      const [keyData, policiesData] = await Promise.all([
+      const [keyData, policiesData, routesData] = await Promise.all([
         api.getAccessKey(id).catch(() => null),
         api.getPolicies().catch(() => []),
+        api.getRoutes().catch(() => []),
       ]);
       if (!keyData) {
         toast.error('密钥不存在');
@@ -66,6 +68,7 @@ export default function AccessKeyDetailPage() {
       }
       setKey(keyData);
       setPolicies(policiesData);
+      setRoutes(routesData);
       setEditName(keyData.name);
       setEditRemark(keyData.remark || '');
       setEditPolicyId(keyData.policyId || '');
@@ -261,6 +264,7 @@ export default function AccessKeyDetailPage() {
 
   const tabs: { key: DetailTab; label: string }[] = [
     { key: 'info', label: '基本信息' },
+    { key: 'policy', label: '策略' },
     { key: 'stats', label: '统计' },
     { key: 'logs', label: '日志' },
   ];
@@ -346,6 +350,111 @@ export default function AccessKeyDetailPage() {
           </div>
         </div>
       )}
+
+      {/* ==================== 策略 Tab ==================== */}
+      {activeTab === 'policy' && (() => {
+        const policy = policies.find(p => p.id === key.policyId);
+        const routeName = policy?.routeId ? routes.find(r => r.id === policy.routeId)?.name : undefined;
+        const formatQuota = (p: Policy) => {
+          const parts: string[] = [];
+          if (p.dailyTokenLimit) parts.push(`日 ${p.dailyTokenLimit}k Token`);
+          if (p.weeklyTokenLimit) parts.push(`周 ${p.weeklyTokenLimit}k Token`);
+          if (p.monthlyTokenLimit) parts.push(`月 ${p.monthlyTokenLimit}k Token`);
+          if (p.customTokenLimit && p.customTokenResetHours) parts.push(`${p.customTokenResetHours}h ${p.customTokenLimit}k Token`);
+          if (p.dailyRequestLimit) parts.push(`日 ${p.dailyRequestLimit} 次请求`);
+          if (p.weeklyRequestLimit) parts.push(`周 ${p.weeklyRequestLimit} 次请求`);
+          if (p.monthlyRequestLimit) parts.push(`月 ${p.monthlyRequestLimit} 次请求`);
+          if (p.customRequestLimit && p.customRequestResetHours) parts.push(`${p.customRequestResetHours}h ${p.customRequestLimit} 次请求`);
+          if (p.rpmLimit) parts.push(`RPM ${p.rpmLimit}`);
+          if (p.concurrentLimit) parts.push(`并发 ${p.concurrentLimit}`);
+          return parts.length > 0 ? parts : null;
+        };
+        const modelList = policy?.allowedModels?.length ? policy.allowedModels
+          : policy?.blockedModels?.length ? policy.blockedModels : null;
+        const modelMode = policy?.allowedModels?.length ? 'allow'
+          : policy?.blockedModels?.length ? 'block' : 'none';
+
+        if (!policy) {
+          return (
+            <div className="card" style={{ textAlign: 'center', padding: '60px 20px' }}>
+              <div style={{ fontSize: '36px', marginBottom: '12px' }}>📋</div>
+              <div style={{ fontSize: '16px', fontWeight: 500, marginBottom: '8px' }}>未绑定策略</div>
+              <div style={{ color: 'var(--text-tertiary)', fontSize: '13px' }}>
+                可在「编辑」弹窗中为此密钥绑定策略，以启用配额限制和模型过滤
+              </div>
+            </div>
+          );
+        }
+
+        const quotas = formatQuota(policy);
+        return (
+          <div className="card">
+            {/* 策略头部 */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <div>
+                <h3 style={{ margin: '0 0 4px', fontSize: '18px' }}>📋 {policy.name}</h3>
+                {policy.description && <div style={{ color: 'var(--text-tertiary)', fontSize: '13px' }}>{policy.description}</div>}
+              </div>
+              <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>只读 · 如需修改请前往策略管理</span>
+            </div>
+
+            {/* 路由绑定 */}
+            <div style={{ display: 'grid', gridTemplateColumns: '140px 1fr', gap: '12px 20px', alignItems: 'center', marginBottom: '20px', paddingBottom: '20px', borderBottom: '1px solid var(--border-primary)' }}>
+              <div style={{ color: 'var(--text-tertiary)', fontSize: '14px' }}>绑定路由</div>
+              <div style={{ fontSize: '14px' }}>
+                {routeName ? (
+                  <span>🔗 {routeName}</span>
+                ) : (
+                  <span style={{ color: 'var(--text-tertiary)' }}>未绑定</span>
+                )}
+              </div>
+            </div>
+
+            {/* 配额限制 */}
+            <div style={{ marginBottom: '20px', paddingBottom: '20px', borderBottom: '1px solid var(--border-primary)' }}>
+              <h4 style={{ margin: '0 0 12px', fontSize: '15px' }}>📊 配额限制</h4>
+              {quotas ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {quotas.map((q, i) => (
+                    <span key={i} style={{
+                      display: 'inline-block', padding: '6px 12px', borderRadius: '6px',
+                      background: 'var(--bg-secondary)', fontSize: '13px',
+                      border: '1px solid var(--border-primary)',
+                    }}>{q}</span>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ color: 'var(--text-tertiary)', fontSize: '14px' }}>无限制</div>
+              )}
+            </div>
+
+            {/* 模型过滤 */}
+            <div>
+              <h4 style={{ margin: '0 0 12px', fontSize: '15px' }}>🏷️ 模型过滤</h4>
+              {modelMode === 'none' ? (
+                <div style={{ color: 'var(--text-tertiary)', fontSize: '14px' }}>不限制，允许所有模型</div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: '13px', marginBottom: '10px', color: 'var(--text-secondary)' }}>
+                    {modelMode === 'allow' ? '✅ 白名单模式 — 仅允许以下模型' : '🚫 黑名单模式 — 禁止以下模型'}
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                    {modelList!.map((m, i) => (
+                      <span key={i} style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '6px',
+                        padding: '5px 12px', background: 'var(--bg-secondary)',
+                        borderRadius: '16px', fontSize: '13px', border: '1px solid var(--border-primary)',
+                      }}>
+                        {m}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ==================== 统计 Tab ==================== */}
       {activeTab === 'stats' && (
