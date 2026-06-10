@@ -415,8 +415,8 @@ function AppContent() {
             <>
               <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
               <li>
-                <NavItemWithTooltip text="接入密钥" showTooltip={sidebarCollapsed}>
-                  <NavLink to="/access-keys"><span className="nav-icon">🔑</span><span className="nav-text">接入密钥</span></NavLink>
+                <NavItemWithTooltip text="API Key" showTooltip={sidebarCollapsed}>
+                  <NavLink to="/access-keys"><span className="nav-icon">🔑</span><span className="nav-text">API Key</span></NavLink>
                 </NavItemWithTooltip>
               </li>
             </>

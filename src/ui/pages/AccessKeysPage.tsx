@@ -299,7 +299,7 @@ export default function AccessKeysPage() {
     <div className="page-container">
       {/* 头部 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-        <h2 style={{ margin: 0 }}>接入密钥</h2>
+        <h2 style={{ margin: 0 }}>API Key</h2>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <button className="btn btn-primary" onClick={() => { setShowCreateModal(true); loadPolicies(); }} style={{ height: '45px' }}>+ 创建密钥</button>
           <button

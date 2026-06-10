@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-21: 代理响应 model 字段回写
+
+### 新增
+- 代理层统一将响应中的 `model` 字段回写为客户端请求时的原始模型名，解决 Claude Code / Codex 等工具因读取上游模型名而导致模型映射规则失效的问题
+- 新增 `ModelRewriteTransform` 流式 SSE 文本 model 回写 Transform
+- 新增 `rewriteResponseModel` 非流式响应 model 回写函数
+- 覆盖全部 4 条代理路径（proxyRequest / proxyRequestForApiPath 的流式与非流式）
+
 ## 2026-06-11: 修复配置文件写入时认证字段丢失
 
 ### 修复

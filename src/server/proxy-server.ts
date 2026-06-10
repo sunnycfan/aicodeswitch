@@ -7,6 +7,7 @@ import {
   SSEParserTransform,
   SSESerializerTransform,
 } from './transformers/streaming';
+import { ModelRewriteTransform, rewriteResponseModel } from './transformers/model-rewrite-transform';
 import { ChunkCollectorTransform, SSEEventCollectorTransform, type SSEEvent } from './transformers/chunk-collector';
 import { rulesStatusBroadcaster } from './rules-status-service';
 import {
@@ -1917,7 +1918,9 @@ export class ProxyServer {
     const requestModel = body?.model;
     const candidates: Rule[] = [];
     const contentType = forcedContentType || this.determineContentType(req, this.inferTargetTypeFromPath(req.path) || 'claude-code', routeId);
-    const prioritizeContentType = contentType === 'high-iq';
+    // 所有特定内容类型（compact, thinking, long-context 等）优先于 model-mapping，
+    // 保持与 findMatchingRule 中的优先级顺序一致
+    const prioritizeContentType = contentType !== 'default';
 
     const modelMappingRules = requestModel
       ? enabledRules.filter(rule =>
@@ -2083,6 +2086,9 @@ export class ProxyServer {
 
     for (const detector of this.getContentTypeDetectors()) {
       if (detector.match(req, body, sessionId, routeId)) {
+        if (detector.type === 'compact') {
+          console.log('[CONTENT-TYPE] Detected compact request');
+        }
         return detector.type;
       }
     }
@@ -4216,6 +4222,9 @@ export class ProxyServer {
         const compactResponseSanitizer = rule.contentType === 'compact' && targetType === 'claude-code'
           ? new ClaudeCompactResponseSanitizer()
           : null;
+        // 流式 model 回写：将上游返回的 model 改写为客户端请求时的原始模型名
+        const originalModel = req.body?.model;
+        const modelRewriter = originalModel ? new ModelRewriteTransform(originalModel) : null;
         responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
 
         // 使用 transformSSEToTool 方法选择转换器
@@ -4262,7 +4271,11 @@ export class ProxyServer {
               if (compactResponseSanitizer) {
                 streamStages.push(compactResponseSanitizer);
               }
-              streamStages.push(serializer, downstreamChunkCollector, res);
+              streamStages.push(serializer);
+              if (modelRewriter) {
+                streamStages.push(modelRewriter);
+              }
+              streamStages.push(downstreamChunkCollector, res);
               pipeline(streamStages[0], streamStages[1], streamStages[2], streamStages[3], ...(streamStages.slice(4) as any[]), (error) => {
                 if (error) {
                   reject(error);
@@ -4277,7 +4290,11 @@ export class ProxyServer {
             if (compactResponseSanitizer) {
               streamStages.push(compactResponseSanitizer);
             }
-            streamStages.push(serializer, downstreamChunkCollector, res);
+            streamStages.push(serializer);
+            if (modelRewriter) {
+              streamStages.push(modelRewriter);
+            }
+            streamStages.push(downstreamChunkCollector, res);
             pipeline(streamStages[0], streamStages[1], streamStages[2], ...(streamStages.slice(3) as any[]), (error) => {
               if (error) {
                 reject(error);
@@ -4414,6 +4431,11 @@ export class ProxyServer {
       // 提取 token usage（从原始响应数据中提取）
       usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
       console.log('[Proxy] Non-stream response: extracted usageForLog:', usageForLog);
+
+      // 回写 model 字段：将上游返回的 model 改写为客户端请求时的原始模型名
+      const originalModel = req.body?.model;
+      rewriteResponseModel(normalizedConverted, originalModel);
+      rewriteResponseModel(responseData, originalModel);
 
       this.copyResponseHeaders(responseHeaders, res);
 
@@ -5044,6 +5066,10 @@ export class ProxyServer {
         });
         responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
 
+        // 流式 model 回写：将上游返回的 model 改写为客户端请求时的原始模型名
+        const originalModel = req.body?.model;
+        const modelRewriter = originalModel ? new ModelRewriteTransform(originalModel) : null;
+
         const { converter, extractUsage } = this.transformSSEByFormat(clientFormat, sourceType);
         this.copyResponseHeaders(responseHeaders, res);
         res.status(response.status);
@@ -5066,13 +5092,21 @@ export class ProxyServer {
 
         try {
           await new Promise<void>((resolve, reject) => {
+            const buildStages = (...upstream: any[]): any[] => {
+              const stages: any[] = [...upstream, serializer];
+              if (modelRewriter) stages.push(modelRewriter);
+              stages.push(downstreamChunkCollector, res);
+              return stages;
+            };
             if (converter) {
-              pipeline(response.data, parser, eventCollector, converter, serializer, downstreamChunkCollector, res, (error: any) => {
+              const stages = buildStages(response.data, parser, eventCollector, converter);
+              (pipeline as any)(...stages, (error: any) => {
                 if (error) { reject(error); return; }
                 resolve();
               });
             } else {
-              pipeline(response.data, parser, eventCollector, serializer, downstreamChunkCollector, res, (error: any) => {
+              const stages = buildStages(response.data, parser, eventCollector);
+              (pipeline as any)(...stages, (error: any) => {
                 if (error) { reject(error); return; }
                 resolve();
               });
@@ -5119,6 +5153,12 @@ export class ProxyServer {
         : converted;
 
       usageForLog = this.extractTokenUsageFromResponse(responseData, sourceType);
+
+      // 回写 model 字段：将上游返回的 model 改写为客户端请求时的原始模型名
+      const originalModel = req.body?.model;
+      rewriteResponseModel(normalizedConverted, originalModel);
+      rewriteResponseModel(responseData, originalModel);
+
       this.copyResponseHeaders(responseHeaders, res);
 
       if (normalizedConverted && normalizedConverted !== responseData) {
