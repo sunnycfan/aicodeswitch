@@ -164,7 +164,7 @@ const isValidAutocompactPct = (v: unknown): v is number => {
 };
 
 const writeClaudeConfig = async (
-  dbManager: FileSystemDatabaseManager,
+  _dbManager: FileSystemDatabaseManager,
   enableAgentTeams?: boolean,
   enableBypassPermissionsSupport?: boolean,
   effortLevel?: ClaudeEffortLevel,
@@ -175,7 +175,6 @@ const writeClaudeConfig = async (
   try {
     const homeDir = os.homedir();
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 4567;
-    const config = dbManager.getConfig();
 
     // Claude Code settings.json
     const claudeDir = path.join(homeDir, '.claude');
@@ -228,7 +227,7 @@ const writeClaudeConfig = async (
 
     // 构建代理配置
     const claudeSettingsEnv: Record<string, any> = {
-      ANTHROPIC_AUTH_TOKEN: config.apiKey || "api_key",
+      ANTHROPIC_AUTH_TOKEN: "api_key",
       ANTHROPIC_API_KEY: "",
       ANTHROPIC_BASE_URL: `http://${host}:${port}/claude-code`,
       API_TIMEOUT_MS: "3000000",
@@ -350,14 +349,13 @@ const isCodexReasoningEffort = (value: unknown): value is CodexReasoningEffort =
 };
 
 const writeCodexConfig = async (
-  dbManager: FileSystemDatabaseManager,
+  _dbManager: FileSystemDatabaseManager,
   modelReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
   codexDefaultModel?: string,
   options: ToolConfigWriteOptions = {}
 ): Promise<boolean> => {
   try {
     const homeDir = os.homedir();
-    const config = dbManager.getConfig();
 
     // Codex config.toml
     const codexDir = path.join(homeDir, '.codex');
@@ -460,7 +458,7 @@ const writeCodexConfig = async (
 
     // 构建代理配置
     const proxyAuth: Record<string, any> = {
-      OPENAI_API_KEY: config.apiKey || "api_key"
+      OPENAI_API_KEY: "api_key"
     };
 
     // 使用智能合并
@@ -2949,6 +2947,79 @@ ${instruction}
         },
       },
     });
+  }));
+
+  // 写入本地配置（将 AccessKey 写入 Claude Code / Codex 配置文件）
+  app.post('/api/access-keys/:id/write-local', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(400).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const key = accessKeyModule.keyManager.get(req.params.id);
+    if (!key) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+
+    const targets: string[] = req.body.targets || [];
+    if (targets.length === 0) {
+      res.status(400).json({ error: '请选择至少一个目标' });
+      return;
+    }
+
+    const homeDir = os.homedir();
+    const results: Record<string, boolean> = {};
+
+    for (const target of targets) {
+      try {
+        if (target === 'claude-code') {
+          // 写入 ~/.claude/settings.json 的 env.ANTHROPIC_AUTH_TOKEN
+          const claudeDir = path.join(homeDir, '.claude');
+          const settingsPath = path.join(claudeDir, 'settings.json');
+          if (!fs.existsSync(claudeDir)) {
+            fs.mkdirSync(claudeDir, { recursive: true });
+          }
+
+          let settings: Record<string, any> = {};
+          if (fs.existsSync(settingsPath)) {
+            try {
+              settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+            } catch { /* ignore */ }
+          }
+
+          if (!settings.env) settings.env = {};
+          settings.env.ANTHROPIC_AUTH_TOKEN = key.apiKey;
+
+          atomicWriteFile(settingsPath, JSON.stringify(settings, null, 2));
+          results['claude-code'] = true;
+        } else if (target === 'codex') {
+          // 写入 ~/.codex/auth.json 的 OPENAI_API_KEY
+          const codexDir = path.join(homeDir, '.codex');
+          const authPath = path.join(codexDir, 'auth.json');
+          if (!fs.existsSync(codexDir)) {
+            fs.mkdirSync(codexDir, { recursive: true });
+          }
+
+          let auth: Record<string, any> = {};
+          if (fs.existsSync(authPath)) {
+            try {
+              auth = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+            } catch { /* ignore */ }
+          }
+
+          auth.OPENAI_API_KEY = key.apiKey;
+          atomicWriteFile(authPath, JSON.stringify(auth, null, 2));
+          results['codex'] = true;
+        }
+      } catch (error) {
+        console.error(`Failed to write local config for ${target}:`, error);
+        results[target] = false;
+      }
+    }
+
+    res.json({ success: true, results });
   }));
 
   // ============================================================

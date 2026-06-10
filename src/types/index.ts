@@ -242,7 +242,6 @@ export interface AppConfig {
   enableLogging?: boolean;
   logRetentionDays?: number;
   maxLogSize?: number;
-  apiKey?: string;
   enableFailover?: boolean;  // 是否启用智能故障切换,默认 true
   failoverRecoverySeconds?: number;  // 故障自动恢复时间（秒）,默认 10
   ruleGlobalTimeout?: number;  // 规则全局超时时间（秒），覆盖未设置超时的规则，默认 300

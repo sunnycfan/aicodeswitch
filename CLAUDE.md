@@ -216,7 +216,7 @@ aicos version            # Show current version information
 - This structure ensures data consistency and simplifies cascade operations
 
 #### 5.5. AccessKey Module - `server/access-keys/`
-- **Purpose**: Multi-client API Key sharing without user accounts
+- **Purpose**: Multi-client API Key sharing without user accounts (仅在 AUTH 启用时可用)
 - **Key Files**:
   - `index.ts` - Module entry point, initialization and persistence
   - `manager.ts` - AccessKey CRUD, hash-based O(1) lookup
@@ -234,6 +234,14 @@ aicos version            # Show current version information
 - **API Key Prefixes**: `sk_` = AccessKey, `skr_` = routing key (existing)
 - **Authentication Headers**: Supports `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`
 - **Key Design**: AccessKey requests completely bypass existing log/statistics systems
+- **写入本地功能**: 密钥详情页"写入本地"按钮可将真实 Key 写入 Claude Code (`~/.claude/settings.json` → `ANTHROPIC_AUTH_TOKEN`) 和 Codex (`~/.codex/auth.json` → `OPENAI_API_KEY`) 本地配置文件
+- **认证架构**（`proxy-server.ts` 4 处统一）：
+  - AUTH 未配置 → 所有代理请求直接放行，无认证
+  - AUTH 已配置 + `sk_` 前缀 key → AccessKey 鉴权（策略 + 配额）
+  - AUTH 已配置 + 无 `sk_` key → 401 拒绝
+- **前端可见性**：
+  - AUTH 关闭 → 隐藏"接入密钥"菜单，显示"会话""日志"
+  - AUTH 开启 → 显示"接入密钥"菜单，隐藏"会话""日志"
 
 #### 6. UI (React) - `ui/`
 - Main app: `App.tsx` - Navigation and layout with collapsible sidebar
@@ -898,6 +906,12 @@ npm 发布成功后，自动触发 Tauri 应用构建：
 - `.github/workflows/build-tauri.yaml` - Tauri 构建和发布
 
 ## 最近变更
+
+- 2026-06-10: 认证体系简化与密钥详情页 Tabs 改造
+  - 移除全局 `config.apiKey` 认证，简化为 AUTH 驱动的 AccessKey-only 认证
+  - AUTH 未配置时：隐藏"接入密钥"菜单，代理无需认证；AUTH 已配置时：显示"接入密钥"，隐藏"会话""日志"，代理必须 AccessKey 认证
+  - 密钥详情页重构为 Tabs 布局（基本信息 / 统计 / 日志），复用 LogDetailModal 和 Pagination 组件
+  - 新增"写入本地"功能：将 AccessKey 真实 Key 写入 Claude Code / Codex 本地配置文件
 
 - 2026-06-10: 新增 AccessKey 接入密钥共享功能
   - 通过 `sk_` 前缀 API Key 实现多端接入共享，无需用户体系

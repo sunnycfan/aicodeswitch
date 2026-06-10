@@ -178,6 +178,7 @@ interface BackendAPI {
     codex: { description: string; envVars: Record<string, string> };
     openai: { description: string; envVars: Record<string, string> };
   }>;
+  writeAccessKeyToLocal: (id: string, targets: string[]) => Promise<{ success: boolean; results: Record<string, boolean> }>;
 
   // Policy 策略
   getPolicies: () => Promise<(Policy & { keyCount?: number })[]>;
@@ -603,6 +604,7 @@ export const api: BackendAPI = {
   getAccessKeyUsageTrend: (id, days) => requestJson(buildUrl(`/api/access-keys/${id}/usage/trend`, { days })),
   getAccessKeyLogs: (id, params) => requestJson(buildUrl(`/api/access-keys/${id}/logs`, params as Record<string, string | number | undefined>)),
   getAccessKeyGuide: (id, host, port) => requestJson(buildUrl(`/api/access-keys/${id}/guide`, { host, port })),
+  writeAccessKeyToLocal: (id, targets: string[]) => requestJson(buildUrl(`/api/access-keys/${id}/write-local`), { method: 'POST', body: JSON.stringify({ targets }) }),
 
   // Policy 策略
   getPolicies: () => requestJson(buildUrl('/api/policies')),

@@ -46,14 +46,12 @@ function SettingsPage() {
 
   const handleSaveConfig = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
     const parsedRecoverySeconds = Number(failoverRecoverySeconds);
     const normalizedRecoverySeconds = Number.isFinite(parsedRecoverySeconds) && parsedRecoverySeconds > 0
       ? Math.floor(parsedRecoverySeconds)
       : 10;
     const newConfig: AppConfig = {
       ...config, // 保留现有配置
-      apiKey: formData.get('apiKey') as string,
       enableFailover: failoverEnabled,
       failoverRecoverySeconds: normalizedRecoverySeconds,
     };
@@ -190,18 +188,6 @@ function SettingsPage() {
       <div className="card">
         <h3>应用配置</h3>
         <form onSubmit={handleSaveConfig}>
-
-           <div className="form-group">
-             <label>API Key</label>
-             <input
-               type="password"
-               name="apiKey"
-               defaultValue={config.apiKey}
-             />
-             <small style={{ display: 'block', marginTop: '4px', color: '#666', fontSize: '12px' }}>
-              当编程工具连接到aicodeswitch时，需要使用此API Key进行认证
-            </small>
-           </div>
           <div className="form-group">
             <label>启用智能故障切换</label>
             <select

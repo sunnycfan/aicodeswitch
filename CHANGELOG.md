@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-10: 认证体系简化与密钥详情页 Tabs 改造
+
+### 变更
+- 移除全局 `config.apiKey` 认证机制，简化为 AUTH 驱动的 AccessKey-only 认证
+- AUTH 未配置时：不展示"接入密钥"菜单，所有代理请求无需认证直接通过
+- AUTH 已配置时：展示"接入密钥"菜单，隐藏"会话""日志"菜单，所有代理请求必须通过 AccessKey (`sk_` 前缀) 认证
+- 移除设置页面的 API Key 配置项
+- Claude Code / Codex 配置注入改用固定占位符 `"api_key"`，用户通过密钥详情页的"写入本地"功能将真实 Key 写入本地
+
+### 新增
+- 密钥详情页重构为 Tabs 布局：基本信息 / 统计 / 日志
+  - **基本信息**：展示 API Key（脱敏 + 复制）、策略、状态、创建时间、最后活跃、备注等
+  - **统计**：概览卡片 + Token/请求量/错误数趋势图，支持 7/30/90 天切换
+  - **日志**：完整日志列表，支持日期筛选、分页、自动刷新，复用 `LogDetailModal` 组件
+- 新增"写入本地"功能：将 AccessKey 真实 Key 写入 Claude Code / Codex 本地配置文件
+  - 后端 API：`POST /api/access-keys/:id/write-local`
+  - 弹窗支持选择目标（Claude Code / Codex）
+- 新增 `writeAccessKeyToLocal` 前端 API 方法
+
+### 移除
+- `AppConfig.apiKey` 类型定义
+- `fs-database.ts` 中 `apiKey` 默认值
+- `proxy-server.ts` 中 4 处 `config.apiKey` 认证分支
+- `SettingsPage` 中 API Key 表单项
+
 ## 2026-06-10: 日志详情弹窗组件化重构
 
 ### 优化

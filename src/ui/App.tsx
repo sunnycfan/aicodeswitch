@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { HashRouter as Router, Routes, Route, NavLink, useNavigate } from 'react-router-dom';
+import { HashRouter as Router, Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import { api } from './api/client';
 import VendorsPage from './pages/VendorsPage';
@@ -411,28 +411,36 @@ function AppContent() {
               <NavLink to="/mcp"><span className="nav-icon">🧰</span><span className="nav-text">MCP 管理</span></NavLink>
             </NavItemWithTooltip>
           </li>
-          <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
-          <li>
-            <NavItemWithTooltip text="接入密钥" showTooltip={sidebarCollapsed}>
-              <NavLink to="/access-keys"><span className="nav-icon">🔑</span><span className="nav-text">接入密钥</span></NavLink>
-            </NavItemWithTooltip>
-          </li>
+          {authEnabled && (
+            <>
+              <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
+              <li>
+                <NavItemWithTooltip text="接入密钥" showTooltip={sidebarCollapsed}>
+                  <NavLink to="/access-keys"><span className="nav-icon">🔑</span><span className="nav-text">接入密钥</span></NavLink>
+                </NavItemWithTooltip>
+              </li>
+            </>
+          )}
           <li className="nav-divider"><hr style={{ border: 'none', borderTop: '1px solid var(--border-primary)', margin: '4px 8px' }} /></li>
           <li>
             <NavItemWithTooltip text="数据统计" showTooltip={sidebarCollapsed}>
               <NavLink to="/statistics"><span className="nav-icon">📊</span><span className="nav-text">数据统计</span></NavLink>
             </NavItemWithTooltip>
           </li>
-          <li>
-            <NavItemWithTooltip text="会话" showTooltip={sidebarCollapsed}>
-              <NavLink to="/sessions"><span className="nav-icon">💬</span><span className="nav-text">会话</span></NavLink>
-            </NavItemWithTooltip>
-          </li>
-          <li>
-            <NavItemWithTooltip text="日志" showTooltip={sidebarCollapsed}>
-              <NavLink to="/logs"><span className="nav-icon">🪵</span><span className="nav-text">日志</span></NavLink>
-            </NavItemWithTooltip>
-          </li>
+          {!authEnabled && (
+            <>
+              <li>
+                <NavItemWithTooltip text="会话" showTooltip={sidebarCollapsed}>
+                  <NavLink to="/sessions"><span className="nav-icon">💬</span><span className="nav-text">会话</span></NavLink>
+                </NavItemWithTooltip>
+              </li>
+              <li>
+                <NavItemWithTooltip text="日志" showTooltip={sidebarCollapsed}>
+                  <NavLink to="/logs"><span className="nav-icon">🪵</span><span className="nav-text">日志</span></NavLink>
+                </NavItemWithTooltip>
+              </li>
+            </>
+          )}
           <li>
             <NavItemWithTooltip text="设置" showTooltip={sidebarCollapsed}>
               <NavLink to="/settings"><span className="nav-icon">⚙️</span><span className="nav-text">设置</span></NavLink>
@@ -491,10 +499,10 @@ function AppContent() {
             <Route path="/vendors" element={<VendorsPage />} />
             <Route path="/skills" element={<SkillsPage />} />
             <Route path="/mcp" element={<MCPPage />} />
-            <Route path="/access-keys" element={<AccessKeysPage />} />
-            <Route path="/access-keys/:id" element={<AccessKeyDetailPage />} />
-            <Route path="/sessions" element={<SessionsPage />} />
-            <Route path="/logs" element={<LogsPage />} />
+            <Route path="/access-keys" element={authEnabled ? <AccessKeysPage /> : <Navigate to="/" />} />
+            <Route path="/access-keys/:id" element={authEnabled ? <AccessKeyDetailPage /> : <Navigate to="/" />} />
+            <Route path="/sessions" element={!authEnabled ? <SessionsPage /> : <Navigate to="/" />} />
+            <Route path="/logs" element={!authEnabled ? <LogsPage /> : <Navigate to="/" />} />
             <Route path="/write-config" element={<WriteConfigPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/usage" element={<UsagePage />} />

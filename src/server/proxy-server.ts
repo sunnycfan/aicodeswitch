@@ -339,11 +339,10 @@ export class ProxyServer {
             this.sendAccessKeyError(res, err);
             return;
           }
-        } else if (this.config.apiKey) {
-          if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
-            res.status(401).json({ error: { message: 'Invalid API key' } });
-            return;
-          }
+        } else if (isAuthEnabled()) {
+          // AUTH 已启用 → 仅允许 AccessKey 认证
+          res.status(401).json({ error: { type: 'authentication_error', code: 'INVALID_API_KEY', message: 'Authentication required. Please provide a valid AccessKey.' } });
+          return;
         }
         res.json(buildModelsResponse(this.dbManager.getApiPathModels()));
         return;
@@ -362,14 +361,8 @@ export class ProxyServer {
           return;
         }
         accessKeyCtx = result;
-      } else if (this.config.apiKey) {
-        // 全局 apiKey 校验
-        if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
-          res.status(401).json({ error: { message: 'Invalid API key' } });
-          return;
-        }
       } else if (isAuthEnabled()) {
-        // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
+        // AUTH 已启用 → 仅允许 AccessKey 认证
         res.status(401).json({ error: { type: 'authentication_error', code: 'INVALID_API_KEY', message: 'Authentication required. Please provide a valid AccessKey.' } });
         return;
       }
@@ -791,20 +784,15 @@ export class ProxyServer {
           }
           // 并发 +1
           this.accessKeyModule.quotaChecker.onRequestStart(accessKeyCtx.accessKey.id, accessKeyCtx.policy);
-        } else if (this.config.apiKey) {
-          // 全局 apiKey 校验
-          if (!apiKeyValue || apiKeyValue !== this.config.apiKey) {
-            await this.logToolRequest(req, {
-              statusCode: 401,
-              responseTime: Date.now() - requestStartAt,
-              targetType,
-              error: 'Invalid API key',
-              tags: this.buildRelayTags(false),
-            });
-            return res.status(401).json({ error: 'Invalid API key' });
-          }
         } else if (isAuthEnabled()) {
-          // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
+          // AUTH 已启用 → 仅允许 AccessKey 认证
+          await this.logToolRequest(req, {
+            statusCode: 401,
+            responseTime: Date.now() - requestStartAt,
+            targetType,
+            error: 'Authentication required',
+            tags: this.buildRelayTags(false),
+          });
           return res.status(401).json({ error: 'Authentication required. Please provide a valid AccessKey.' });
         }
 
@@ -4524,25 +4512,15 @@ export class ProxyServer {
 
     // AccessKey 请求已在上层完成鉴权；非 AccessKey 请求在此鉴权
     if (!accessKeyCtx) {
-      if (this.config.apiKey) {
-        const providedKey = this.extractApiKey(req);
-        if (!providedKey || providedKey !== this.config.apiKey) {
-          await this.logToolRequest(req, {
-            statusCode: 401,
-            responseTime: Date.now() - requestStartAt,
-            error: 'Invalid API key',
-            tags: this.buildRelayTags(false),
-          });
-          // 根据客户端格式返回错误
-          if (clientFormat === 'claude') {
-            res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
-          } else {
-            res.status(401).json({ error: { message: 'Invalid API key' } });
-          }
-          return;
-        }
-      } else if (isAuthEnabled()) {
-        // AUTH 已启用但未配置 config.apiKey → 仅允许 AccessKey 认证
+      if (isAuthEnabled()) {
+        // AUTH 已启用 → 仅允许 AccessKey 认证
+        await this.logToolRequest(req, {
+          statusCode: 401,
+          responseTime: Date.now() - requestStartAt,
+          error: 'Authentication required',
+          tags: this.buildRelayTags(false),
+        });
+        // 根据客户端格式返回错误
         if (clientFormat === 'claude') {
           res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Authentication required. Please provide a valid AccessKey.' } });
         } else {

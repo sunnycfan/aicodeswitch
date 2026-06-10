@@ -1088,7 +1088,6 @@ export class FileSystemDatabaseManager {
       enableLogging: true,
       logRetentionDays: 30,
       maxLogSize: 100000,
-      apiKey: '',
       enableFailover: true,
       failoverRecoverySeconds: DEFAULT_FAILOVER_RECOVERY_SECONDS,
       ruleGlobalTimeout: undefined,
