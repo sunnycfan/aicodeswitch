@@ -470,8 +470,8 @@ export default function RoutesPage() {
       routeId: selectedRoute!.id,
       contentType: formData.get('contentType') as ContentType,
       targetServiceId: useMCP ? '' : selectedService,
-      targetModel: useMCP ? undefined : (selectedModel || undefined),
-      replacedModel: selectedReplacedModel || undefined,
+      targetModel: useMCP ? undefined : (selectedModel || ''),
+      replacedModel: selectedReplacedModel || '',
       sortOrder: selectedSortOrder,
       timeout: selectedTimeout ? selectedTimeout * 1000 : undefined, // 转换为毫秒
       tokenLimit: useMCP ? undefined : (selectedTokenLimit || undefined), // k值（与Service保持一致）
