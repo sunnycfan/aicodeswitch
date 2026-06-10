@@ -663,6 +663,13 @@ export interface AccessKey {
   lastActiveAt?: number;          // 最后活跃时间
 }
 
+/** 写入本地记录（持久化哪些 AccessKey 被写入了哪些工具的配置文件） */
+export interface WriteLocalRecord {
+  accessKeyId: string;
+  targets: string[];      // 'claude-code' | 'codex'
+  timestamp: number;
+}
+
 /** 策略 */
 export interface Policy {
   id: string;                     // 系统生成的唯一标识

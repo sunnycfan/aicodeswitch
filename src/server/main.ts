@@ -26,6 +26,7 @@ import type {
   CodexReasoningEffort,
   ClaudeEffortLevel,
   ToolName,
+  WriteLocalRecord,
 } from '../types';
 import os from 'os';
 import { isAuthEnabled, verifyAuthCode, generateToken, authMiddleware } from './auth';
@@ -105,6 +106,110 @@ function getProxyAgent() {
     return proxyUrl;
   } catch {
     return null;
+  }
+}
+
+// ============================================================================
+// 写入本地记录持久化
+// ============================================================================
+
+const getWriteLocalRecordsFile = (): string => path.join(dataDir, 'write-local-records.json');
+
+function loadWriteLocalRecords(): WriteLocalRecord[] {
+  try {
+    const filePath = getWriteLocalRecordsFile();
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+function saveWriteLocalRecords(records: WriteLocalRecord[]): void {
+  const filePath = getWriteLocalRecordsFile();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  atomicWriteFile(filePath, JSON.stringify(records, null, 2));
+}
+
+function addWriteLocalRecord(accessKeyId: string, targets: string[]): void {
+  const records = loadWriteLocalRecords();
+  const existing = records.find(r => r.accessKeyId === accessKeyId);
+  if (existing) {
+    for (const t of targets) {
+      if (!existing.targets.includes(t)) existing.targets.push(t);
+    }
+    existing.timestamp = Date.now();
+  } else {
+    records.push({ accessKeyId, targets: [...targets], timestamp: Date.now() });
+  }
+  saveWriteLocalRecords(records);
+}
+
+function removeWriteLocalRecords(accessKeyId: string): void {
+  const records = loadWriteLocalRecords().filter(r => r.accessKeyId !== accessKeyId);
+  saveWriteLocalRecords(records);
+}
+
+/**
+ * 从持久化记录中恢复已写入本地的 AccessKey
+ * 每次代理配置写入后调用，确保 AccessKey 不会被占位符覆盖
+ */
+function applyWriteLocalRecords(proxyServer: ProxyServer): void {
+  const accessKeyModule = proxyServer.getAccessKeyModule();
+  if (!accessKeyModule) return;
+
+  const records = loadWriteLocalRecords();
+  if (records.length === 0) return;
+
+  let changed = false;
+  const homeDir = os.homedir();
+
+  const remainingRecords = records.filter(record => {
+    const key = accessKeyModule.keyManager.get(record.accessKeyId);
+    if (!key || key.status !== 'active') {
+      changed = true;
+      return false; // 密钥已删除或停用，移除记录
+    }
+
+    for (const target of record.targets) {
+      try {
+        if (target === 'claude-code') {
+          const claudeDir = path.join(homeDir, '.claude');
+          const settingsPath = path.join(claudeDir, 'settings.json');
+          if (!fs.existsSync(claudeDir)) {
+            fs.mkdirSync(claudeDir, { recursive: true });
+          }
+          let settings: Record<string, any> = {};
+          if (fs.existsSync(settingsPath)) {
+            try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch { /* ignore */ }
+          }
+          if (!settings.env) settings.env = {};
+          settings.env.ANTHROPIC_AUTH_TOKEN = key.apiKey;
+          atomicWriteFile(settingsPath, JSON.stringify(settings, null, 2));
+        } else if (target === 'codex') {
+          const codexDir = path.join(homeDir, '.codex');
+          const authPath = path.join(codexDir, 'auth.json');
+          if (!fs.existsSync(codexDir)) {
+            fs.mkdirSync(codexDir, { recursive: true });
+          }
+          let auth: Record<string, any> = {};
+          if (fs.existsSync(authPath)) {
+            try { auth = JSON.parse(fs.readFileSync(authPath, 'utf-8')); } catch { /* ignore */ }
+          }
+          auth.OPENAI_API_KEY = key.apiKey;
+          atomicWriteFile(authPath, JSON.stringify(auth, null, 2));
+        }
+      } catch (error) {
+        console.error(`[WriteLocal] Failed to apply key ${record.accessKeyId} to ${target}:`, error);
+      }
+    }
+    return true;
+  });
+
+  if (changed) {
+    saveWriteLocalRecords(remainingRecords);
   }
 }
 
@@ -1621,6 +1726,7 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2337,6 +2443,7 @@ ${instruction}
         appConfig.claudeDefaultModel,
         appConfig.autocompactPctOverride
       );
+      applyWriteLocalRecords(proxyServer);
       res.json(result);
     })
   );
@@ -2356,6 +2463,7 @@ ${instruction}
         modelReasoningEffort,
         appConfig.codexDefaultModel
       );
+      applyWriteLocalRecords(proxyServer);
       res.json(result);
     })
   );
@@ -2375,6 +2483,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2395,6 +2504,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2419,6 +2529,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -3065,6 +3176,7 @@ ${instruction}
 
     const result = accessKeyModule.keyManager.delete(req.params.id);
     await accessKeyModule.save();
+    removeWriteLocalRecords(req.params.id);
     res.json(result);
   }));
 
@@ -3082,6 +3194,8 @@ ${instruction}
       return;
     }
     await accessKeyModule.save();
+    // 如果该密钥有写入本地记录，重新生成后自动重写
+    applyWriteLocalRecords(proxyServer);
     res.json({ apiKey: result.apiKey });
   }));
 
@@ -3136,6 +3250,7 @@ ${instruction}
     }
     const count = accessKeyModule.keyManager.batchDelete(keyIds);
     await accessKeyModule.save();
+    for (const keyId of keyIds) removeWriteLocalRecords(keyId);
     res.json({ count });
   }));
 
@@ -3295,7 +3410,20 @@ ${instruction}
       }
     }
 
+    // 持久化写入本地记录，确保服务重启后自动恢复
+    const successTargets = Object.entries(results)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k);
+    if (successTargets.length > 0) {
+      addWriteLocalRecord(key.id, successTargets);
+    }
+
     res.json({ success: true, results });
+  }));
+
+  // 查询写入本地记录（供 UI 显示标注）
+  app.get('/api/write-local-records', asyncHandler(async (_req, res) => {
+    res.json(loadWriteLocalRecords());
   }));
 
   // ============================================================
@@ -3329,6 +3457,11 @@ ${instruction}
     const policy = accessKeyModule.policyManager.create(req.body);
     await accessKeyModule.save();
     res.json(policy);
+  }));
+
+  // 策略模板（必须在 /:id 之前注册，避免被当作 id 参数匹配）
+  app.get('/api/policies/templates', asyncHandler(async (_req, res) => {
+    res.json(PolicyManager.getTemplates());
   }));
 
   // 策略详情
@@ -3410,11 +3543,6 @@ ${instruction}
 
     const keys = accessKeyModule.keyManager.listByPolicyId(req.params.id);
     res.json(keys.map(k => ({ ...k, apiKey: AccessKeyManager.maskApiKey(k.apiKey) })));
-  }));
-
-  // 策略模板
-  app.get('/api/policies/templates', asyncHandler(async (_req, res) => {
-    res.json(PolicyManager.getTemplates());
   }));
 
   // ============================================================
@@ -3778,6 +3906,13 @@ const start = async () => {
     proxyServer.setAccessKeyModule(accessKeyModule);
   } catch (error) {
     console.error('[Server] AccessKey module initialization failed:', error);
+  }
+
+  // 恢复已写入本地的 AccessKey（在代理配置写入之后、AccessKey 模块初始化之后）
+  try {
+    applyWriteLocalRecords(proxyServer);
+  } catch (error) {
+    console.error('[Server] Failed to apply write-local records:', error);
   }
 
   // Initialize proxy server and register proxy routes last

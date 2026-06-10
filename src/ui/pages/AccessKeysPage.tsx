@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
-import type { AccessKey, Policy, Route } from '../../types';
+import type { AccessKey, Policy, Route, WriteLocalRecord } from '../../types';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
 import AccessKeyGuideModal from '../components/AccessKeyGuideModal';
@@ -10,6 +10,7 @@ export default function AccessKeysPage() {
   const [policies, setPolicies] = useState<(Policy & { keyCount?: number })[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [templates, setTemplates] = useState<any[]>([]);
+  const [writeLocalRecords, setWriteLocalRecords] = useState<WriteLocalRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const pageSize = 20;
@@ -91,6 +92,7 @@ export default function AccessKeysPage() {
 
   useEffect(() => { loadKeys(); }, [page, statusFilter, searchQuery]);
   useEffect(() => { loadPolicies(); }, []);
+  useEffect(() => { api.getWriteLocalRecords().then(setWriteLocalRecords).catch(() => {}); }, [keys]);
 
   // ====== AccessKey 操作 ======
 
@@ -393,7 +395,22 @@ export default function AccessKeysPage() {
                           <input type="checkbox" checked={selectedIds.has(key.id)} onChange={() => toggleSelect(key.id)} />
                         </td>
                         <td style={{ padding: '10px 12px' }}>
-                          <a href={`#/access-keys/${key.id}`} style={{ color: 'var(--color-primary)', textDecoration: 'none', fontWeight: 500 }}>{key.name}</a>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                            <a href={`#/access-keys/${key.id}`} style={{ color: 'var(--color-primary)', textDecoration: 'none', fontWeight: 500 }}>{key.name}</a>
+                            {(() => {
+                              const record = writeLocalRecords.find(r => r.accessKeyId === key.id);
+                              if (!record) return null;
+                              return record.targets.map(t => (
+                                <span key={t} style={{
+                                  display: 'inline-block', padding: '1px 6px', borderRadius: '8px',
+                                  fontSize: '11px', lineHeight: '16px',
+                                  background: t === 'claude-code' ? '#cc7832' : '#000', color: '#fff',
+                                }}>
+                                  {t === 'claude-code' ? 'Claude Code' : 'Codex'}
+                                </span>
+                              ));
+                            })()}
+                          </span>
                           {key.remark && <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{key.remark}</div>}
                         </td>
                         <td style={{ padding: '10px 12px' }}>
