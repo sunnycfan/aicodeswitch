@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-10: 修复 AUTH 401 错误导致 Claude Code 挂起
+
+### 修复
+- 修复 AUTH 启用后，Claude Code 收到 401 错误但持续请求不停止的问题
+  - 根因：`sendAuthError` 对流式请求返回 SSE 格式的 401 响应，违反 Anthropic API 规范
+  - 按 Anthropic 文档，4xx 错误应始终以标准 HTTP JSON 返回，SSE error event 仅用于 200 已发送后的流中错误
+  - 现所有 401 错误统一返回标准 HTTP JSON + `request-id` header + `connection: close`
+- 修复 `sendAccessKeyError` 仅返回 OpenAI 格式的问题，现根据客户端格式自动返回 Claude 或 OpenAI 格式
+- 所有 AccessKey 错误响应统一添加 `request-id` 和 `connection: close` header
+
 ## 2026-06-10: 认证体系简化与密钥详情页 Tabs 改造
 
 ### 新增
