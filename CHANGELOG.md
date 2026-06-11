@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-06-11: 路由「绑定会话」弹窗新增会话解绑功能
+
+### 新增
+- 路由列表页「绑定会话」弹窗的每个会话行新增「解绑」按钮，点击即可解除该会话与当前路由的绑定，无需再跳转「会话」页逐条解绑
+- 复用已有 `DELETE /api/sessions/:id/bind-route` 接口与 `api.unbindSessionRoute()`，未新增后端逻辑
+- 交互：解绑前弹出二次确认（沿用删除路由/规则的 `useConfirm` 约定），成功后乐观移除该行并使路由卡片徽标计数 -1；按行 loading 态防止重复点击
+- 布局：会话条目改为「去背景·分隔线列表」样式，标题/指标硬顶左边、「解绑」按钮硬顶右边，行间用 `var(--border-color)` 细分隔线区分（末行无分隔线）
+- 修复：绑定会话较多时列表溢出无滚动条 —— 弹窗补上 `modal--sticky-layout` 类（header/footer 固定、body 区滚动，复用 SessionDetailModal 同款布局），并移除 body 内联 `padding: '20px'` 让滚动条槽位正常生效
+- 调整：滚动列表区最大高度限制为 `460px`，避免大屏下列表区过高
+- 影响文件：`src/ui/pages/RoutesPage.tsx`
+
+## 2026-06-11: 修复 Codex 经第三方 Responses API 报 `unknown tool type: custom`
+
+### 修复
+- 修复 Codex 经「Responses 标准接口」转发至第三方提供商（火山方舟/豆包等）时，上游返回 400 `unknown tool type: custom` 的问题
+- 根因：`downgradeResponsesRequest`（responses→responses 降级兼容，负责剥离 OpenAI 私有工具与非标准字段）被 `if (sanitizeBody)` 门控，而 `proxy-server.ts` 两处请求转换入口（`transformRequestToUpstream` / `transformRequestByFormat`）从未传入 `sanitizeBody`，导致整个降级路径为死代码，`apply_patch`(`type:custom`)、MCP(`type:namespace`)、`tool_search`、`web_search` 等私有工具被原样转发
+- 现在仅在 responses→responses 直连「非 OpenAI 官方端点」时开启降级（新增 `isOfficialOpenAiApi` 判定 `api.openai.com` / `*.openai.azure.com`），避免误伤直连官方 OpenAI 的场景
+- 工具过滤由黑名单改为 `function` 白名单，与原注释「仅保留 function 类型」一致，顺带覆盖此前遗漏的 `namespace` 类型
+
+## 2026-06-11: 优化清空日志与清除会话功能
+
+### 新增
+- 会话页右上角新增「清除会话」按钮，点击打开弹窗，支持按「最后请求时间」清理过期会话
+  - 可选择清理 1-15 天以前的会话（以 `lastRequestAt` 为基准）
+  - 可选「仅清空日志」开关：开启后保留会话记录，仅删除关联日志；关闭则同时删除会话及其关联日志
+  - 新增 `POST /api/sessions/cleanup` 端点
+- 后端新增 `cleanupSessionsByAge` / `deleteLogsBySessionIds`：按分片重写并维护 `sessionLogIndex`、`logShardsIndex` 一致性，与 `addLog` 共享分片写入锁避免并发竞争
+
+### 变更
+- 日志页「清空全部日志」按钮改由 `src/ui/config/index.ts` 的 `IS_CLEAR_LOGS_VISIBLE` 控制显隐
+
 ## 2026-06-11: 修复关闭 AUTH 后日志/会话不再写入的问题
 
 ### 修复

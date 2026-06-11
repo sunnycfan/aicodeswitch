@@ -111,6 +111,7 @@ interface BackendAPI {
   getSessionLogs: (id: string, limit?: number) => Promise<RequestLog[]>;
   deleteSession: (id: string) => Promise<boolean>;
   clearSessions: () => Promise<boolean>;
+  cleanupSessions: (beforeDays: number, onlyLogs: boolean) => Promise<{ sessionsAffected: number; logsDeleted: number }>;
 
   getRecommendVendorsMarkdown: () => Promise<string>;
   getReadmeMarkdown: () => Promise<string>;
@@ -393,6 +394,10 @@ export const api: BackendAPI = {
   getSessionLogs: (id, limit) => requestJson(buildUrl(`/api/sessions/${id}/logs`, { limit })),
   deleteSession: (id) => requestJson(buildUrl(`/api/sessions/${id}`), { method: 'DELETE' }),
   clearSessions: () => requestJson(buildUrl('/api/sessions'), { method: 'DELETE' }),
+  cleanupSessions: (beforeDays, onlyLogs) => requestJson(buildUrl('/api/sessions/cleanup'), {
+    method: 'POST',
+    body: JSON.stringify({ beforeDays, onlyLogs })
+  }),
 
   getRecommendVendorsMarkdown: () => requestJson(buildUrl('/api/docs/recommend-vendors')),
 

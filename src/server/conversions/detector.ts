@@ -53,6 +53,19 @@ export function detectRequestFormat(path: string, body: any): Format {
 }
 
 /**
+ * 判断上游 URL 是否为 OpenAI 官方（含 Azure OpenAI）端点。
+ *
+ * 官方端点完整支持 Responses API 的私有扩展（custom 自定义工具、
+ * tool_search/web_search 等内置工具、reasoning.effort、text.verbosity 等），
+ * 因此 responses→responses 直连时无需降级兼容。其余第三方 Responses 提供商
+ * （火山方舟/豆包等）不支持这些扩展，需要走 downgradeResponsesRequest。
+ */
+export function isOfficialOpenAiApi(apiUrl: string): boolean {
+  const u = (apiUrl || '').toLowerCase();
+  return u.includes('api.openai.com') || u.includes('.openai.azure.com');
+}
+
+/**
  * Determine the upstream format from a SourceType string.
  * Maps the legacy SourceType values to the new Format type.
  */

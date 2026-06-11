@@ -8,6 +8,7 @@ import { Pagination } from '../components/Pagination';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
 import LogDetailModal from '../components/LogDetailModal';
+import { IS_CLEAR_LOGS_VISIBLE } from '../config';
 
 dayjs.extend(relativeTime);
 
@@ -371,7 +372,9 @@ function LogsPage() {
             <h1>日志</h1>
             <p>查看所有API请求日志</p>
           </div>
-          <button className="btn btn-danger" onClick={handleClearAllLogs}>清空全部日志</button>
+          {IS_CLEAR_LOGS_VISIBLE && (
+            <button className="btn btn-danger" onClick={handleClearAllLogs}>清空全部日志</button>
+          )}
         </div>
       </div>
 
