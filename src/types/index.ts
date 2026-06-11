@@ -273,19 +273,6 @@ export interface LanDiscoverResponse {
   };
   skills: LanSkillItem[];
   mcps: LanMcpItem[];
-  vendors: {
-    id: string;
-    name: string;
-    services: {
-      id: string;
-      name: string;
-      sourceType?: string;
-      supportedModels?: string[];
-      authType?: string;
-      enableProxy?: boolean;
-      enableCodingPlan?: boolean;
-    }[];
-  }[];
 }
 
 /** 局域网同步的 Skill 条目 */

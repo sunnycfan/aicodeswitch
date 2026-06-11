@@ -27,6 +27,7 @@ import type {
   ClaudeEffortLevel,
   ToolName,
   WriteLocalRecord,
+  SourceType,
 } from '../types';
 import os from 'os';
 import { isAuthEnabled, verifyAuthCode, generateToken, authMiddleware } from './auth';
@@ -71,7 +72,7 @@ if (fs.existsSync(dotenvPath)) {
   dotenv.config({ path: dotenvPath });
 }
 
-const host = process.env.HOST || '127.0.0.1';
+const host = process.env.HOST || '0.0.0.0';
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 4567;
 
 let globalProxyConfig: { enabled: boolean; url: string; username?: string; password?: string } | null = null;
@@ -1294,6 +1295,22 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
 
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+  // 局域网访问控制中间件：当 enableLanDiscovery 关闭时，仅允许本机访问 /api/* 路由
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    const config = dbManager.getConfig();
+    if (config.enableLanDiscovery) {
+      return next();
+    }
+    const clientIp = req.ip || req.socket.remoteAddress || '';
+    // 规范化 IPv4-mapped IPv6 地址 (::ffff:127.0.0.1 -> 127.0.0.1)
+    const normalizedIp = clientIp.replace(/^::ffff:/, '');
+    if (normalizedIp === '127.0.0.1' || normalizedIp === '::1' || normalizedIp === 'localhost') {
+      return next();
+    }
+    console.warn(`[LAN Guard] 拒绝非本机访问: ${clientIp} -> ${req.method} ${req.path}`);
+    res.status(403).json({ error: 'LAN access is disabled. Only local access is allowed.' });
+  });
+
   // 鉴权相关路由 - 公开访问
   app.get('/api/auth/status', (_req, res) => {
     const response: AuthStatus = { enabled: isAuthEnabled() };
@@ -1773,7 +1790,8 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         skills.push(skillItem);
       }
 
-      // 收集 MCPs（脱敏 headers）
+      // 收集 MCPs（脱敏 headers 和 env 中的敏感信息）
+      const SENSITIVE_KEY_PATTERN = /api_key|apikey|access_token|accesstoken|auth|key|token|secret|password|private_key|privatekey|credentials/i;
       const allMcps = dbManager.getMCPs();
       const mcps = allMcps.map(mcp => {
         const sanitized: Record<string, unknown> = {
@@ -1782,14 +1800,26 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
           type: mcp.type,
           command: mcp.command,
           args: mcp.args,
-          env: mcp.env,
           targets: mcp.targets,
         };
         if (mcp.url) sanitized.url = mcp.url;
+        // 脱敏 env
+        if (mcp.env) {
+          const sanitizedEnv: Record<string, string> = {};
+          for (const [key, value] of Object.entries(mcp.env)) {
+            if (SENSITIVE_KEY_PATTERN.test(key)) {
+              sanitizedEnv[key] = '***';
+            } else {
+              sanitizedEnv[key] = value;
+            }
+          }
+          sanitized.env = sanitizedEnv;
+        }
+        // 脱敏 headers
         if (mcp.headers) {
           const sanitizedHeaders: Record<string, string> = {};
           for (const [key, value] of Object.entries(mcp.headers)) {
-            if (/auth|key|token|secret|password/i.test(key)) {
+            if (SENSITIVE_KEY_PATTERN.test(key)) {
               sanitizedHeaders[key] = '***';
             } else {
               sanitizedHeaders[key] = value;
@@ -1799,21 +1829,6 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         }
         return sanitized;
       });
-
-      // 收集 Vendors + Services（脱敏）
-      const vendors = dbManager.getVendors().map(v => ({
-        id: v.id,
-        name: v.name,
-        services: (v.services || []).map(s => ({
-          id: s.id,
-          name: s.name,
-          sourceType: s.sourceType,
-          supportedModels: s.supportedModels,
-          authType: s.authType,
-          enableProxy: s.enableProxy,
-          enableCodingPlan: s.enableCodingPlan,
-        })),
-      }));
 
       // 读取版本号
       let version = 'unknown';
@@ -1831,7 +1846,6 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         },
         skills,
         mcps,
-        vendors,
       });
     } catch (error) {
       console.error('[LAN Discover] 错误:', error);
@@ -1842,24 +1856,34 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
   // GET /api/lan/scan - 获取本机局域网 IP 信息
   app.get('/api/lan/scan', (_req, res) => {
     const interfaces = os.networkInterfaces();
+    const port = process.env.PORT ? parseInt(process.env.PORT) : 4567;
+
+    // 收集所有非内部 IPv4 网络接口
+    const networkInterfaces: Array<{ name: string; address: string; subnet: string; netmask: string }> = [];
     let localIp = '127.0.0.1';
     let subnet = '127.0.0';
 
-    for (const entries of Object.values(interfaces)) {
+    for (const [ifaceName, entries] of Object.entries(interfaces)) {
       if (!entries) continue;
       for (const entry of entries) {
         if (entry.family === 'IPv4' && !entry.internal) {
-          localIp = entry.address;
-          subnet = localIp.split('.').slice(0, 3).join('.');
-          break;
+          const entrySubnet = entry.address.split('.').slice(0, 3).join('.');
+          networkInterfaces.push({
+            name: ifaceName,
+            address: entry.address,
+            subnet: entrySubnet,
+            netmask: entry.netmask,
+          });
+          // 兼容旧逻辑：取第一个非内部接口作为默认值
+          if (localIp === '127.0.0.1') {
+            localIp = entry.address;
+            subnet = entrySubnet;
+          }
         }
       }
-      if (localIp !== '127.0.0.1') break;
     }
 
-    const port = process.env.PORT ? parseInt(process.env.PORT) : 4567;
-
-    res.json({ localIp, subnet, port });
+    res.json({ localIp, subnet, port, networkInterfaces });
   });
 
   // POST /api/lan/sync - 执行同步写入
@@ -1919,7 +1943,7 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         name: skill.name,
         description: skill.description || '',
         targets: skill.targets || [],
-        enabledTargets: [] as string[],
+        enabledTargets: [] as string[], // 不自动选中编程工具，由用户自行配置
         githubUrl: skill.githubUrl,
         skillPath: skill.skillPath,
         installedAt: Date.now(),
@@ -1950,41 +1974,42 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         url: mcp.url,
         headers: mcp.headers,
         env: mcp.env,
-        targets: mcp.targets as TargetType[] | undefined,
+        targets: [], // 不自动选中编程工具，由用户自行配置
       });
       result.mcpsImported++;
     }
 
-    // 3. 可选：创建供应商
+    // 3. 可选：创建供应商（将远端节点的代理路径映射为固定 API 服务）
     if (vendor.enabled) {
       const vendorName = `${remoteNode.name}@${remoteNode.ip}`;
-      const allVendors = dbManager.getVendors();
+      const remoteBaseUrl = `http://${remoteNode.ip}:${remoteNode.port}`;
 
-      // 收集远端所有 services
-      const remoteUrl = `http://${remoteNode.ip}:${remoteNode.port}/v1/`;
-      const services: Omit<APIService, 'id' | 'createdAt' | 'updatedAt'>[] = [];
-      for (const v of allVendors) {
-        for (const s of (v.services || [])) {
-          services.push({
-            name: `${v.name} - ${s.name}`,
-            apiUrl: remoteUrl,
-            apiKey: vendor.apiKey || '',
-            sourceType: s.sourceType,
-            authType: s.authType,
-            supportedModels: s.supportedModels,
-            enableProxy: s.enableProxy,
-            enableCodingPlan: s.enableCodingPlan,
-          });
-        }
-      }
+      // 固定的代理路径到 API 服务映射
+      const LAN_PROXY_SERVICES: Array<{ name: string; sourceType: SourceType; apiPath: string }> = [
+        { name: 'Claude Code', sourceType: 'claude', apiPath: '/claude-code' },
+        { name: 'Codex', sourceType: 'openai', apiPath: '/codex' },
+        { name: 'Claude 标准接口', sourceType: 'claude', apiPath: '/v1/messages' },
+        { name: 'Responses 标准接口', sourceType: 'openai', apiPath: '/v1/responses' },
+        { name: 'Chat Completions 标准接口', sourceType: 'openai-chat', apiPath: '/v1/chat/completions' },
+        { name: 'Gemini 标准接口', sourceType: 'gemini', apiPath: '/v1beta/models' },
+      ];
 
       // 检查供应商是否已存在
       const existingVendor = dbManager.getVendors().find(v => v.name === vendorName);
       if (!existingVendor) {
+        const services: Omit<APIService, 'id' | 'createdAt' | 'updatedAt'>[] = LAN_PROXY_SERVICES.map(svc => ({
+          name: svc.name,
+          apiUrl: `${remoteBaseUrl}${svc.apiPath}`,
+          apiKey: vendor.apiKey || '',
+          sourceType: svc.sourceType,
+          enableProxy: false,
+          enableCodingPlan: false,
+        }));
+
         await dbManager.createVendor({
           name: vendorName,
           description: `从局域网节点 ${remoteNode.ip}:${remoteNode.port} 同步`,
-          apiBaseUrl: `http://${remoteNode.ip}:${remoteNode.port}`,
+          apiBaseUrl: remoteBaseUrl,
           services: services as any[],
         });
         result.vendorCreated = true;

@@ -45,6 +45,12 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
   const [manualPort, setManualPort] = useState('4567');
   const [manualConnecting, setManualConnecting] = useState(false);
 
+  // 局域网接口信息
+  const [networkInterfaces, setNetworkInterfaces] = useState<Array<{ name: string; address: string; subnet: string; netmask: string }>>([]);
+  const [selectedSubnet, setSelectedSubnet] = useState<string>('');
+  const [localPort, setLocalPort] = useState(4567);
+  const [scanMode, setScanMode] = useState<'scan' | 'manual'>('scan');
+
   // Step 2: Skills 选择
   const [selectableSkills, setSelectableSkills] = useState<SelectableSkill[]>([]);
   const [selectedSkillNames, setSelectedSkillNames] = useState<Set<string>>(new Set());
@@ -52,6 +58,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
   // Step 3: MCP 选择
   const [selectableMcps, setSelectableMcps] = useState<SelectableMcp[]>([]);
   const [selectedMcpNames, setSelectedMcpNames] = useState<Set<string>>(new Set());
+  const [envOverrides, setEnvOverrides] = useState<Record<string, Record<string, string>>>({}); // mcpName -> key -> value
 
   // Step 4: 供应商
   const [createVendor, setCreateVendor] = useState(false);
@@ -59,6 +66,8 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
 
   // Step 5: 同步中
   const [syncing, setSyncing] = useState(false);
+  const [hasScanned, setHasScanned] = useState(false);
+  const [loadingNext, setLoadingNext] = useState(false);
 
   // 重置所有状态
   const resetState = useCallback(() => {
@@ -74,30 +83,54 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
     setSelectedSkillNames(new Set());
     setSelectableMcps([]);
     setSelectedMcpNames(new Set());
+    setEnvOverrides({});
     setCreateVendor(false);
     setVendorApiKey('');
     setSyncing(false);
+    setHasScanned(false);
+    setLoadingNext(false);
+    setNetworkInterfaces([]);
+    setSelectedSubnet('');
+    setLocalPort(4567);
+    setScanMode('scan');
   }, []);
 
-  // 弹窗打开时自动开始扫描
+  // 弹窗打开时获取网络信息并自动开始扫描
   useEffect(() => {
     if (show) {
       resetState();
-      startScan();
+      fetchNetworkInfoAndScan();
     }
   }, [show]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // 获取网络信息并自动扫描
+  const fetchNetworkInfoAndScan = async () => {
+    try {
+      const scanInfo = await api.lanScan();
+      setNetworkInterfaces(scanInfo.networkInterfaces || []);
+      setLocalPort(scanInfo.port);
+      // 如果只有一个网段，自动选中并扫描
+      if (scanInfo.networkInterfaces.length <= 1) {
+        setSelectedSubnet(scanInfo.subnet);
+        doScan(scanInfo.subnet, scanInfo.port, scanInfo.localIp);
+      } else {
+        // 多网段时，默认选中第一个并扫描
+        setSelectedSubnet(scanInfo.subnet);
+        doScan(scanInfo.subnet, scanInfo.port, scanInfo.localIp);
+      }
+    } catch (error: any) {
+      console.error('[LAN Scan] 获取网络信息失败:', error);
+    }
+  };
+
   // ========== Step 1: 扫描 ==========
-  const startScan = async () => {
+  const doScan = async (subnet: string, port: number, localIp: string) => {
     setScanning(true);
     setDiscoveredNodes([]);
     setScanProgress({ current: 0, total: 0 });
+    const startTime = Date.now();
 
     try {
-      const scanInfo = await api.lanScan();
-      const { subnet, port } = scanInfo;
-      const localIp = scanInfo.localIp;
-
       const ips: string[] = [];
       for (let i = 1; i <= 254; i++) {
         const ip = `${subnet}.${i}`;
@@ -133,7 +166,31 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
     } catch (error: any) {
       console.error('[LAN Scan] 扫描失败:', error);
     } finally {
+      // 保证扫描状态至少显示 1 秒，避免闪烁
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 1000) {
+        await new Promise(r => setTimeout(r, 1000 - elapsed));
+      }
       setScanning(false);
+      setHasScanned(true);
+    }
+  };
+
+  // 切换网段重新扫描
+  const handleSubnetChange = (subnet: string) => {
+    setSelectedSubnet(subnet);
+    const iface = networkInterfaces.find(i => i.subnet === subnet);
+    if (iface) {
+      doScan(iface.subnet, localPort, iface.address);
+    }
+  };
+
+  // 重新扫描当前网段
+  const handleRescan = () => {
+    const iface = networkInterfaces.find(i => i.subnet === selectedSubnet);
+    if (iface) {
+      setSelectedNode(null);
+      doScan(iface.subnet, localPort, iface.address);
     }
   };
 
@@ -161,33 +218,40 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
   // 进入 Step 2 时准备 Skills 数据（含重名检测）
   const handleNodeSelectedAndNext = async () => {
     if (!selectedNode) return;
+    setLoadingNext(true);
 
-    // 获取本地 Skills 和 MCPs 用于重名检测
-    let localSkills: InstalledSkill[] = [];
-    let localMcps: MCPServer[] = [];
     try {
-      localSkills = await api.getInstalledSkills();
-    } catch { /* ignore */ }
-    try {
-      localMcps = await api.getMCPs();
-    } catch { /* ignore */ }
+      // 获取本地 Skills 和 MCPs 用于重名检测
+      let localSkills: InstalledSkill[] = [];
+      let localMcps: MCPServer[] = [];
+      try {
+        localSkills = await api.getInstalledSkills();
+      } catch { /* ignore */ }
+      try {
+        localMcps = await api.getMCPs();
+      } catch (e) {
+        console.error('[LAN Sync] 获取本地 MCPs 失败，重复检测可能不准确:', e);
+      }
 
-    const localSkillNames = new Set(localSkills.map(s => s.name));
-    const localMcpNames = new Set(localMcps.map(m => m.name));
+      const localSkillNames = new Set(localSkills.map(s => s.name));
+      const localMcpNames = new Set(localMcps.map(m => m.name));
 
-    const skills: SelectableSkill[] = (selectedNode.data.skills || []).map(s => ({
-      ...s,
-      isDuplicate: localSkillNames.has(s.name),
-    }));
-    setSelectableSkills(skills);
+      const skills: SelectableSkill[] = (selectedNode.data.skills || []).map(s => ({
+        ...s,
+        isDuplicate: localSkillNames.has(s.name),
+      }));
+      setSelectableSkills(skills);
 
-    const mcps: SelectableMcp[] = (selectedNode.data.mcps || []).map(m => ({
-      ...(m as LanMcpItem),
-      isDuplicate: localMcpNames.has(m.name),
-    }));
-    setSelectableMcps(mcps);
+      const mcps: SelectableMcp[] = (selectedNode.data.mcps || []).map(m => ({
+        ...(m as LanMcpItem),
+        isDuplicate: localMcpNames.has(m.name),
+      }));
+      setSelectableMcps(mcps);
 
-    setStep(2);
+      setStep(2);
+    } finally {
+      setLoadingNext(false);
+    }
   };
 
   // ========== Step 5: 同步 ==========
@@ -213,7 +277,14 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
           .map(({ isDuplicate, ...rest }) => rest),
         mcps: selectableMcps
           .filter(m => selectedMcpNames.has(m.name) && !m.isDuplicate)
-          .map(({ isDuplicate, ...rest }) => rest),
+          .map(({ isDuplicate, ...rest }) => {
+            // 合并用户填写的 env 覆盖值
+            const overrides = envOverrides[rest.name];
+            if (overrides && rest.env) {
+              return { ...rest, env: { ...rest.env, ...overrides } };
+            }
+            return rest;
+          }),
         vendor: {
           enabled: createVendor,
           apiKey: vendorApiKey || undefined,
@@ -234,7 +305,38 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
     }
   };
 
+  // 获取 MCP 中被脱敏的 env key 列表（值为 ***）
+  const getMaskedEnvKeys = (mcp: SelectableMcp): string[] => {
+    if (!mcp.env) return [];
+    return Object.entries(mcp.env)
+      .filter(([, value]) => value === '***')
+      .map(([key]) => key);
+  };
+
+  // 设置某个 MCP 的 env 覆盖值
+  const setEnvValue = (mcpName: string, key: string, value: string) => {
+    setEnvOverrides(prev => ({
+      ...prev,
+      [mcpName]: { ...(prev[mcpName] || {}), [key]: value },
+    }));
+  };
+
+  // 检查所有选中的 MCP 的脱敏变量是否都已填写
+  const allMaskedEnvsFilled = (): boolean => {
+    for (const name of selectedMcpNames) {
+      const mcp = selectableMcps.find(m => m.name === name);
+      if (!mcp) continue;
+      const maskedKeys = getMaskedEnvKeys(mcp);
+      for (const key of maskedKeys) {
+        if (!envOverrides[name]?.[key]?.trim()) return false;
+      }
+    }
+    return true;
+  };
+
   const toggleSkill = (name: string) => {
+    const skill = selectableSkills.find(s => s.name === name);
+    if (skill?.isDuplicate) return;
     setSelectedSkillNames(prev => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
@@ -254,6 +356,8 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
   };
 
   const toggleMcp = (name: string) => {
+    const mcp = selectableMcps.find(m => m.name === name);
+    if (mcp?.isDuplicate) return;
     setSelectedMcpNames(prev => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
@@ -283,14 +387,14 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
       <button type="button" className="modal-close-btn" onClick={() => { if (!syncing) onClose(); }} aria-label="关闭">
         ×
       </button>
-      <div className="modal">
-        <div className="modal-container" style={{ maxWidth: '640px' }}>
+      <div className="modal" style={{ width: '720px', maxWidth: '90%' }}>
+        <div className="modal-container">
           <div className="modal-header">
             <h2>局域网内同步配置</h2>
           </div>
 
           {/* 步骤指示器 */}
-          <div style={{ display: 'flex', gap: '8px', padding: '0 24px', marginBottom: '20px', borderBottom: '1px solid var(--border-color)', paddingBottom: '12px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 24px', marginBottom: '20px', borderBottom: '1px solid var(--border-secondary)', paddingBottom: '12px' }}>
             {([1, 2, 3, 4, 5] as Step[]).map(s => (
               <span
                 key={s}
@@ -301,6 +405,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                   borderBottom: step === s ? '2px solid var(--primary-color)' : '2px solid transparent',
                   paddingBottom: '10px',
                   cursor: 'default',
+                  whiteSpace: 'nowrap',
                 }}
               >
                 {s < step ? '✓ ' : `${s} `}{STEP_LABELS[s]}
@@ -308,115 +413,281 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
             ))}
           </div>
 
-          <div style={{ padding: '0 24px', minHeight: '300px' }}>
+          <div style={{ padding: '0 24px', minHeight: '300px', position: 'relative' }}>
             {/* ========== Step 1: 扫描发现 ========== */}
             {step === 1 && (
               <div>
-                {scanning && (
-                  <div style={{ marginBottom: '16px' }}>
-                    <p style={{ fontSize: '14px', color: '#666', marginBottom: '8px' }}>
-                      正在扫描局域网... {scanProgress.current}/{scanProgress.total}
-                    </p>
-                    <div style={{
-                      width: '100%',
-                      height: '6px',
-                      background: 'var(--bg-secondary)',
-                      borderRadius: '3px',
-                      overflow: 'hidden',
-                    }}>
-                      <div style={{
-                        width: scanProgress.total > 0 ? `${(scanProgress.current / scanProgress.total * 100)}%` : '0%',
-                        height: '100%',
-                        background: 'var(--primary-color)',
-                        borderRadius: '3px',
-                        transition: 'width 0.3s ease',
-                      }} />
-                    </div>
-                  </div>
-                )}
-
-                {!scanning && discoveredNodes.length === 0 && (
-                  <div style={{ textAlign: 'center', padding: '40px 0', color: '#999' }}>
-                    <p style={{ fontSize: '16px', marginBottom: '8px' }}>未发现可用节点</p>
-                    <p style={{ fontSize: '14px' }}>请确认远端节点已开启"允许局域网拉取配置"，或手动输入 IP 地址</p>
-                  </div>
-                )}
-
-                {discoveredNodes.length > 0 && (
-                  <div style={{ marginBottom: '16px' }}>
-                    <p style={{ fontSize: '14px', color: '#666', marginBottom: '8px' }}>
-                      已发现 {discoveredNodes.length} 个节点：
-                    </p>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      {discoveredNodes.map(node => (
-                        <label
-                          key={`${node.ip}-${node.port}`}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '12px',
-                            padding: '12px',
-                            border: `2px solid ${selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-color)' : 'var(--border-color)'}`,
-                            borderRadius: '8px',
-                            cursor: 'pointer',
-                            background: selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-bg)' : 'transparent',
-                            transition: 'all 0.2s',
-                          }}
-                          onClick={() => setSelectedNode(node)}
-                        >
-                          <input
-                            type="radio"
-                            name="node"
-                            checked={selectedNode?.ip === node.ip && selectedNode?.port === node.port}
-                            onChange={() => setSelectedNode(node)}
-                            style={{ accentColor: 'var(--primary-color)' }}
-                          />
-                          <div style={{ flex: 1 }}>
-                            <div style={{ fontWeight: 500 }}>{node.data.node.name}</div>
-                            <div style={{ fontSize: '13px', color: '#666' }}>
-                              {node.ip}:{node.port}
-                              {node.data.skills?.length > 0 && ` · ${node.data.skills.length} Skills`}
-                              {node.data.mcps?.length > 0 && ` · ${node.data.mcps.length} MCP`}
-                            </div>
-                          </div>
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* 手动添加 */}
+                {/* 方式切换 */}
                 <div style={{
-                  borderTop: '1px solid var(--border-color)',
-                  paddingTop: '16px',
                   display: 'flex',
-                  gap: '8px',
-                  alignItems: 'center',
-                  flexWrap: 'wrap',
+                  gap: '24px',
+                  marginBottom: '20px',
                 }}>
-                  <span style={{ fontSize: '14px', color: '#666', whiteSpace: 'nowrap' }}>手动添加：</span>
-                  <input
-                    type="text"
-                    value={manualIp}
-                    onChange={e => setManualIp(e.target.value)}
-                    placeholder="192.168.1.xxx"
-                    style={{ flex: 1, minWidth: '140px', padding: '6px 10px', borderRadius: '6px', border: '1px solid var(--border-color)', background: 'var(--input-bg, var(--bg-secondary))', color: 'var(--text-primary)' }}
-                  />
-                  <input
-                    type="text"
-                    value={manualPort}
-                    onChange={e => setManualPort(e.target.value)}
-                    placeholder="4567"
-                    style={{ width: '70px', padding: '6px 10px', borderRadius: '6px', border: '1px solid var(--border-color)', background: 'var(--input-bg, var(--bg-secondary))', color: 'var(--text-primary)' }}
-                  />
-                  <button
-                    className="btn btn-secondary"
-                    onClick={handleManualConnect}
-                    disabled={manualConnecting || !manualIp.trim()}
-                  >
-                    {manualConnecting ? '连接中...' : '连接'}
-                  </button>
+                  {(['scan', 'manual'] as const).map(mode => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setScanMode(mode)}
+                      style={{
+                        padding: '8px 4px',
+                        background: 'none',
+                        border: 'none',
+                        borderBottom: scanMode === mode ? '2px solid var(--primary-color)' : 'none',
+                        color: scanMode === mode ? 'var(--primary-color)' : 'var(--text-muted)',
+                        fontWeight: scanMode === mode ? 500 : 400,
+                        fontSize: '14px',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s',
+                      }}
+                    >
+                      {mode === 'scan' ? '局域网扫描' : '手动添加'}
+                    </button>
+                  ))}
                 </div>
+
+                {/* 局域网扫描模式 */}
+                {scanMode === 'scan' && (
+                  <>
+                    {/* 本机网络信息 */}
+                    {networkInterfaces.length > 0 && (
+                      <div style={{
+                        marginBottom: '16px',
+                        padding: '10px 14px',
+                        background: 'var(--accent-light)',
+                        borderRadius: '8px',
+                        fontSize: '13px',
+                        color: 'var(--text-secondary)',
+                      }}>
+                        <span style={{ fontWeight: 500, color: 'var(--accent-primary)' }}>本机</span>
+                        {' · '}
+                        {networkInterfaces.map(i => i.address).join('、')}
+                        {' · '}
+                        端口 {localPort}
+                        {networkInterfaces.length > 1 && (
+                          <>
+                            {' · '}
+                            {networkInterfaces.map((iface, idx) => (
+                              <span key={iface.subnet}>
+                                {idx > 0 ? ' / ' : ''}
+                                <button
+                                  type="button"
+                                  onClick={() => handleSubnetChange(iface.subnet)}
+                                  disabled={scanning}
+                                  style={{
+                                    padding: 0,
+                                    border: 'none',
+                                    background: 'none',
+                                    color: selectedSubnet === iface.subnet ? 'var(--primary-color)' : 'var(--text-muted)',
+                                    fontSize: '12px',
+                                    fontWeight: selectedSubnet === iface.subnet ? 600 : 400,
+                                    cursor: scanning ? 'not-allowed' : 'pointer',
+                                    textDecoration: selectedSubnet === iface.subnet ? 'underline' : 'none',
+                                  }}
+                                >
+                                  {iface.subnet}.0/{iface.netmask}
+                                </button>
+                              </span>
+                            ))}
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {scanning && (
+                      <div style={{ marginBottom: '16px' }}>
+                        <p style={{ fontSize: '14px', color: '#666', marginBottom: '8px' }}>
+                          正在扫描 {selectedSubnet}.0 网段... {scanProgress.current}/{scanProgress.total}
+                        </p>
+                        <div style={{
+                          width: '100%',
+                          height: '6px',
+                          background: 'var(--bg-secondary)',
+                          borderRadius: '3px',
+                          overflow: 'hidden',
+                        }}>
+                          <div style={{
+                            width: scanProgress.total > 0 ? `${(scanProgress.current / scanProgress.total * 100)}%` : '0%',
+                            height: '100%',
+                            background: 'var(--primary-color)',
+                            borderRadius: '3px',
+                            transition: 'width 0.3s ease',
+                          }} />
+                        </div>
+                      </div>
+                    )}
+
+                    {!scanning && hasScanned && discoveredNodes.length === 0 && (
+                      <div style={{ textAlign: 'center', padding: '40px 0', color: '#999' }}>
+                        <p style={{ fontSize: '16px', marginBottom: '8px' }}>未发现可用节点</p>
+                        <p style={{ fontSize: '14px', marginBottom: '12px' }}>请确认远端节点已开启"允许局域网拉取配置"</p>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ fontSize: '13px', padding: '6px 16px' }}
+                          onClick={handleRescan}
+                        >
+                          重新扫描
+                        </button>
+                      </div>
+                    )}
+
+                    {discoveredNodes.length > 0 && (
+                      <div style={{ marginBottom: '16px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                          <p style={{ fontSize: '14px', color: '#666' }}>
+                            已发现 {discoveredNodes.length} 个节点：
+                          </p>
+                          {!scanning && hasScanned && (
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ fontSize: '12px', padding: '4px 10px' }}
+                              onClick={handleRescan}
+                            >
+                              重新扫描
+                            </button>
+                          )}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          {discoveredNodes.map(node => (
+                            <label
+                              key={`${node.ip}-${node.port}`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '12px',
+                                padding: '12px',
+                                border: `2px solid ${selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-color)' : 'var(--border-secondary)'}`,
+                                borderRadius: '8px',
+                                cursor: 'pointer',
+                                background: selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-bg)' : 'transparent',
+                                transition: 'all 0.2s',
+                              }}
+                              onClick={() => setSelectedNode(node)}
+                            >
+                              <input
+                                type="radio"
+                                name="node"
+                                checked={selectedNode?.ip === node.ip && selectedNode?.port === node.port}
+                                onChange={() => setSelectedNode(node)}
+                                style={{ accentColor: 'var(--primary-color)' }}
+                              />
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontWeight: 500 }}>{node.data.node.name}</div>
+                                <div style={{ fontSize: '13px', color: '#666' }}>
+                                  {node.ip}:{node.port}
+                                  {node.data.skills?.length > 0 && ` · ${node.data.skills.length} Skills`}
+                                  {node.data.mcps?.length > 0 && ` · ${node.data.mcps.length} MCP`}
+                                </div>
+                              </div>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* 加载中遮罩 */}
+                {loadingNext && (
+                  <div style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    background: 'rgba(255, 255, 255, 0.7)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: '8px',
+                    zIndex: 10,
+                  }}>
+                    <div style={{
+                      width: '32px',
+                      height: '32px',
+                      border: '3px solid var(--border-secondary)',
+                      borderTop: '3px solid var(--primary-color)',
+                      borderRadius: '50%',
+                      animation: 'spin 1s linear infinite',
+                      marginBottom: '12px',
+                    }} />
+                    <p style={{ fontSize: '14px', color: 'var(--text-secondary)' }}>正在准备数据...</p>
+                    <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                  </div>
+                )}
+
+                {/* 手动添加模式 */}
+                {scanMode === 'manual' && (
+                  <div style={{ padding: '20px 0' }}>
+                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '16px' }}>
+                      <input
+                        type="text"
+                        value={manualIp}
+                        onChange={e => setManualIp(e.target.value)}
+                        placeholder="IP 地址，如 192.168.1.100"
+                        style={{ flex: 1, padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border-secondary)', background: 'var(--input-bg, var(--bg-card))', color: 'var(--text-primary)', fontSize: '14px' }}
+                      />
+                      <input
+                        type="text"
+                        value={manualPort}
+                        onChange={e => setManualPort(e.target.value)}
+                        placeholder="端口"
+                        style={{ width: '80px', padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border-secondary)', background: 'var(--input-bg, var(--bg-card))', color: 'var(--text-primary)', fontSize: '14px' }}
+                      />
+                      <button
+                        className="btn btn-primary"
+                        onClick={handleManualConnect}
+                        disabled={manualConnecting || !manualIp.trim()}
+                      >
+                        {manualConnecting ? '连接中...' : '连接'}
+                      </button>
+                    </div>
+
+                    {discoveredNodes.length > 0 && (
+                      <div>
+                        <p style={{ fontSize: '14px', color: '#666', marginBottom: '8px' }}>
+                          已发现的节点：
+                        </p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          {discoveredNodes.map(node => (
+                            <label
+                              key={`${node.ip}-${node.port}`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '12px',
+                                padding: '12px',
+                                border: `2px solid ${selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-color)' : 'var(--border-secondary)'}`,
+                                borderRadius: '8px',
+                                cursor: 'pointer',
+                                background: selectedNode?.ip === node.ip && selectedNode?.port === node.port ? 'var(--primary-bg)' : 'transparent',
+                                transition: 'all 0.2s',
+                              }}
+                              onClick={() => setSelectedNode(node)}
+                            >
+                              <input
+                                type="radio"
+                                name="node"
+                                checked={selectedNode?.ip === node.ip && selectedNode?.port === node.port}
+                                onChange={() => setSelectedNode(node)}
+                                style={{ accentColor: 'var(--primary-color)' }}
+                              />
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontWeight: 500 }}>{node.data.node.name}</div>
+                                <div style={{ fontSize: '13px', color: '#666' }}>
+                                  {node.ip}:{node.port}
+                                  {node.data.skills?.length > 0 && ` · ${node.data.skills.length} Skills`}
+                                  {node.data.mcps?.length > 0 && ` · ${node.data.mcps.length} MCP`}
+                                </div>
+                              </div>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -450,7 +721,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                           alignItems: 'flex-start',
                           gap: '10px',
                           padding: '10px 12px',
-                          border: `1px solid ${skill.isDuplicate ? '#f0ad4e' : 'var(--border-color)'}`,
+                          border: `1px solid ${skill.isDuplicate ? '#f0ad4e' : 'var(--border-secondary)'}`,
                           borderRadius: '8px',
                           cursor: skill.isDuplicate ? 'not-allowed' : 'pointer',
                           opacity: skill.isDuplicate ? 0.7 : 1,
@@ -507,46 +778,80 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                   </div>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '360px', overflowY: 'auto' }}>
-                    {selectableMcps.map(mcp => (
-                      <label
-                        key={mcp.name}
-                        style={{
+                    {selectableMcps.map(mcp => {
+                      const maskedKeys = getMaskedEnvKeys(mcp);
+                      const isSelected = selectedMcpNames.has(mcp.name);
+                      const showEnvForm = isSelected && maskedKeys.length > 0;
+                      return (
+                      <div key={mcp.name} style={{
+                        border: `1px solid ${mcp.isDuplicate ? '#f0ad4e' : 'var(--border-secondary)'}`,
+                        borderRadius: '8px',
+                        opacity: mcp.isDuplicate ? 0.7 : 1,
+                        background: mcp.isDuplicate ? 'var(--bg-secondary)' : 'transparent',
+                        overflow: 'hidden',
+                      }}>
+                        <label style={{
                           display: 'flex',
                           alignItems: 'flex-start',
                           gap: '10px',
                           padding: '10px 12px',
-                          border: `1px solid ${mcp.isDuplicate ? '#f0ad4e' : 'var(--border-color)'}`,
-                          borderRadius: '8px',
                           cursor: mcp.isDuplicate ? 'not-allowed' : 'pointer',
-                          opacity: mcp.isDuplicate ? 0.7 : 1,
-                          background: mcp.isDuplicate ? 'var(--bg-secondary)' : 'transparent',
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedMcpNames.has(mcp.name)}
-                          onChange={() => toggleMcp(mcp.name)}
-                          disabled={mcp.isDuplicate}
-                          style={{ accentColor: 'var(--primary-color)', marginTop: '2px' }}
-                        />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span style={{ fontWeight: 500 }}>{mcp.name}</span>
-                            <span style={{ fontSize: '11px', padding: '1px 6px', borderRadius: '4px', background: 'var(--bg-secondary)', color: '#666' }}>
-                              {mcp.type}
-                            </span>
-                          </div>
-                          {mcp.description && (
-                            <div style={{ fontSize: '13px', color: '#666', marginTop: '2px' }}>{mcp.description}</div>
-                          )}
-                          {mcp.isDuplicate && (
-                            <div style={{ fontSize: '12px', color: '#e67e22', marginTop: '4px' }}>
-                              ⚠ 本地已存在，无法重复同步
+                        }}>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleMcp(mcp.name)}
+                            disabled={mcp.isDuplicate}
+                            style={{ accentColor: 'var(--primary-color)', marginTop: '2px' }}
+                          />
+                          <div style={{ flex: 1 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontWeight: 500 }}>{mcp.name}</span>
+                              <span style={{ fontSize: '11px', padding: '1px 6px', borderRadius: '4px', background: 'var(--bg-secondary)', color: '#666' }}>
+                                {mcp.type}
+                              </span>
+                              {maskedKeys.length > 0 && !mcp.isDuplicate && (
+                                <span style={{ fontSize: '11px', padding: '1px 6px', borderRadius: '4px', background: '#fff3e0', color: '#e67e22' }}>
+                                  含敏感变量
+                                </span>
+                              )}
                             </div>
-                          )}
-                        </div>
-                      </label>
-                    ))}
+                            {mcp.description && (
+                              <div style={{ fontSize: '13px', color: '#666', marginTop: '2px' }}>{mcp.description}</div>
+                            )}
+                            {mcp.isDuplicate && (
+                              <div style={{ fontSize: '12px', color: '#e67e22', marginTop: '4px' }}>
+                                ⚠ 本地已存在，无法重复同步
+                              </div>
+                            )}
+                          </div>
+                        </label>
+                        {showEnvForm && (
+                          <div style={{
+                            padding: '8px 12px 12px 36px',
+                            borderTop: '1px dashed var(--border-secondary)',
+                            background: 'var(--bg-secondary)',
+                          }}>
+                            <p style={{ fontSize: '12px', color: '#e67e22', marginBottom: '8px' }}>
+                              以下环境变量需要手动填写：
+                            </p>
+                            {maskedKeys.map(key => (
+                              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                                <span style={{ fontSize: '12px', color: '#666', minWidth: '120px', fontFamily: 'monospace' }}>{key}</span>
+                                <input
+                                  type="text"
+                                  value={envOverrides[mcp.name]?.[key] || ''}
+                                  onChange={e => setEnvValue(mcp.name, key, e.target.value)}
+                                  placeholder={`请输入 ${key}`}
+                                  style={{ flex: 1, padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--border-secondary)', background: 'var(--input-bg, #fff)', color: 'var(--text-primary)', fontSize: '12px' }}
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -585,7 +890,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                 {createVendor && (
                   <div style={{
                     padding: '16px',
-                    border: '1px solid var(--border-color)',
+                    border: '1px solid var(--border-secondary)',
                     borderRadius: '8px',
                     marginBottom: '12px',
                   }}>
@@ -601,7 +906,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                         width: '100%',
                         padding: '8px 12px',
                         borderRadius: '6px',
-                        border: '1px solid var(--border-color)',
+                        border: '1px solid var(--border-secondary)',
                         background: 'var(--input-bg, var(--bg-secondary))',
                         color: 'var(--text-primary)',
                         boxSizing: 'border-box',
@@ -616,7 +921,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                 {createVendor && (
                   <p style={{ fontSize: '13px', color: '#666' }}>
                     将创建供应商 <strong>{selectedNode?.data.node.name}@{selectedNode?.ip}</strong>，
-                    包含 {selectedNode?.data.vendors?.reduce((sum, v) => sum + (v.services?.length || 0), 0) || 0} 个 API 服务。
+                    包含 6 个 API 服务（Claude Code、Codex、Claude、Responses、Chat Completions、Gemini）。
                   </p>
                 )}
 
@@ -664,11 +969,20 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                     <div style={{ paddingLeft: '8px' }}>
                       {selectableMcps
                         .filter(m => selectedMcpNames.has(m.name))
-                        .map(m => (
+                        .map(m => {
+                          const maskedKeys = getMaskedEnvKeys(m);
+                          const hasUnfilled = maskedKeys.some(k => !envOverrides[m.name]?.[k]?.trim());
+                          return (
                           <div key={m.name} style={{ fontSize: '14px', padding: '2px 0' }}>
                             · {m.name} ({m.type})
+                            {maskedKeys.length > 0 && (
+                              <span style={{ fontSize: '12px', color: hasUnfilled ? '#e74c3c' : '#e67e22', marginLeft: '6px' }}>
+                                {hasUnfilled ? `⚠ ${maskedKeys.length} 个敏感变量未填写` : `✓ 敏感变量已填写`}
+                              </span>
+                            )}
                           </div>
-                        ))}
+                          );
+                        })}
                     </div>
                   )}
                 </div>
@@ -680,9 +994,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                     <div style={{ paddingLeft: '8px' }}>
                       <div style={{ fontSize: '14px' }}>名称：{selectedNode?.data.node.name}@{selectedNode?.ip}</div>
                       <div style={{ fontSize: '14px' }}>API Key：{vendorApiKey ? '已填写' : '未填写'}</div>
-                      <div style={{ fontSize: '14px' }}>
-                        API 服务：{selectedNode?.data.vendors?.reduce((sum, v) => sum + (v.services?.length || 0), 0) || 0} 个
-                      </div>
+                      <div style={{ fontSize: '14px' }}>API 服务：6 个（Claude Code、Codex、Claude、Responses、Chat Completions、Gemini）</div>
                     </div>
                   ) : (
                     <p style={{ fontSize: '13px', color: '#999', paddingLeft: '8px' }}>不创建</p>
@@ -703,7 +1015,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                 <div style={{
                   width: '40px',
                   height: '40px',
-                  border: '3px solid var(--border-color)',
+                  border: '3px solid var(--border-secondary)',
                   borderTop: '3px solid var(--primary-color)',
                   borderRadius: '50%',
                   animation: 'spin 1s linear infinite',
@@ -717,7 +1029,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
 
           {/* 底部按钮 */}
           <div className="modal-footer" style={{ marginTop: '20px' }}>
-            {step > 1 && step < 5 && (
+            {step > 1 && (step < 5 || !syncing) && (
               <button
                 type="button"
                 className="btn btn-secondary"
@@ -737,9 +1049,9 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
                 type="button"
                 className="btn btn-primary"
                 onClick={handleNodeSelectedAndNext}
-                disabled={!selectedNode}
+                disabled={!selectedNode || loadingNext}
               >
-                下一步 →
+                {loadingNext ? '加载中...' : '下一步 →'}
               </button>
             )}
             {step === 2 && (
@@ -748,7 +1060,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
               </button>
             )}
             {step === 3 && (
-              <button type="button" className="btn btn-primary" onClick={() => setStep(4)}>
+              <button type="button" className="btn btn-primary" onClick={() => setStep(4)} disabled={!allMaskedEnvsFilled()}>
                 下一步 →
               </button>
             )}

@@ -202,7 +202,7 @@ interface BackendAPI {
   getQuotaAlerts: () => Promise<QuotaAlert[]>;
 
   // 局域网同步
-  lanScan: () => Promise<{ localIp: string; subnet: string; port: number }>;
+  lanScan: () => Promise<{ localIp: string; subnet: string; port: number; networkInterfaces: Array<{ name: string; address: string; subnet: string; netmask: string }> }>;
   lanDiscover: (ip: string, port: number) => Promise<LanDiscoverResponse>;
   lanSync: (data: LanSyncRequest) => Promise<LanSyncResult>;
 }
