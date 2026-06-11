@@ -321,19 +321,6 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
     }));
   };
 
-  // 检查所有选中的 MCP 的脱敏变量是否都已填写
-  const allMaskedEnvsFilled = (): boolean => {
-    for (const name of selectedMcpNames) {
-      const mcp = selectableMcps.find(m => m.name === name);
-      if (!mcp) continue;
-      const maskedKeys = getMaskedEnvKeys(mcp);
-      for (const key of maskedKeys) {
-        if (!envOverrides[name]?.[key]?.trim()) return false;
-      }
-    }
-    return true;
-  };
-
   const toggleSkill = (name: string) => {
     const skill = selectableSkills.find(s => s.name === name);
     if (skill?.isDuplicate) return;
@@ -1060,7 +1047,7 @@ export default function SyncConfigModal({ show, onClose, onComplete }: SyncConfi
               </button>
             )}
             {step === 3 && (
-              <button type="button" className="btn btn-primary" onClick={() => setStep(4)} disabled={!allMaskedEnvsFilled()}>
+              <button type="button" className="btn btn-primary" onClick={() => setStep(4)}>
                 下一步 →
               </button>
             )}

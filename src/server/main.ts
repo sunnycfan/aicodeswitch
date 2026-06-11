@@ -1985,13 +1985,14 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
       const remoteBaseUrl = `http://${remoteNode.ip}:${remoteNode.port}`;
 
       // 固定的代理路径到 API 服务映射
-      const LAN_PROXY_SERVICES: Array<{ name: string; sourceType: SourceType; apiPath: string }> = [
-        { name: 'Claude Code', sourceType: 'claude', apiPath: '/claude-code' },
-        { name: 'Codex', sourceType: 'openai', apiPath: '/codex' },
-        { name: 'Claude 标准接口', sourceType: 'claude', apiPath: '/v1/messages' },
-        { name: 'Responses 标准接口', sourceType: 'openai', apiPath: '/v1/responses' },
-        { name: 'Chat Completions 标准接口', sourceType: 'openai-chat', apiPath: '/v1/chat/completions' },
-        { name: 'Gemini 标准接口', sourceType: 'gemini', apiPath: '/v1beta/models' },
+      // 规则：Claude/Responses/Gemini 标准接口只填 baseurl，Chat Completions 需完整路径
+      const LAN_PROXY_SERVICES: Array<{ name: string; sourceType: SourceType; apiUrl: string }> = [
+        { name: 'Claude Code', sourceType: 'claude', apiUrl: `${remoteBaseUrl}/claude-code` },
+        { name: 'Codex', sourceType: 'openai', apiUrl: `${remoteBaseUrl}/codex` },
+        { name: 'Claude 标准接口', sourceType: 'claude', apiUrl: remoteBaseUrl },
+        { name: 'Responses 标准接口', sourceType: 'openai', apiUrl: remoteBaseUrl },
+        { name: 'Chat Completions 标准接口', sourceType: 'openai-chat', apiUrl: `${remoteBaseUrl}/v1/chat/completions` },
+        { name: 'Gemini 标准接口', sourceType: 'gemini', apiUrl: remoteBaseUrl },
       ];
 
       // 检查供应商是否已存在
@@ -1999,7 +2000,7 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
       if (!existingVendor) {
         const services: Omit<APIService, 'id' | 'createdAt' | 'updatedAt'>[] = LAN_PROXY_SERVICES.map(svc => ({
           name: svc.name,
-          apiUrl: `${remoteBaseUrl}${svc.apiPath}`,
+          apiUrl: svc.apiUrl,
           apiKey: vendor.apiKey || '',
           sourceType: svc.sourceType,
           enableProxy: false,
