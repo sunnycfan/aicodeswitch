@@ -9,7 +9,7 @@
     windows_subsystem = "windows"
 )]
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -193,29 +193,10 @@ async fn start_server(
             .arg(&server_path)
             .current_dir(&resource_root)
             .env("PORT", port.to_string())
-            .env("NODE_ENV", "production");
-
-        // 将 Node.js 子进程的 stdout/stderr 重定向到启动日志文件
-        let node_log_path = log_file_path();
-        match std::fs::OpenOptions::new().append(true).open(&node_log_path) {
-            Ok(log_file) => {
-                let child_stdin = std::process::Stdio::null();
-                command.stdin(child_stdin);
-                match log_file.try_clone() {
-                    Ok(log_copy) => {
-                        command.stdout(log_file);
-                        command.stderr(log_copy);
-                        debug_log("✓ Node.js 输出将写入启动日志");
-                    }
-                    Err(e) => {
-                        debug_log(&format!("⚠ 无法复制日志文件句柄: {}, stdout/stderr 将丢失", e));
-                    }
-                }
-            }
-            Err(e) => {
-                debug_log(&format!("⚠ 无法打开日志文件: {}, stdout/stderr 将丢失", e));
-            }
-        }
+            .env("NODE_ENV", "production")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         // Windows 下隐藏控制台窗口
         #[cfg(target_os = "windows")]
@@ -226,7 +207,7 @@ async fn start_server(
 
         debug_log(&format!("执行: {} {} (PORT={}, NODE_ENV=production)", node_path, server_path.display(), port));
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| {
                 let err = format!("Failed to start Node.js server: {}", e);
@@ -236,6 +217,25 @@ async fn start_server(
 
         let pid = child.id();
         debug_log(&format!("✓ Node.js 进程已启动 (PID: {})", pid));
+
+        // 后台线程：将 Node.js stdout/stderr 逐行写入启动日志
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    debug_log(&format!("[node:out] {}", line));
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    debug_log(&format!("[node:err] {}", line));
+                }
+            });
+        }
+
         server.process = Some(child);
     }
 
@@ -355,20 +355,32 @@ async fn wait_for_server(app: &AppHandle, port: u16) -> Result<(), String> {
     let max_attempts = 30;
 
     for attempt in 1..=max_attempts {
-        match reqwest::get(&health_url).await {
-            Ok(response) if response.status().is_success() => {
+        // 每次健康检查最多等 2 秒，防止 reqwest 永久阻塞
+        let check_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reqwest::get(&health_url),
+        ).await;
+
+        match check_result {
+            Ok(Ok(response)) if response.status().is_success() => {
                 debug_log(&format!("✓ 服务就绪! (第 {}/{} 次尝试)", attempt, max_attempts));
                 return Ok(());
             }
-            Ok(response) => {
+            Ok(Ok(response)) => {
                 let status = response.status();
                 if attempt <= 3 || attempt % 6 == 0 {
                     debug_log(&format!("健康检查返回 {} (第 {}/{} 次)", status, attempt, max_attempts));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if attempt <= 3 || attempt % 6 == 0 {
                     debug_log(&format!("健康检查失败: {} (第 {}/{} 次)", e, attempt, max_attempts));
+                }
+            }
+            Err(_) => {
+                // timeout
+                if attempt <= 3 || attempt % 6 == 0 {
+                    debug_log(&format!("健康检查超时 (2s) (第 {}/{} 次)", attempt, max_attempts));
                 }
             }
         }
