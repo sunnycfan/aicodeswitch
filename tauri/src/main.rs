@@ -400,6 +400,35 @@ async fn wait_for_server(app: &AppHandle, port: u16) -> Result<(), String> {
     Err(err)
 }
 
+/// 验证后端数据就绪（健康检查通过后调用，确保 API 可正常返回数据）
+async fn verify_data_ready(port: u16) -> bool {
+    let ready_url = format!("http://localhost:{}/api/ready", port);
+    debug_log(&format!("正在验证数据就绪: {} ...", ready_url));
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::get(&ready_url),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => {
+            debug_log("✓ 数据就绪验证通过");
+            true
+        }
+        Ok(Ok(response)) => {
+            debug_log(&format!("⚠ 数据就绪验证返回 {}", response.status()));
+            false
+        }
+        Ok(Err(e)) => {
+            debug_log(&format!("⚠ 数据就绪验证请求失败: {}", e));
+            false
+        }
+        Err(_) => {
+            debug_log("⚠ 数据就绪验证超时 (5s)");
+            false
+        }
+    }
+}
+
 /// 快速探测服务器是否已运行（1-2 秒内）
 async fn is_server_ready(port: u16) -> bool {
     let health_url = format!("http://localhost:{}/health", port);
@@ -473,6 +502,8 @@ fn main() {
                 // 先检测是否已有服务在运行
                 if is_server_ready(port).await {
                     debug_log(&format!("检测到已有服务运行 → 导航到 {}", server_url));
+                    let _ = app_handle.emit("startup-log", "正在验证数据就绪...");
+                    let _ = verify_data_ready(port).await;
                     let _ = app_handle.emit("startup-log", "检测到已有服务运行，正在加载...");
                     match window.navigate(server_url.parse().unwrap()) {
                         Ok(_) => debug_log("✓ 导航成功"),
@@ -485,6 +516,8 @@ fn main() {
                 match start_server(&app_handle, &state, port).await {
                     Ok(_) => {
                         debug_log(&format!("服务启动成功 → 导航到 {}", server_url));
+                        let _ = app_handle.emit("startup-log", "正在验证数据就绪...");
+                        let _ = verify_data_ready(port).await;
                         let _ = app_handle.emit("startup-log", "服务已就绪，正在加载...");
                         match window.navigate(server_url.parse().unwrap()) {
                             Ok(_) => debug_log("✓ 导航成功"),
