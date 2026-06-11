@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-11: 修复 Codex 经第三方 Responses API 报 `unknown tool type: custom`
+
+### 修复
+- 修复 Codex 经「Responses 标准接口」转发至第三方提供商（火山方舟/豆包等）时，上游返回 400 `unknown tool type: custom` 的问题
+- 根因：`downgradeResponsesRequest`（responses→responses 降级兼容，负责剥离 OpenAI 私有工具与非标准字段）被 `if (sanitizeBody)` 门控，而 `proxy-server.ts` 两处请求转换入口（`transformRequestToUpstream` / `transformRequestByFormat`）从未传入 `sanitizeBody`，导致整个降级路径为死代码，`apply_patch`(`type:custom`)、MCP(`type:namespace`)、`tool_search`、`web_search` 等私有工具被原样转发
+- 现在仅在 responses→responses 直连「非 OpenAI 官方端点」时开启降级（新增 `isOfficialOpenAiApi` 判定 `api.openai.com` / `*.openai.azure.com`），避免误伤直连官方 OpenAI 的场景
+- 工具过滤由黑名单改为 `function` 白名单，与原注释「仅保留 function 类型」一致，顺带覆盖此前遗漏的 `namespace` 类型
+
 ## 2026-06-11: 优化清空日志与清除会话功能
 
 ### 新增

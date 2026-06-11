@@ -6,13 +6,12 @@
  */
 
 /**
- * Responses API 非标准 tool 类型集合。
- * OpenAI 私有扩展（custom、tool_search、web_search 等），
- * 其他 Responses API 提供商不支持这些类型，直接转发会导致 400 错误。
+ * 第三方 Responses API 提供商仅支持 function 类型工具。
+ * OpenAI 私有扩展（apply_patch 的 custom、MCP 的 namespace、
+ * tool_search、web_search、file_search、code_interpreter 等）一律剥离，
+ * 直接转发会导致 400 `unknown tool type` 错误。
+ * 采用 function 白名单而非黑名单，避免新增私有类型时遗漏。
  */
-const NON_STANDARD_TOOL_TYPES = new Set([
-  'custom', 'tool_search', 'web_search', 'file_search', 'code_interpreter',
-]);
 
 /**
  * Responses API 降级兼容时需移除的顶层字段集合。
@@ -67,9 +66,9 @@ export function downgradeResponsesRequest(body: any): any {
     return sanitized;
   };
 
-  // 1. 过滤掉非标准 tool 类型，仅保留 function 类型
+  // 1. 仅保留 function 类型工具，剥离 custom/namespace/tool_search/web_search 等私有类型
   if (Array.isArray(body.tools)) {
-    const filteredTools = body.tools.filter((t: any) => !NON_STANDARD_TOOL_TYPES.has(t.type));
+    const filteredTools = body.tools.filter((t: any) => t && t.type === 'function');
     if (filteredTools.length !== body.tools.length) {
       sanitized = { ...sanitized, tools: filteredTools };
     }
