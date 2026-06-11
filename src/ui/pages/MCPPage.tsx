@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import type { MCPServer, TargetType } from '../../types';
 import { toast } from '../components/Toast';
+import { Switch } from '../components/Switch';
 
 interface MCPFormData {
   name: string;
@@ -428,8 +429,26 @@ function MCPPage() {
           {mcps.map((mcp) => (
             <div className="card mcp-card" key={mcp.id} style={{ display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px' }}>
-                <div className="mcp-title" style={{ flex: 1 }}>{mcp.name}</div>
-                <div className="badge badge-secondary">{getTypeLabel(mcp.type)}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: 0 }}>
+                  <div className="mcp-title" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{mcp.name}</div>
+                  <div className="badge badge-secondary">{getTypeLabel(mcp.type)}</div>
+                </div>
+                <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => openEditModal(mcp)}
+                    style={{ padding: '6px 14px', fontSize: '13px' }}
+                  >
+                    编辑
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    onClick={() => openDeleteConfirm(mcp)}
+                    style={{ padding: '6px 14px', fontSize: '13px' }}
+                  >
+                    删除
+                  </button>
+                </div>
               </div>
               {mcp.description && (
                 <div className="mcp-description" style={{ marginTop: '12px', color: 'var(--text-muted)', fontSize: '14px' }}>
@@ -449,56 +468,34 @@ function MCPPage() {
                   URL: {mcp.url}
                 </div>
               )}
-              <div style={{ marginTop: 'auto', paddingTop: '16px', borderTop: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div style={{ display: 'flex', gap: '16px', fontSize: '14px' }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={mcp.targets?.includes('claude-code')}
-                      onChange={async (e) => {
-                        const targets = mcp.targets || [];
-                        const newTargets = e.target.checked
-                          ? [...targets, 'claude-code'] as TargetType[]
-                          : targets.filter((t) => t !== 'claude-code');
-                        await api.updateMCP(mcp.id, { targets: newTargets });
-                        await loadMCPs();
-                      }}
-                      style={{ width: '16px', height: '16px', cursor: 'pointer' }}
-                    />
-                    <span>Claude Code</span>
-                  </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                    <input
-                      type="checkbox"
-                      checked={mcp.targets?.includes('codex')}
-                      onChange={async (e) => {
-                        const targets = mcp.targets || [];
-                        const newTargets = e.target.checked
-                          ? [...targets, 'codex'] as TargetType[]
-                          : targets.filter((t) => t !== 'codex');
-                        await api.updateMCP(mcp.id, { targets: newTargets });
-                        await loadMCPs();
-                      }}
-                      style={{ width: '16px', height: '16px', cursor: 'pointer' }}
-                    />
-                    <span>Codex</span>
-                  </label>
-                </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => openEditModal(mcp)}
-                    style={{ padding: '6px 12px', fontSize: '12px' }}
-                  >
-                    编辑
-                  </button>
-                  <button
-                    className="btn btn-danger"
-                    onClick={() => openDeleteConfirm(mcp)}
-                    style={{ padding: '6px 12px', fontSize: '12px' }}
-                  >
-                    删除
-                  </button>
+              <div style={{ marginTop: 'auto', paddingTop: '16px', borderTop: '1px solid var(--border-color)', display: 'flex', alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: '24px' }}>
+                  <Switch
+                    checked={mcp.targets?.includes('claude-code') ?? false}
+                    onChange={async (checked) => {
+                      const targets = mcp.targets || [];
+                      const newTargets = checked
+                        ? [...targets, 'claude-code'] as TargetType[]
+                        : targets.filter((t) => t !== 'claude-code');
+                      await api.updateMCP(mcp.id, { targets: newTargets });
+                      await loadMCPs();
+                    }}
+                    label="Claude Code"
+                    labelPosition="right"
+                  />
+                  <Switch
+                    checked={mcp.targets?.includes('codex') ?? false}
+                    onChange={async (checked) => {
+                      const targets = mcp.targets || [];
+                      const newTargets = checked
+                        ? [...targets, 'codex'] as TargetType[]
+                        : targets.filter((t) => t !== 'codex');
+                      await api.updateMCP(mcp.id, { targets: newTargets });
+                      await loadMCPs();
+                    }}
+                    label="Codex"
+                    labelPosition="right"
+                  />
                 </div>
               </div>
             </div>
