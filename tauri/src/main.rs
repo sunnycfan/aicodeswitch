@@ -11,7 +11,7 @@
 
 use std::process::{Child, Command};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -117,6 +117,8 @@ async fn start_server(
         }
 
         let resource_root = get_resource_root(app)?;
+
+        let _ = app.emit("startup-log", "正在定位服务文件...");
         let server_path = resource_root.join("dist").join("server").join("main.js");
 
         if !server_path.exists() {
@@ -124,6 +126,8 @@ async fn start_server(
         }
 
         let node_path = get_node_executable();
+        let _ = app.emit("startup-log", format!("正在启动服务 (端口: {})...", port));
+
         let mut command = Command::new(&node_path);
         command
             .arg(&server_path)
@@ -147,7 +151,8 @@ async fn start_server(
     }
 
     // 等待服务器就绪
-    wait_for_server(port).await
+    let _ = app.emit("startup-log", "正在等待服务就绪...");
+    wait_for_server(app, port).await
 }
 
 /// 通过 HTTP /api/shutdown 优雅停止服务器，失败则强制终止
@@ -218,7 +223,7 @@ async fn stop_server(state: &State<'_, Mutex<ServerProcess>>, port: u16) {
 // ── 健康检查 ─────────────────────────────────────────────
 
 /// 轮询 /health 端点，等待服务器就绪（最多 15 秒）
-async fn wait_for_server(port: u16) -> Result<(), String> {
+async fn wait_for_server(app: &AppHandle, port: u16) -> Result<(), String> {
     let health_url = format!("http://localhost:{}/health", port);
     let max_attempts = 30;
 
@@ -229,8 +234,9 @@ async fn wait_for_server(port: u16) -> Result<(), String> {
                 return Ok(());
             }
             _ => {
-                if attempt % 6 == 0 {
-                    println!("Waiting... attempt {}/{}", attempt, max_attempts);
+                if attempt % 4 == 0 {
+                    let msg = format!("等待服务启动中... ({}/{})", attempt, max_attempts);
+                    let _ = app.emit("startup-log", msg);
                 }
             }
         }
@@ -290,9 +296,12 @@ fn main() {
                 let state = app_handle.state::<Mutex<ServerProcess>>();
                 let server_url = format!("http://localhost:{}", port);
 
+                let _ = app_handle.emit("startup-log", "正在检查服务状态...");
+
                 // 先检测是否已有服务在运行
                 if is_server_ready(port).await {
                     println!("Server already running, navigating directly");
+                    let _ = app_handle.emit("startup-log", "检测到已有服务运行，正在加载...");
                     let _ = window.navigate(server_url.parse().unwrap());
                     return;
                 }
@@ -301,20 +310,12 @@ fn main() {
                 match start_server(&app_handle, &state, port).await {
                     Ok(_) => {
                         println!("Server started, navigating to: {}", server_url);
+                        let _ = app_handle.emit("startup-log", "服务已就绪，正在加载...");
                         let _ = window.navigate(server_url.parse().unwrap());
                     }
                     Err(e) => {
                         eprintln!("Failed to start server: {}", e);
-                        use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
-                        let _ = app_handle
-                            .dialog()
-                            .message(&format!(
-                                "无法启动后端服务器：\n\n{}\n\n请检查 Node.js 是否已正确安装。",
-                                e
-                            ))
-                            .title("服务器启动失败")
-                            .kind(MessageDialogKind::Error)
-                            .show(|_| {});
+                        let _ = app_handle.emit("startup-error", &e);
                     }
                 }
             });
