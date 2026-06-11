@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-23: 流式模式下智能故障切换修复
+
+### 修复
+- 修复流式（SSE）模式下智能故障切换几乎完全失效的问题
+- 根因：原实现在流管道建立前就发送了响应头（`res.status()` + `copyResponseHeaders()`），导致 `res.headersSent=true`，而所有故障切换判断条件都要求响应未提交，因此流式场景下无法切换到下一个候选服务
+- 新增 `preflightStream()` 方法：在提交响应头前预读第一个 SSE 事件，若首事件为 `response.failed`/`error` 或超时/提前关闭，则不提交响应头，直接抛出 `FailoverProxyError` 触发故障切换
+- 新增 `createPreflightCombinedStream()` 方法：预检通过后用组合流（缓冲字节 + 上游剩余流）无缝衔接后续 SSE 管道，原有所有 Transform 无需改动
+- 同步覆盖 `proxyRequest()` 与 `proxyRequestForApiPath()` 两条流式处理路径
+- 预检阶段保留原始字节（非解析后事件），避免二次解析，最大兼容现有转换器
+
 ## 2026-06-22: 密钥详情页新增"会话"Tab
 
 ### 新增
