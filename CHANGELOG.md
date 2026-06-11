@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-06-11: 优化清空日志与清除会话功能
+
+### 新增
+- 会话页右上角新增「清除会话」按钮，点击打开弹窗，支持按「最后请求时间」清理过期会话
+  - 可选择清理 1-15 天以前的会话（以 `lastRequestAt` 为基准）
+  - 可选「仅清空日志」开关：开启后保留会话记录，仅删除关联日志；关闭则同时删除会话及其关联日志
+  - 新增 `POST /api/sessions/cleanup` 端点
+- 后端新增 `cleanupSessionsByAge` / `deleteLogsBySessionIds`：按分片重写并维护 `sessionLogIndex`、`logShardsIndex` 一致性，与 `addLog` 共享分片写入锁避免并发竞争
+
+### 变更
+- 日志页「清空全部日志」按钮改由 `src/ui/config/index.ts` 的 `IS_CLEAR_LOGS_VISIBLE` 控制显隐
+
 ## 2026-06-11: 修复关闭 AUTH 后日志/会话不再写入的问题
 
 ### 修复

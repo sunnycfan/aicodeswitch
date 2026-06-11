@@ -2796,6 +2796,22 @@ ${instruction}
     })
   );
 
+  // 清理过期会话（基于最后请求时间），可选择仅清空关联日志而保留会话本身
+  app.post(
+    '/api/sessions/cleanup',
+    asyncHandler(async (req, res) => {
+      const beforeDays = Number(req.body?.beforeDays);
+      const onlyLogs = Boolean(req.body?.onlyLogs);
+      if (!Number.isFinite(beforeDays) || !Number.isInteger(beforeDays) || beforeDays < 1 || beforeDays > 15) {
+        res.status(400).json({ error: 'beforeDays 必须为 1-15 之间的整数' });
+        return;
+      }
+      const beforeTimestamp = Date.now() - beforeDays * 24 * 60 * 60 * 1000;
+      const result = await dbManager.cleanupSessionsByAge(beforeTimestamp, { onlyLogs });
+      res.json(result);
+    })
+  );
+
   // ─── Session Route Binding API ───
 
   app.put(

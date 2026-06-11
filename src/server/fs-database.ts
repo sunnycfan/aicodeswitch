@@ -3175,6 +3175,168 @@ export class FileSystemDatabaseManager {
     await this.saveSessions();
   }
 
+  /**
+   * 批量清理过期会话
+   * 以最后请求时间为基准，清理 lastRequestAt 早于 beforeTimestamp 的会话。
+   * @param beforeTimestamp 时间阈值（毫秒），最后请求时间严格早于此值的会话将被处理
+   * @param options.onlyLogs 仅清空关联日志，保留会话本身
+   * @returns 受影响会话数 / 删除的日志数
+   */
+  async cleanupSessionsByAge(
+    beforeTimestamp: number,
+    options: { onlyLogs?: boolean } = {}
+  ): Promise<{ sessionsAffected: number; logsDeleted: number }> {
+    const targetSessions = this.sessions.filter(s => s.lastRequestAt < beforeTimestamp);
+    if (targetSessions.length === 0) {
+      return { sessionsAffected: 0, logsDeleted: 0 };
+    }
+
+    const targetIds = new Set(targetSessions.map(s => s.id));
+    const { logsDeleted } = await this.deleteLogsBySessionIds(targetIds);
+
+    if (!options.onlyLogs) {
+      this.sessions = this.sessions.filter(s => !targetIds.has(s.id));
+      await this.saveSessions();
+    }
+
+    return { sessionsAffected: targetSessions.length, logsDeleted };
+  }
+
+  /**
+   * 删除指定会话集合关联的所有日志条目，并维护分片文件与索引的一致性。
+   * 多个会话可能共享同一分片，按分片重写并修正其余会话的 index 引用。
+   * 与 addLog 共享分片写入锁（shardWriteLocks），避免并发写入竞争。
+   */
+  private async deleteLogsBySessionIds(sessionIds: Set<string>): Promise<{ logsDeleted: number }> {
+    if (sessionIds.size === 0) return { logsDeleted: 0 };
+
+    // 1. 按分片文件收集待删除的 index（基于内存索引快照）
+    const shardDeletes = new Map<string, Set<number>>();
+    for (const sid of sessionIds) {
+      const refs = this.sessionLogIndex.get(sid);
+      if (!refs) continue;
+      for (const ref of refs) {
+        let set = shardDeletes.get(ref.filename);
+        if (!set) {
+          set = new Set();
+          shardDeletes.set(ref.filename, set);
+        }
+        set.add(ref.index);
+      }
+    }
+
+    let logsDeleted = 0;
+
+    // 2. 逐分片重写（在分片锁内执行，与该分片的 addLog 串行）
+    for (const [filename, deleteSet] of shardDeletes) {
+      let shardRemoved = 0;
+      const prevLock = this.shardWriteLocks.get(filename) || Promise.resolve();
+      const task = prevLock.then(async () => {
+        const shardLogs = await this.loadLogShard(filename);
+        if (shardLogs.length === 0) return;
+
+        // 构建 oldIndex -> newIndex 映射（仅保留项）
+        const newIndexMap = new Map<number, number>();
+        const newLogs: RequestLog[] = [];
+        let removed = 0;
+        for (let i = 0; i < shardLogs.length; i++) {
+          if (deleteSet.has(i)) {
+            removed++;
+            continue;
+          }
+          newIndexMap.set(i, newLogs.length);
+          newLogs.push(shardLogs[i]);
+        }
+
+        if (removed === 0) return;
+        shardRemoved = removed;
+
+        // 重写或删除分片文件
+        if (newLogs.length === 0) {
+          try {
+            await fs.unlink(path.join(this.logsDir, filename));
+          } catch {
+            // 文件可能已被其它清理流程删除，忽略
+          }
+        } else {
+          await this.saveLogShard(filename, newLogs);
+        }
+
+        // 更新分片索引
+        const shardIndex = this.logShardsIndex.find(s => s.filename === filename);
+        if (shardIndex) {
+          if (newLogs.length === 0) {
+            this.logShardsIndex = this.logShardsIndex.filter(s => s.filename !== filename);
+          } else {
+            shardIndex.count = newLogs.length;
+            let minTs = Infinity;
+            let maxTs = -Infinity;
+            for (const l of newLogs) {
+              if (l.timestamp < minTs) minTs = l.timestamp;
+              if (l.timestamp > maxTs) maxTs = l.timestamp;
+            }
+            shardIndex.startTime = minTs;
+            shardIndex.endTime = maxTs;
+          }
+        }
+
+        // 修正引用了该分片的非目标会话的 refs（index 偏移）
+        for (const [sid, refs] of this.sessionLogIndex) {
+          if (sessionIds.has(sid)) continue;
+          let touched = false;
+          const updated: SessionLogRef[] = [];
+          for (const ref of refs) {
+            if (ref.filename !== filename) {
+              updated.push(ref);
+              continue;
+            }
+            if (deleteSet.has(ref.index)) {
+              touched = true;
+              continue;
+            }
+            const ni = newIndexMap.get(ref.index);
+            if (ni !== undefined) {
+              if (ni !== ref.index) touched = true;
+              updated.push({ ...ref, index: ni });
+            } else {
+              touched = true;
+            }
+          }
+          if (touched) {
+            if (updated.length === 0) {
+              this.sessionLogIndex.delete(sid);
+            } else {
+              this.sessionLogIndex.set(sid, updated);
+            }
+          }
+        }
+      });
+
+      this.shardWriteLocks.set(filename, task);
+      try {
+        await task;
+        logsDeleted += shardRemoved;
+      } catch (err) {
+        console.error(`[Database] Failed to cleanup shard ${filename}:`, err);
+      } finally {
+        if (this.shardWriteLocks.get(filename) === task) {
+          this.shardWriteLocks.delete(filename);
+        }
+      }
+    }
+
+    // 3. 清除目标会话的索引条目
+    for (const sid of sessionIds) {
+      this.sessionLogIndex.delete(sid);
+    }
+
+    await this.saveLogsIndex();
+    await this.saveSessionLogIndexNow();
+    this.logsCountCache = null;
+
+    return { logsDeleted };
+  }
+
   // 新增方法：获取单个 session
   getSession(id: string): Session | null {
     return this.sessions.find(s => s.id === id) || null;

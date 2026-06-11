@@ -7,6 +7,7 @@ import { Pagination } from '../components/Pagination';
 import { toast } from '../components/Toast';
 import { SessionMigrationModal } from '../components/SessionMigrationModal';
 import { SessionRouteBindingModal } from '../components/SessionRouteBindingModal';
+import { ClearSessionsModal } from '../components/ClearSessionsModal';
 import SessionDetailModal from '../components/SessionDetailModal';
 import { cleanSessionTitle, extractChatMessagesFromLogs } from '../utils/session-chat-utils';
 import { parseSSEChunks, assembleStreamText } from '../utils/log-utils';
@@ -34,6 +35,7 @@ function SessionsPage() {
   const [countdown, setCountdown] = useState(10);
   const [migrationSession, setMigrationSession] = useState<Session | null>(null);
   const [routeBindingSession, setRouteBindingSession] = useState<Session | null>(null);
+  const [clearSessionsOpen, setClearSessionsOpen] = useState(false);
 
   useEffect(() => {
     loadSessions();
@@ -253,6 +255,7 @@ function SessionsPage() {
             <h1>会话</h1>
             <p>查看和管理所有会话记录</p>
           </div>
+          <button className="btn btn-danger" onClick={() => setClearSessionsOpen(true)}>清除会话</button>
         </div>
       </div>
 
@@ -476,6 +479,14 @@ function SessionsPage() {
           onBound={() => {
             loadSessions();
           }}
+        />
+      )}
+
+      {/* 清除会话 Modal */}
+      {clearSessionsOpen && (
+        <ClearSessionsModal
+          onClose={() => setClearSessionsOpen(false)}
+          onCleared={() => { setSessionsPage(1); loadSessions(); }}
         />
       )}
 
