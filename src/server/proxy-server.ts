@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import axios, { AxiosRequestConfig } from 'axios';
-import { pipeline, Transform } from 'stream';
+import { pipeline, Transform, Readable } from 'stream';
 import crypto from 'crypto';
 import type { FileSystemDatabaseManager } from './fs-database';
 import {
@@ -1513,6 +1513,174 @@ export class ProxyServer {
 
   private isResponseCommitted(res: Response): boolean {
     return res.headersSent || this.isDownstreamClosed(res);
+  }
+
+  /**
+   * SSE 流预检：在提交响应头之前读取上游流的第一个有意义的 SSE 事件，
+   * 判断上游是否健康。若首事件为错误（response.failed / error），则不提交响应头，
+   * 允许外层故障切换循环尝试下一个候选服务。
+   *
+   * @returns healthy=true 时携带 bufferedRaw（预检期间读取的原始字节），
+   *          healthy=false 时携带 failureInfo 用于构建错误信息。
+   */
+  private preflightStream(
+    upstreamStream: NodeJS.ReadableStream,
+    options: { timeoutMs?: number } = {},
+  ): Promise<{
+    healthy: true;
+    bufferedRaw: Buffer;
+  } | {
+    healthy: false;
+    failureInfo: StreamFailureInfo | null;
+    bufferedRaw: Buffer;
+    errorData?: any;
+  }> {
+    const { timeoutMs = 5000 } = options;
+
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      const tempParser = new SSEParserTransform();
+      const events: SSEEvent[] = [];
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = (result: any) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        // 停止从上游流读取，但不 destroy（后续可能还需要用）
+        upstreamStream.removeAllListeners?.();
+        resolve(result);
+      };
+
+      // 超时保护
+      timer = setTimeout(() => {
+        finish({
+          healthy: false,
+          failureInfo: { statusCode: 504, errorMessage: 'Stream preflight timed out waiting for first event' },
+          bufferedRaw: Buffer.concat(chunks),
+        });
+      }, timeoutMs);
+
+      // 将原始数据喂给临时 parser 解析 SSE 事件
+      const onData = (chunk: Buffer) => {
+        if (settled) return;
+        chunks.push(chunk);
+        // 手动喂给 parser
+        tempParser.write(chunk);
+        drainParserEvents();
+      };
+
+      const drainParserEvents = () => {
+        // 从 tempParser 的 readable 侧读出解析后的事件
+        let event: SSEEvent;
+        while (null !== (event = tempParser.read() as any)) {
+          if (settled) return;
+          events.push(event);
+
+          // 跳过无意义的空事件和 done
+          const eventType = event.event?.trim();
+          const eventData = event.data;
+          if (!eventType && eventData && typeof eventData === 'object' && (eventData as any).type === 'done') continue;
+          if (!eventType && !eventData) continue;
+
+          // 检查是否为错误事件
+          if (eventType === 'response.failed' || eventType === 'error') {
+            const parsed = event.data ? this.safeJsonParse(event.data) : null;
+            const errorObj = parsed?.response?.error || parsed?.error || parsed;
+            const errorCode = errorObj?.code;
+            const errorMessage = errorObj?.message
+              || parsed?.message
+              || `Upstream stream returned ${eventType}`;
+            const statusCode = errorCode === 'server_is_overloaded' ? 503 : 502;
+            finish({
+              healthy: false,
+              failureInfo: {
+                statusCode,
+                errorMessage: `Upstream stream returned ${eventType}: ${errorMessage}`,
+              },
+              bufferedRaw: Buffer.concat(chunks),
+              errorData: event.data,
+            });
+            return;
+          }
+
+          // 首个有意义的正常事件 → 健康通过
+          finish({
+            healthy: true,
+            bufferedRaw: Buffer.concat(chunks),
+          });
+          return;
+        }
+      };
+
+      const onEnd = () => {
+        if (settled) return;
+        // 流结束了但没读到有意义的 event
+        if (events.length === 0 && chunks.length === 0) {
+          finish({
+            healthy: false,
+            failureInfo: { statusCode: 502, errorMessage: 'Upstream stream ended before sending any data' },
+            bufferedRaw: Buffer.concat(chunks),
+          });
+        } else {
+          // 读到了一些数据但没有明确的错误 → 视为健康
+          finish({
+            healthy: true,
+            bufferedRaw: Buffer.concat(chunks),
+          });
+        }
+      };
+
+      const onError = (err: Error) => {
+        if (settled) return;
+        finish({
+          healthy: false,
+          failureInfo: { statusCode: 502, errorMessage: `Upstream stream error during preflight: ${err.message}` },
+          bufferedRaw: Buffer.concat(chunks),
+        });
+      };
+
+      (upstreamStream as any).on('data', onData);
+      (upstreamStream as any).once('end', onEnd);
+      (upstreamStream as any).once('error', onError);
+
+      // 暂停自动读取 — 我们只需要第一个事件
+      // 注意：不能 pause，因为 axios stream 需要 flow mode 才能获取数据
+    });
+  }
+
+  /**
+   * 创建一个组合流：先输出 bufferedRaw 中的原始字节，再透传上游流的剩余数据。
+   * 用于预检通过后无缝衔接后续的 SSE 管道。
+   */
+  private createPreflightCombinedStream(upstreamStream: NodeJS.ReadableStream, bufferedRaw: Buffer): NodeJS.ReadableStream {
+    let pushed = false;
+    const combined = new Readable({
+      read() {
+        if (!pushed) {
+          pushed = true;
+          if (bufferedRaw.length > 0) {
+            this.push(bufferedRaw);
+          }
+          // 将上游流 pipe 到 combined
+          (upstreamStream as any).on('data', (chunk: Buffer) => {
+            if (!this.push(chunk)) {
+              (upstreamStream as any).pause();
+            }
+          });
+          (upstreamStream as any).once('end', () => {
+            this.push(null);
+          });
+          (upstreamStream as any).once('error', (err: Error) => {
+            this.destroy(err);
+          });
+          // 如果上游已经暂停了（预检时消费了一些数据），恢复它
+          (upstreamStream as any).resume?.();
+        }
+      },
+    });
+    return combined;
   }
 
   private isClientDisconnectError(error: any, res?: Response): boolean {
@@ -4231,6 +4399,73 @@ export class ProxyServer {
       }
 
       if (isEventStream && response.data) {
+        // ── SSE 预检：在提交响应头之前，先读取第一个 SSE 事件以检测上游错误 ──
+        // 这使得故障切换能在流式场景下生效（首事件为 error 时不提交响应头，允许切换到下一个服务）
+        const preflightResult = await this.preflightStream(response.data, { timeoutMs: 5000 });
+
+        if (!preflightResult.healthy) {
+          // 预检失败（首事件是错误 / 超时 / 流提前关闭）
+          const failureInfo = preflightResult.failureInfo;
+          console.warn(`[Proxy] Stream preflight failed: ${failureInfo?.errorMessage || 'unknown'}`);
+
+          // 尝试读取完整错误体用于日志
+          let errorBody: any = (preflightResult as any).errorData;
+          if (!errorBody && preflightResult.bufferedRaw.length > 0) {
+            errorBody = this.safeJsonParse(preflightResult.bufferedRaw.toString('utf8'));
+          }
+
+          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+          const errorMsg = failureInfo?.errorMessage || 'Stream preflight detected upstream error';
+
+          // 记录错误日志
+          try {
+            await this.dbManager.addErrorLog({
+              timestamp: Date.now(),
+              method: req.method,
+              path: req.path,
+              statusCode: failureInfo?.statusCode || 502,
+              errorMessage: errorMsg,
+              requestHeaders: this.normalizeHeaders(req.headers),
+              requestBody: req.body ? JSON.stringify(req.body) : undefined,
+              upstreamRequest: upstreamRequestForLog,
+              responseHeaders: responseHeadersForLog,
+              responseBody: preflightResult.bufferedRaw.toString('utf8'),
+              ruleId: rule.id,
+              targetType,
+              targetServiceId: service.id,
+              targetServiceName: service.name,
+              targetModel: rule.targetModel || req.body?.model,
+              vendorId: service.vendorId,
+              vendorName: vendor?.name,
+              requestModel: req.body?.model,
+              responseTime: Date.now() - startTime,
+            });
+          } catch (logError) {
+            console.error('[Proxy] Failed to log preflight error:', logError);
+          }
+
+          await finalizeLog(failureInfo?.statusCode || 502, errorMsg);
+
+          // 销毁上游流
+          if (typeof (response.data as any).destroy === 'function') {
+            (response.data as any).destroy();
+          }
+
+          // 响应头未提交 → 可以触发故障切换
+          if (failoverEnabled) {
+            throw this.createFailoverError(errorMsg, failureInfo?.statusCode || 502);
+          }
+
+          // 非 failover 模式：直接返回错误给客户端
+          res.status(failureInfo?.statusCode || 502).json({
+            error: { message: errorMsg, type: 'upstream_error' },
+          });
+          return;
+        }
+
+        // ── 预检通过：提交响应头，使用组合流继续管道传输 ──
+        const streamSource = this.createPreflightCombinedStream(response.data, preflightResult.bufferedRaw);
+
         res.status(response.status);
         // 默认stream处理(无转换)
         const parser = new SSEParserTransform();
@@ -4287,7 +4522,7 @@ export class ProxyServer {
           ensureResponseWritable();
           return await new Promise<void>((resolve, reject) => {
             if (converter) {
-              const streamStages: any[] = [response.data, parser, eventCollector, converter];
+              const streamStages: any[] = [streamSource, parser, eventCollector, converter];
               if (compactResponseSanitizer) {
                 streamStages.push(compactResponseSanitizer);
               }
@@ -4306,7 +4541,7 @@ export class ProxyServer {
               return;
             }
 
-            const streamStages: any[] = [response.data, parser, eventCollector];
+            const streamStages: any[] = [streamSource, parser, eventCollector];
             if (compactResponseSanitizer) {
               streamStages.push(compactResponseSanitizer);
             }
@@ -5099,6 +5334,40 @@ export class ProxyServer {
       }
 
       if (isEventStream && response.data) {
+        // ── SSE 预检：在提交响应头之前，先读取第一个 SSE 事件以检测上游错误 ──
+        const preflightResult = await this.preflightStream(response.data, { timeoutMs: 5000 });
+
+        if (!preflightResult.healthy) {
+          const failureInfo = preflightResult.failureInfo;
+          console.warn(`[ApiPathProxy] Stream preflight failed: ${failureInfo?.errorMessage || 'unknown'}`);
+
+          let errorBody: any = (preflightResult as any).errorData;
+          if (!errorBody && preflightResult.bufferedRaw.length > 0) {
+            errorBody = this.safeJsonParse(preflightResult.bufferedRaw.toString('utf8'));
+          }
+
+          responseHeadersForLog = this.normalizeResponseHeaders(responseHeaders);
+          const errorMsg = failureInfo?.errorMessage || 'Stream preflight detected upstream error';
+
+          await finalizeLog(failureInfo?.statusCode || 502, errorMsg);
+
+          if (typeof (response.data as any).destroy === 'function') {
+            (response.data as any).destroy();
+          }
+
+          if (failoverEnabled) {
+            throw this.createFailoverError(errorMsg, failureInfo?.statusCode || 502);
+          }
+
+          res.status(failureInfo?.statusCode || 502).json({
+            error: { message: errorMsg, type: 'upstream_error' },
+          });
+          return;
+        }
+
+        // ── 预检通过：使用组合流继续管道传输 ──
+        const streamSource = this.createPreflightCombinedStream(response.data, preflightResult.bufferedRaw);
+
         // Stream pipeline
         const parser = new SSEParserTransform();
         const eventCollector = new SSEEventCollectorTransform();
@@ -5141,13 +5410,13 @@ export class ProxyServer {
               return stages;
             };
             if (converter) {
-              const stages = buildStages(response.data, parser, eventCollector, converter);
+              const stages = buildStages(streamSource, parser, eventCollector, converter);
               (pipeline as any)(...stages, (error: any) => {
                 if (error) { reject(error); return; }
                 resolve();
               });
             } else {
-              const stages = buildStages(response.data, parser, eventCollector);
+              const stages = buildStages(streamSource, parser, eventCollector);
               (pipeline as any)(...stages, (error: any) => {
                 if (error) { reject(error); return; }
                 resolve();

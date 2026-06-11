@@ -1295,6 +1295,13 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
 
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+  // 数据就绪验证端点（供 Tauri 启动阶段确认后端完全可用）
+  app.get('/api/ready', (_req, res) => {
+    const vendors = dbManager.getVendors();
+    const routes = dbManager.getRoutes();
+    res.json({ ready: true, vendorsCount: vendors.length, routesCount: routes.length });
+  });
+
   // 局域网访问控制中间件：当 enableLanDiscovery 关闭时，仅允许本机访问 /api/* 路由
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     const config = dbManager.getConfig();
