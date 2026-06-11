@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api/client';
-import type { AccessKey, Policy, Route } from '../../types';
+import type { AccessKey, Policy, Route, WriteLocalRecord } from '../../types';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
 import AccessKeyGuideModal from '../components/AccessKeyGuideModal';
@@ -10,6 +10,7 @@ export default function AccessKeysPage() {
   const [policies, setPolicies] = useState<(Policy & { keyCount?: number })[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [templates, setTemplates] = useState<any[]>([]);
+  const [writeLocalRecords, setWriteLocalRecords] = useState<WriteLocalRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const pageSize = 20;
@@ -30,7 +31,7 @@ export default function AccessKeysPage() {
   const [showPolicyEditor, setShowPolicyEditor] = useState(false);
   const [formName, setFormName] = useState('');
   const [formDesc, setFormDesc] = useState('');
-  const [formRouteId, setFormRouteId] = useState('');
+  const [formRouteId, setFormRouteId] = useState('system');
   const [formDailyToken, setFormDailyToken] = useState('');
   const [formMonthlyToken, setFormMonthlyToken] = useState('');
   const [formDailyReq, setFormDailyReq] = useState('');
@@ -40,6 +41,9 @@ export default function AccessKeysPage() {
   const [formBlockedModels, setFormBlockedModels] = useState<string[]>([]);
   const [formModelMode, setFormModelMode] = useState<'none' | 'allow' | 'block'>('none');
   const [modelInput, setModelInput] = useState('');
+  const [allModels, setAllModels] = useState<{name: string; vendors: string[]}[]>([]);
+  const [showModelSuggest, setShowModelSuggest] = useState(false);
+  const modelInputRef = useRef<HTMLInputElement>(null);
 
   const { confirm } = useConfirm();
   const batchMenuRef = useRef<HTMLDivElement>(null);
@@ -88,6 +92,7 @@ export default function AccessKeysPage() {
 
   useEffect(() => { loadKeys(); }, [page, statusFilter, searchQuery]);
   useEffect(() => { loadPolicies(); }, []);
+  useEffect(() => { api.getWriteLocalRecords().then(setWriteLocalRecords).catch(() => {}); }, [keys]);
 
   // ====== AccessKey 操作 ======
 
@@ -186,7 +191,7 @@ export default function AccessKeysPage() {
   const openPolicyEditor = (policy?: Policy) => {
     if (policy) {
       setEditingPolicy(policy);
-      setFormName(policy.name); setFormDesc(policy.description || ''); setFormRouteId(policy.routeId || '');
+      setFormName(policy.name); setFormDesc(policy.description || ''); setFormRouteId(policy.routeId || 'system');
       setFormDailyToken(policy.dailyTokenLimit?.toString() || '');
       setFormMonthlyToken(policy.monthlyTokenLimit?.toString() || '');
       setFormDailyReq(policy.dailyRequestLimit?.toString() || '');
@@ -198,7 +203,31 @@ export default function AccessKeysPage() {
       resetPolicyForm();
     }
     setShowPolicyEditor(true);
+    // 加载所有可用模型用于自动补全
+    loadAllModels();
   };
+
+  const loadAllModels = async () => {
+    try {
+      const vendors = await api.getVendors();
+      const map = new Map<string, Set<string>>();
+      (vendors || []).forEach((v: any) => {
+        const vName = v.name || '';
+        (v.services || []).forEach((s: any) => {
+          (s.supportedModels || []).forEach((m: string) => {
+            if (!map.has(m)) map.set(m, new Set());
+            map.get(m)!.add(vName);
+          });
+        });
+      });
+      setAllModels(Array.from(map.entries()).map(([name, vSet]) => ({ name, vendors: Array.from(vSet) })).sort((a, b) => a.name.localeCompare(b.name)));
+    } catch { /* ignore */ }
+  };
+
+  const currentModelList = formModelMode === 'allow' ? formAllowedModels : formBlockedModels;
+  const filteredModels = modelInput.trim()
+    ? allModels.filter(m => m.name.toLowerCase().includes(modelInput.toLowerCase()) && !currentModelList.includes(m.name))
+    : allModels.filter(m => !currentModelList.includes(m.name));
 
   const applyTemplate = (template: any) => {
     const c = template.config;
@@ -212,7 +241,7 @@ export default function AccessKeysPage() {
   const handleSavePolicy = async () => {
     if (!formName.trim()) { toast.error('请输入策略名称'); return; }
     const data: any = {
-      name: formName.trim(), description: formDesc || undefined, routeId: formRouteId || undefined,
+      name: formName.trim(), description: formDesc || undefined, routeId: formRouteId === 'system' ? 'system' : (formRouteId || undefined),
       dailyTokenLimit: formDailyToken ? Number(formDailyToken) : undefined,
       monthlyTokenLimit: formMonthlyToken ? Number(formMonthlyToken) : undefined,
       dailyRequestLimit: formDailyReq ? Number(formDailyReq) : undefined,
@@ -272,7 +301,7 @@ export default function AccessKeysPage() {
     <div className="page-container">
       {/* 头部 */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-        <h2 style={{ margin: 0 }}>接入密钥</h2>
+        <h2 style={{ margin: 0 }}>API Key</h2>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <button className="btn btn-primary" onClick={() => { setShowCreateModal(true); loadPolicies(); }} style={{ height: '45px' }}>+ 创建密钥</button>
           <button
@@ -366,7 +395,22 @@ export default function AccessKeysPage() {
                           <input type="checkbox" checked={selectedIds.has(key.id)} onChange={() => toggleSelect(key.id)} />
                         </td>
                         <td style={{ padding: '10px 12px' }}>
-                          <a href={`#/access-keys/${key.id}`} style={{ color: 'var(--color-primary)', textDecoration: 'none', fontWeight: 500 }}>{key.name}</a>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                            <a href={`#/access-keys/${key.id}`} style={{ color: 'var(--color-primary)', textDecoration: 'none', fontWeight: 500 }}>{key.name}</a>
+                            {(() => {
+                              const record = writeLocalRecords.find(r => r.accessKeyId === key.id);
+                              if (!record) return null;
+                              return record.targets.map(t => (
+                                <span key={t} style={{
+                                  display: 'inline-block', padding: '1px 6px', borderRadius: '8px',
+                                  fontSize: '11px', lineHeight: '16px',
+                                  background: t === 'claude-code' ? '#cc7832' : '#000', color: '#fff',
+                                }}>
+                                  {t === 'claude-code' ? 'Claude Code' : 'Codex'}
+                                </span>
+                              ));
+                            })()}
+                          </span>
                           {key.remark && <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{key.remark}</div>}
                         </td>
                         <td style={{ padding: '10px 12px' }}>
@@ -463,7 +507,7 @@ export default function AccessKeysPage() {
                           </div>
                         </div>
                         <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                          <span>🔗 路由: {getRouteName(policy.routeId) || <span style={{ color: 'var(--text-tertiary)' }}>未绑定</span>}</span>
+                          <span>🔗 路由: {policy.routeId && policy.routeId !== 'system' ? (getRouteName(policy.routeId) || <span style={{ color: 'var(--text-tertiary)' }}>未绑定</span>) : <span style={{ color: 'var(--accent-color, #4a90d9)' }}>按系统默认</span>}</span>
                           <span>🔑 Key: {policy.keyCount || 0}</span>
                           <span>📊 配额: {formatQuota(policy)}</span>
                         </div>
@@ -604,7 +648,7 @@ export default function AccessKeysPage() {
               <label style={{ display: 'block', marginBottom: '6px', fontWeight: 600, fontSize: '14px' }}>路由绑定</label>
               <select value={formRouteId} onChange={e => setFormRouteId(e.target.value)}
                 style={{ ...inputStyle, width: '100%', padding: '10px 14px', fontSize: '14px', borderRadius: '8px', cursor: 'pointer' }}>
-                <option value="">选择路由...</option>
+                <option value="system">按系统默认</option>
                 {routes.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
               </select>
             </div>
@@ -682,10 +726,41 @@ export default function AccessKeysPage() {
                 {formModelMode !== 'none' && (
                   <div>
                     <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                      <input type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
-                        placeholder="输入模型名，回车确认..." autoFocus
-                        onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModel(formModelMode === 'allow' ? formAllowedModels : formBlockedModels, formModelMode === 'allow' ? setFormAllowedModels : setFormBlockedModels); } }}
-                        style={{ ...inputStyle, flex: 1, padding: '8px 12px', borderRadius: '6px', fontSize: '13px' }} />
+                      <div style={{ position: 'relative', flex: 1 }}>
+                        <input ref={modelInputRef} type="text" value={modelInput}
+                          onChange={e => { setModelInput(e.target.value); setShowModelSuggest(true); }}
+                          onFocus={() => setShowModelSuggest(true)}
+                          onBlur={() => setTimeout(() => setShowModelSuggest(false), 150)}
+                          placeholder={allModels.length > 0 ? '搜索或输入模型名...' : '输入模型名，回车确认...'}
+                          autoFocus
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              addModel(formModelMode === 'allow' ? formAllowedModels : formBlockedModels, formModelMode === 'allow' ? setFormAllowedModels : setFormBlockedModels);
+                            }
+                            if (e.key === 'Escape') { setShowModelSuggest(false); }
+                          }}
+                          style={{ ...inputStyle, width: '100%', padding: '8px 12px', borderRadius: '6px', fontSize: '13px' }} />
+                        {showModelSuggest && filteredModels.length > 0 && (
+                          <div className="ak-model-suggest">
+                            {filteredModels.map(m => (
+                              <button key={m.name} className="ak-model-suggest-item"
+                                onMouseDown={e => {
+                                  e.preventDefault();
+                                  const list = formModelMode === 'allow' ? formAllowedModels : formBlockedModels;
+                                  const setter = formModelMode === 'allow' ? setFormAllowedModels : setFormBlockedModels;
+                                  if (!list.includes(m.name)) { setter([...list, m.name]); }
+                                  setModelInput('');
+                                  setShowModelSuggest(false);
+                                  modelInputRef.current?.focus();
+                                }}>
+                                <span>{m.name}</span>
+                                <span>{m.vendors.join(', ')}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <button className="btn btn-primary btn-sm" style={{ padding: '8px 14px', borderRadius: '6px' }}
                         onClick={() => addModel(formModelMode === 'allow' ? formAllowedModels : formBlockedModels, formModelMode === 'allow' ? setFormAllowedModels : setFormBlockedModels)}>添加</button>
                     </div>
@@ -766,6 +841,41 @@ export default function AccessKeysPage() {
         .ak-action-btn--danger:hover {
           background: rgba(220, 38, 38, 0.1);
           border-color: var(--accent-danger);
+        }
+
+        /* 模型自动补全下拉 */
+        .ak-model-suggest {
+          position: absolute; left: 0; right: 0; bottom: 100%; z-index: 50;
+          margin-top: 4px; max-height: 240px; overflow-y: auto;
+          background: var(--bg-primary-solid); border: 1px solid var(--border-primary);
+          border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+          padding: 4px 0;
+        }
+        .ak-model-suggest-item {
+          display: flex; justify-content: space-between; align-items: center; gap: 8px;
+          width: 100%; padding: 7px 12px;
+          border: none; background: none; cursor: pointer;
+          font-size: 13px; color: var(--text-primary); text-align: left;
+        }
+        .ak-model-suggest-item > span:first-child {
+          font-family: "SF Mono", "Fira Code", monospace;
+          white-space: nowrap;
+        }
+        .ak-model-suggest-item > span:last-child {
+          color: #999; font-size: 11px; white-space: nowrap; flex-shrink: 0;
+        }
+        [data-theme="dark"] .ak-model-suggest-item > span:last-child {
+          color: #888;
+        }
+        .ak-model-suggest-item:hover {
+          background: var(--bg-secondary);
+        }
+        [data-theme="dark"] .ak-model-suggest {
+          background: #0C1F12;
+          border-color: rgba(167, 243, 208, 0.2);
+        }
+        [data-theme="dark"] .ak-model-suggest-item:hover {
+          background: rgba(30, 58, 40, 0.95);
         }
 
         /* 批量操作按钮 */

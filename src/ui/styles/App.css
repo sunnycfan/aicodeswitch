@@ -466,7 +466,7 @@ table th {
 }
 
 .modal {
-  background: var(--bg-secondary);
+  background: #ffffff;
   border-radius: 24px;
   padding: 32px;
   padding-right: 28px;
@@ -801,7 +801,7 @@ table th {
 /* Tool messages */
 .chat-message--tool_result .chat-bubble,
 .chat-message--tool_use .chat-bubble {
-  background: var(--bg-card);
+  background: #f0f4f1;
   border: 1px solid var(--border-color);
   opacity: 0.85;
 }
@@ -890,7 +890,7 @@ table th {
 
 .chat-message--tool_result .chat-collapse-fade,
 .chat-message--tool_use .chat-collapse-fade {
-  background: linear-gradient(to bottom, transparent, var(--bg-card));
+  background: linear-gradient(to bottom, transparent, #f0f4f1);
 }
 
 /* Dark mode: deepen chat bubble backgrounds */
@@ -1211,6 +1211,46 @@ table th {
 @keyframes pulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.05); }
+}
+
+/* 路由活跃状态 - 边框游动光效 */
+@property --border-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.route-active-glow {
+  border-color: transparent !important;
+}
+
+.route-active-glow::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 9px;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--border-angle, 0deg),
+    transparent 0%,
+    transparent 55%,
+    var(--color-primary, #2980b9) 75%,
+    var(--color-primary, #2980b9) 82%,
+    transparent 100%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: border-angle-rotate 2.5s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes border-angle-rotate {
+  to {
+    --border-angle: 360deg;
+  }
 }
 
 /* Version Info with Badge and Popup */
@@ -2331,6 +2371,10 @@ table th {
 [data-theme="dark"] .migration-options label,
 [data-theme="dark"] .migration-source-meta {
   color: var(--text-secondary, #a0a0b8);
+}
+
+[data-theme="dark"] .modal {
+  background: #0f2415;
 }
 
 /* Route card icon popover */

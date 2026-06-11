@@ -1,5 +1,122 @@
 # Changelog
 
+## 2026-06-22: 密钥详情页新增"会话"Tab
+
+### 新增
+- 密钥详情页新增"会话"Tab，支持按密钥查看独立会话列表
+- 每密钥独立会话存储（`key-sessions/<keyId>/sessions.json`），与全局会话系统完全隔离
+- 会话列表支持搜索（标题/ID）、客户端类型过滤、分页、自动刷新
+- 会话详情弹窗支持双模式切换：日志模式（表格查看）和对话模式（聊天视图）
+- 会话日志/对话数据导出（JSON 格式）
+- 代理请求处理中自动追踪密钥级会话（两处 finalizeLog 覆盖全部代理路径）
+- 新增 `KeySessionTracker` 模块（`src/server/access-keys/key-session-tracker.ts`）
+- 新增 `KeyLogger.getLogsBySessionId()` 方法，按 sessionId 过滤密钥日志
+- 提取共享聊天工具函数到 `session-chat-utils.tsx`，供 SessionsPage 和 AccessKeyDetailPage 共用
+- 新增 6 个 API 端点：`GET/DELETE /api/access-keys/:id/sessions`、`GET /api/access-keys/:id/sessions/count`、`GET /api/access-keys/:id/sessions/:sessionId`、`GET /api/access-keys/:id/sessions/:sessionId/logs`、`DELETE /api/access-keys/:id/sessions/:sessionId`
+
+## 2026-06-21: 写入本地记录持久化与自动恢复
+
+### 新增
+- 写入本地记录持久化：记录哪个 AccessKey 写入了哪些工具配置文件
+- 服务启动后自动恢复已写入的 AccessKey 到 Claude Code / Codex 配置文件
+- 全局配置更新、手动写入配置后自动恢复 AccessKey，防止被占位符覆盖
+- 密钥删除/批量删除时自动清理写入本地记录
+- 密钥重新生成时自动重写到已绑定的工具配置文件
+- 密钥列表页面显示写入本地 tag 标注（Claude Code / Codex）
+- 新增 `GET /api/write-local-records` 端点
+
+## 2026-06-21: 代理响应 model 字段回写
+
+### 新增
+- 代理层统一将响应中的 `model` 字段回写为客户端请求时的原始模型名，解决 Claude Code / Codex 等工具因读取上游模型名而导致模型映射规则失效的问题
+- 新增 `ModelRewriteTransform` 流式 SSE 文本 model 回写 Transform
+- 新增 `rewriteResponseModel` 非流式响应 model 回写函数
+- 覆盖全部 4 条代理路径（proxyRequest / proxyRequestForApiPath 的流式与非流式）
+
+## 2026-06-11: 修复配置文件写入时认证字段丢失
+
+### 修复
+- 修复代理写入 Claude Code 配置时 `ANTHROPIC_API_KEY` 被置空的问题
+- 修复恢复配置时空值覆盖 backup 中原始 API Key 的问题
+- CLI `aicos restore` 管理字段列表与 Server 端同步，补全 8 个缺失字段
+- 提取 CLI 共享管理字段模块，避免未来不同步
+
+## 2026-06-20: 局域网配置同步
+
+### 新增
+- 设置页面新增"局域网同步"卡片，支持开启/关闭"允许局域网拉取配置"开关
+- 路由管理页面新增"同步配置"按钮，打开局域网同步弹窗
+- 5 步同步流程：扫描发现 → 选择 Skills → 选择 MCP → 供应商配置 → 预览确认
+- Skills 同步含 SKILL.md 内容，MCP 同步含完整配置（command/args/env/url 等）
+- 重名检测：本地已存在的 Skills/MCP 自动禁用，橙色提醒"本地已存在，无法重复同步"
+- 可选将远端节点作为本地供应商（选填 API Key）
+- 后端新增 `GET /api/lan/discover`（免鉴权，由开关控制）、`GET /api/lan/scan`、`POST /api/lan/sync`
+
+## 2026-06-20: API认证方式支持继承供应商全局配置
+
+### 新增
+- API 服务新增"使用供应商全局配置的API认证方式"复选框，与 API 地址、API 密钥采用同一继承模式
+- 新建服务时若供应商已配置 authType 则默认勾选继承
+- 代理请求时自动解析继承的 authType（`resolveEffectiveAuthType`）
+
+## 2026-06-10: 策略路由支持"按系统默认" + 配置重试次数
+
+### 新增
+- 策略路由绑定新增"按系统默认"选项（`routeId: 'system'`），作为默认值
+  - 选择后 AccessKey 请求使用系统路由管理中配置的默认路由规则
+  - 支持所有 3 个代理入口（标准 API 路径、动态代理中间件、固定路由处理器）
+- Claude Code 配置写入增加 `env.CLAUDE_CODE_MAX_RETRIES: 3`
+- Codex 配置写入增加 `stream_max_retries = 3` 和 `stream_retry_backoff = "fixed"`
+
+### 变更
+- 策略编辑表单路由默认选项从"选择路由..."改为"按系统默认"
+- 策略卡片和密钥详情页展示"系统默认"标签（蓝色）
+
+## 2026-06-10: 修复 AUTH 错误导致 Claude Code 挂起
+
+### 修复
+- 修复 AUTH 启用后，Claude Code 收到 401 错误但持续请求不停止的问题
+  - 根因：`sendAuthError` 对流式请求返回 SSE 格式的 401 响应，违反 Anthropic API 规范
+  - 按 Anthropic 文档，4xx 错误应始终以标准 HTTP JSON 返回，SSE error event 仅用于 200 已发送后的流中错误
+  - 现所有 401 错误统一返回标准 HTTP JSON + `request-id` header + `connection: close`
+- 修复 `sendAccessKeyError` 仅返回 OpenAI 格式的问题，现根据客户端格式自动返回 Claude 或 OpenAI 格式
+- 所有 AccessKey 错误响应统一添加 `request-id` 和 `connection: close` header
+
+## 2026-06-10: 认证体系简化与密钥详情页 Tabs 改造
+
+### 新增
+- AccessKey 请求现在会同步更新全局统计数据（`syncStatisticsFromAccessKey`），确保"数据统计"页面在 AUTH 启用后仍能展示完整的使用情况
+  - 仅更新统计，不写入全局日志（AccessKey 日志仍独立存储）
+  - 覆盖 `/claude-code/`、`/codex/` 和 API 路径（`/v1/*`）所有代理入口
+
+### 修复
+- 修复 AUTH 启用后，动态代理中间件未执行认证检查的漏洞（`proxy-server.ts` 的 Dynamic proxy middleware 分支）
+  - 该中间件先于 `createFixedRouteHandler` 注册，会先拦截 `/claude-code/` 和 `/codex/` 路径的请求
+  - 现已补充完整的 AccessKey 鉴权 + 配额检查 + 策略路由解析逻辑
+
+### 变更
+- 移除全局 `config.apiKey` 认证机制，简化为 AUTH 驱动的 AccessKey-only 认证
+- AUTH 未配置时：不展示"接入密钥"菜单，所有代理请求无需认证直接通过
+- AUTH 已配置时：展示"接入密钥"菜单，隐藏"会话""日志"菜单，所有代理请求必须通过 AccessKey (`sk_` 前缀) 认证
+- 移除设置页面的 API Key 配置项
+- Claude Code / Codex 配置注入改用固定占位符 `"api_key"`，用户通过密钥详情页的"写入本地"功能将真实 Key 写入本地
+
+### 新增
+- 密钥详情页重构为 Tabs 布局：基本信息 / 统计 / 日志
+  - **基本信息**：展示 API Key（脱敏 + 复制）、策略、状态、创建时间、最后活跃、备注等
+  - **统计**：概览卡片 + Token/请求量/错误数趋势图，支持 7/30/90 天切换
+  - **日志**：完整日志列表，支持日期筛选、分页、自动刷新，复用 `LogDetailModal` 组件
+- 新增"写入本地"功能：将 AccessKey 真实 Key 写入 Claude Code / Codex 本地配置文件
+  - 后端 API：`POST /api/access-keys/:id/write-local`
+  - 弹窗支持选择目标（Claude Code / Codex）
+- 新增 `writeAccessKeyToLocal` 前端 API 方法
+
+### 移除
+- `AppConfig.apiKey` 类型定义
+- `fs-database.ts` 中 `apiKey` 默认值
+- `proxy-server.ts` 中 4 处 `config.apiKey` 认证分支
+- `SettingsPage` 中 API Key 表单项
+
 ## 2026-06-10: 日志详情弹窗组件化重构
 
 ### 优化

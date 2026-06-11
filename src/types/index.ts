@@ -102,6 +102,7 @@ export interface APIService {
   apiKey: string;
   inheritVendorApiKey?: boolean;
   inheritVendorApiBaseUrl?: boolean;  // 是否继承供应商的 API Base URL
+  inheritVendorAuthType?: boolean;    // 是否继承供应商的 API 认证方式
   sourceType?: SourceType;
   authType?: AuthType; // 认证方式（ AUTH_TOKEN/API_KEY/G_API_KEY），默认为 AUTH_TOKEN
   supportedModels?: string[];
@@ -242,7 +243,6 @@ export interface AppConfig {
   enableLogging?: boolean;
   logRetentionDays?: number;
   maxLogSize?: number;
-  apiKey?: string;
   enableFailover?: boolean;  // 是否启用智能故障切换,默认 true
   failoverRecoverySeconds?: number;  // 故障自动恢复时间（秒）,默认 10
   ruleGlobalTimeout?: number;  // 规则全局超时时间（秒），覆盖未设置超时的规则，默认 300
@@ -259,7 +259,71 @@ export interface AppConfig {
   proxyUrl?: string;  // 代理地址，例如: proxy.example.com:8080
   proxyUsername?: string;  // 代理认证用户名
   proxyPassword?: string;  // 代理认证密码
+  // 局域网同步
+  enableLanDiscovery?: boolean;  // 是否允许局域网发现并拉取配置，默认 false
   // API 路径路由映射
+}
+
+/** 局域网发现响应 */
+export interface LanDiscoverResponse {
+  node: {
+    name: string;
+    version: string;
+    port: number;
+  };
+  skills: LanSkillItem[];
+  mcps: LanMcpItem[];
+}
+
+/** 局域网同步的 Skill 条目 */
+export interface LanSkillItem {
+  name: string;
+  description?: string;
+  targets?: ToolType[];
+  githubUrl?: string;
+  skillPath?: string;
+  instruction?: string;
+}
+
+/** 局域网同步的 MCP 条目 */
+export interface LanMcpItem {
+  name: string;
+  description?: string;
+  type: 'stdio' | 'http' | 'sse';
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  targets?: ToolType[];
+}
+
+/** 局域网同步请求 */
+export interface LanSyncRequest {
+  remoteNode: {
+    ip: string;
+    port: number;
+    name: string;
+  };
+  skills: LanSkillItem[];
+  mcps: LanMcpItem[];
+  vendor: {
+    enabled: boolean;
+    apiKey?: string;
+  };
+}
+
+/** 局域网同步结果 */
+export interface LanSyncResult {
+  success: boolean;
+  result?: {
+    skillsImported: number;
+    mcpsImported: number;
+    vendorCreated: boolean;
+    vendorName?: string;
+    servicesCreated?: number;
+  };
+  error?: string;
 }
 
 export interface ExportData {
@@ -586,6 +650,13 @@ export interface AccessKey {
   lastActiveAt?: number;          // 最后活跃时间
 }
 
+/** 写入本地记录（持久化哪些 AccessKey 被写入了哪些工具的配置文件） */
+export interface WriteLocalRecord {
+  accessKeyId: string;
+  targets: string[];      // 'claude-code' | 'codex'
+  timestamp: number;
+}
+
 /** 策略 */
 export interface Policy {
   id: string;                     // 系统生成的唯一标识
@@ -657,6 +728,22 @@ export interface KeyUsageDailyRecord {
   tokens: number;
   requests: number;
   errors: number;
+}
+
+/** AccessKey 级会话信息（独立于全局 Session，按密钥隔离存储） */
+export interface AccessKeySession {
+  id: string;
+  targetType: ToolType;
+  title?: string;
+  firstRequestAt: number;
+  lastRequestAt: number;
+  requestCount: number;
+  totalTokens: number;
+  vendorId?: string;
+  vendorName?: string;
+  serviceId?: string;
+  serviceName?: string;
+  model?: string;
 }
 
 /** AccessKey 请求的日志（复用 RequestLog 结构，额外附加 keyId/keyName） */

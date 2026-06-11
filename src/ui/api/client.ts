@@ -1,4 +1,4 @@
-import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort, ApiPathBinding, ToolName, ToolBindings, MigrationOptions, MigrationPreview, MigrationResult, LaunchResult, AccessKey, Policy, KeyUsage, AccessKeyRequestLog, KeyUsageDailyRecord, QuotaAlert } from '../../types';
+import type { Vendor, APIService, Route, Rule, RequestLog, ErrorLog, AppConfig, AuthStatus, LoginResponse, Statistics, ServiceBlacklistEntry, Session, InstalledSkill, SkillCatalogItem, SkillInstallResponse, TargetType, SkillDetail, ToolInstallationStatus, ImportPreview, ImportResult, MCPServer, MCPInstallRequest, CodexReasoningEffort, ApiPathBinding, ToolName, ToolBindings, MigrationOptions, MigrationPreview, MigrationResult, LaunchResult, AccessKey, Policy, KeyUsage, AccessKeyRequestLog, AccessKeySession, KeyUsageDailyRecord, QuotaAlert, LanDiscoverResponse, LanSyncRequest, LanSyncResult } from '../../types';
 
 interface BackendAPI {
   // 鉴权相关
@@ -172,12 +172,20 @@ interface BackendAPI {
   batchDeleteAccessKeys: (keyIds: string[]) => Promise<{ count: number }>;
   getAccessKeyUsage: (id: string) => Promise<KeyUsage>;
   getAccessKeyUsageTrend: (id: string, days?: number) => Promise<KeyUsageDailyRecord[]>;
-  getAccessKeyLogs: (id: string, params?: { page?: number; pageSize?: number; startDate?: string; endDate?: string }) => Promise<{ data: AccessKeyRequestLog[]; total: number }>;
+  getAccessKeyLogs: (id: string, params?: { page?: number; pageSize?: number; startDate?: string; endDate?: string; contentType?: string; search?: string }) => Promise<{ data: AccessKeyRequestLog[]; total: number }>;
+  // AccessKey 会话
+  getAccessKeySessions: (id: string, params?: { page?: number; pageSize?: number; targetType?: string; search?: string }) => Promise<{ data: AccessKeySession[]; total: number }>;
+  getAccessKeySession: (keyId: string, sessionId: string) => Promise<AccessKeySession | null>;
+  getAccessKeySessionLogs: (keyId: string, sessionId: string, limit?: number) => Promise<AccessKeyRequestLog[]>;
+  deleteAccessKeySession: (keyId: string, sessionId: string) => Promise<boolean>;
+  clearAccessKeySessions: (keyId: string) => Promise<boolean>;
   getAccessKeyGuide: (id: string, host?: string, port?: string) => Promise<{
     claudeCode: { description: string; envVars: Record<string, string> };
     codex: { description: string; envVars: Record<string, string> };
     openai: { description: string; envVars: Record<string, string> };
   }>;
+  writeAccessKeyToLocal: (id: string, targets: string[]) => Promise<{ success: boolean; results: Record<string, boolean> }>;
+  getWriteLocalRecords: () => Promise<{ accessKeyId: string; targets: string[]; timestamp: number }[]>;
 
   // Policy 策略
   getPolicies: () => Promise<(Policy & { keyCount?: number })[]>;
@@ -192,6 +200,11 @@ interface BackendAPI {
   // AccessKey 统计
   getAccessKeyRanking: (params?: { sortBy?: string; order?: string; limit?: number }) => Promise<Array<{ keyId: string; keyName: string; totalTokens: number; totalRequests: number; lastActiveAt?: number }>>;
   getQuotaAlerts: () => Promise<QuotaAlert[]>;
+
+  // 局域网同步
+  lanScan: () => Promise<{ localIp: string; subnet: string; port: number; networkInterfaces: Array<{ name: string; address: string; subnet: string; netmask: string }> }>;
+  lanDiscover: (ip: string, port: number) => Promise<LanDiscoverResponse>;
+  lanSync: (data: LanSyncRequest) => Promise<LanSyncResult>;
 }
 
 const buildUrl = (
@@ -602,7 +615,15 @@ export const api: BackendAPI = {
   getAccessKeyUsage: (id) => requestJson(buildUrl(`/api/access-keys/${id}/usage`)),
   getAccessKeyUsageTrend: (id, days) => requestJson(buildUrl(`/api/access-keys/${id}/usage/trend`, { days })),
   getAccessKeyLogs: (id, params) => requestJson(buildUrl(`/api/access-keys/${id}/logs`, params as Record<string, string | number | undefined>)),
+  // AccessKey 会话
+  getAccessKeySessions: (id, params) => requestJson(buildUrl(`/api/access-keys/${id}/sessions`, params as Record<string, string | number | undefined>)),
+  getAccessKeySession: (keyId, sessionId) => requestJson(buildUrl(`/api/access-keys/${keyId}/sessions/${sessionId}`)),
+  getAccessKeySessionLogs: (keyId, sessionId, limit) => requestJson(buildUrl(`/api/access-keys/${keyId}/sessions/${sessionId}/logs`, { limit })),
+  deleteAccessKeySession: (keyId, sessionId) => requestJson(buildUrl(`/api/access-keys/${keyId}/sessions/${sessionId}`), { method: 'DELETE' }),
+  clearAccessKeySessions: (keyId) => requestJson(buildUrl(`/api/access-keys/${keyId}/sessions`), { method: 'DELETE' }),
   getAccessKeyGuide: (id, host, port) => requestJson(buildUrl(`/api/access-keys/${id}/guide`, { host, port })),
+  writeAccessKeyToLocal: (id, targets: string[]) => requestJson(buildUrl(`/api/access-keys/${id}/write-local`), { method: 'POST', body: JSON.stringify({ targets }) }),
+  getWriteLocalRecords: () => requestJson(buildUrl('/api/write-local-records')),
 
   // Policy 策略
   getPolicies: () => requestJson(buildUrl('/api/policies')),
@@ -617,4 +638,16 @@ export const api: BackendAPI = {
   // AccessKey 统计
   getAccessKeyRanking: (params) => requestJson(buildUrl('/api/statistics/access-keys', params as Record<string, string | number | undefined>)),
   getQuotaAlerts: () => requestJson(buildUrl('/api/statistics/quota-alerts')),
+
+  // 局域网同步
+  lanScan: () => requestJson(buildUrl('/api/lan/scan')),
+  lanDiscover: (ip, port) => {
+    // 直接请求远端节点，不经过本地代理
+    const url = `http://${ip}:${port}/api/lan/discover`;
+    return fetch(url, { signal: AbortSignal.timeout(3000) }).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    });
+  },
+  lanSync: (data) => requestJson(buildUrl('/api/lan/sync'), { method: 'POST', body: JSON.stringify(data) }),
 };

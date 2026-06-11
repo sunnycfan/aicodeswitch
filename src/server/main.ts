@@ -13,6 +13,7 @@ import { PolicyManager } from './access-keys/policy-manager';
 import type { FileSystemDatabaseManager } from './fs-database';
 import type {
   AppConfig,
+  APIService,
   LoginRequest,
   LoginResponse,
   AuthStatus,
@@ -25,6 +26,8 @@ import type {
   CodexReasoningEffort,
   ClaudeEffortLevel,
   ToolName,
+  WriteLocalRecord,
+  SourceType,
 } from '../types';
 import os from 'os';
 import { isAuthEnabled, verifyAuthCode, generateToken, authMiddleware } from './auth';
@@ -32,7 +35,7 @@ import { checkVersionUpdate } from './version-check';
 import { checkPortUsable } from './utils';
 import { getToolsInstallationStatus } from './tools-service';
 import { createToolInstallationWSServer } from './websocket-service';
-import { rulesStatusBroadcaster } from './rules-status-service';
+import { rulesStatusBroadcaster, type RuleStatusData } from './rules-status-service';
 import { normalizeSourceType, isLegacySourceType } from './type-migration';
 import {
   saveMetadata,
@@ -69,7 +72,7 @@ if (fs.existsSync(dotenvPath)) {
   dotenv.config({ path: dotenvPath });
 }
 
-const host = process.env.HOST || '127.0.0.1';
+const host = process.env.HOST || '0.0.0.0';
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 4567;
 
 let globalProxyConfig: { enabled: boolean; url: string; username?: string; password?: string } | null = null;
@@ -104,6 +107,110 @@ function getProxyAgent() {
     return proxyUrl;
   } catch {
     return null;
+  }
+}
+
+// ============================================================================
+// 写入本地记录持久化
+// ============================================================================
+
+const getWriteLocalRecordsFile = (): string => path.join(dataDir, 'write-local-records.json');
+
+function loadWriteLocalRecords(): WriteLocalRecord[] {
+  try {
+    const filePath = getWriteLocalRecordsFile();
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+function saveWriteLocalRecords(records: WriteLocalRecord[]): void {
+  const filePath = getWriteLocalRecordsFile();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  atomicWriteFile(filePath, JSON.stringify(records, null, 2));
+}
+
+function addWriteLocalRecord(accessKeyId: string, targets: string[]): void {
+  const records = loadWriteLocalRecords();
+  const existing = records.find(r => r.accessKeyId === accessKeyId);
+  if (existing) {
+    for (const t of targets) {
+      if (!existing.targets.includes(t)) existing.targets.push(t);
+    }
+    existing.timestamp = Date.now();
+  } else {
+    records.push({ accessKeyId, targets: [...targets], timestamp: Date.now() });
+  }
+  saveWriteLocalRecords(records);
+}
+
+function removeWriteLocalRecords(accessKeyId: string): void {
+  const records = loadWriteLocalRecords().filter(r => r.accessKeyId !== accessKeyId);
+  saveWriteLocalRecords(records);
+}
+
+/**
+ * 从持久化记录中恢复已写入本地的 AccessKey
+ * 每次代理配置写入后调用，确保 AccessKey 不会被占位符覆盖
+ */
+function applyWriteLocalRecords(proxyServer: ProxyServer): void {
+  const accessKeyModule = proxyServer.getAccessKeyModule();
+  if (!accessKeyModule) return;
+
+  const records = loadWriteLocalRecords();
+  if (records.length === 0) return;
+
+  let changed = false;
+  const homeDir = os.homedir();
+
+  const remainingRecords = records.filter(record => {
+    const key = accessKeyModule.keyManager.get(record.accessKeyId);
+    if (!key || key.status !== 'active') {
+      changed = true;
+      return false; // 密钥已删除或停用，移除记录
+    }
+
+    for (const target of record.targets) {
+      try {
+        if (target === 'claude-code') {
+          const claudeDir = path.join(homeDir, '.claude');
+          const settingsPath = path.join(claudeDir, 'settings.json');
+          if (!fs.existsSync(claudeDir)) {
+            fs.mkdirSync(claudeDir, { recursive: true });
+          }
+          let settings: Record<string, any> = {};
+          if (fs.existsSync(settingsPath)) {
+            try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch { /* ignore */ }
+          }
+          if (!settings.env) settings.env = {};
+          settings.env.ANTHROPIC_AUTH_TOKEN = key.apiKey;
+          atomicWriteFile(settingsPath, JSON.stringify(settings, null, 2));
+        } else if (target === 'codex') {
+          const codexDir = path.join(homeDir, '.codex');
+          const authPath = path.join(codexDir, 'auth.json');
+          if (!fs.existsSync(codexDir)) {
+            fs.mkdirSync(codexDir, { recursive: true });
+          }
+          let auth: Record<string, any> = {};
+          if (fs.existsSync(authPath)) {
+            try { auth = JSON.parse(fs.readFileSync(authPath, 'utf-8')); } catch { /* ignore */ }
+          }
+          auth.OPENAI_API_KEY = key.apiKey;
+          atomicWriteFile(authPath, JSON.stringify(auth, null, 2));
+        }
+      } catch (error) {
+        console.error(`[WriteLocal] Failed to apply key ${record.accessKeyId} to ${target}:`, error);
+      }
+    }
+    return true;
+  });
+
+  if (changed) {
+    saveWriteLocalRecords(remainingRecords);
   }
 }
 
@@ -164,7 +271,7 @@ const isValidAutocompactPct = (v: unknown): v is number => {
 };
 
 const writeClaudeConfig = async (
-  dbManager: FileSystemDatabaseManager,
+  _dbManager: FileSystemDatabaseManager,
   enableAgentTeams?: boolean,
   enableBypassPermissionsSupport?: boolean,
   effortLevel?: ClaudeEffortLevel,
@@ -175,7 +282,6 @@ const writeClaudeConfig = async (
   try {
     const homeDir = os.homedir();
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 4567;
-    const config = dbManager.getConfig();
 
     // Claude Code settings.json
     const claudeDir = path.join(homeDir, '.claude');
@@ -228,11 +334,11 @@ const writeClaudeConfig = async (
 
     // 构建代理配置
     const claudeSettingsEnv: Record<string, any> = {
-      ANTHROPIC_AUTH_TOKEN: config.apiKey || "api_key",
-      ANTHROPIC_API_KEY: "",
+      ANTHROPIC_AUTH_TOKEN: "api_key",
       ANTHROPIC_BASE_URL: `http://${host}:${port}/claude-code`,
       API_TIMEOUT_MS: "3000000",
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1,
+      CLAUDE_CODE_MAX_RETRIES: 3
     };
 
     // 如果启用Agent Teams功能，添加对应的环境变量
@@ -350,14 +456,13 @@ const isCodexReasoningEffort = (value: unknown): value is CodexReasoningEffort =
 };
 
 const writeCodexConfig = async (
-  dbManager: FileSystemDatabaseManager,
+  _dbManager: FileSystemDatabaseManager,
   modelReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
   codexDefaultModel?: string,
   options: ToolConfigWriteOptions = {}
 ): Promise<boolean> => {
   try {
     const homeDir = os.homedir();
-    const config = dbManager.getConfig();
 
     // Codex config.toml
     const codexDir = path.join(homeDir, '.codex');
@@ -421,7 +526,9 @@ const writeCodexConfig = async (
         aicodeswitch: {
           name: "aicodeswitch",
           base_url: `http://${host}:${process.env.PORT ? parseInt(process.env.PORT, 10) : 4567}/codex`,
-          wire_api: "responses"
+          wire_api: "responses",
+          stream_max_retries: 3,
+          stream_retry_backoff: "fixed"
         }
       }
     };
@@ -460,7 +567,7 @@ const writeCodexConfig = async (
 
     // 构建代理配置
     const proxyAuth: Record<string, any> = {
-      OPENAI_API_KEY: config.apiKey || "api_key"
+      OPENAI_API_KEY: "api_key"
     };
 
     // 使用智能合并
@@ -524,6 +631,15 @@ const restoreClaudeConfig = async (): Promise<boolean> => {
           currentSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf-8'));
         } catch (error) {
           console.warn('Failed to parse current settings.json during restore, using empty object:', error);
+        }
+      }
+
+      // 防御性清理：移除 currentSettings 中 ANTHROPIC_API_KEY 的空值，
+      // 防止旧版本代理写入的空值覆盖 backup 中的真实 Key
+      if (currentSettings?.env?.ANTHROPIC_API_KEY === '' && backupSettings?.env?.ANTHROPIC_API_KEY) {
+        delete currentSettings.env.ANTHROPIC_API_KEY;
+        if (Object.keys(currentSettings.env).length === 0) {
+          delete currentSettings.env;
         }
       }
 
@@ -1179,6 +1295,22 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
 
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+  // 局域网访问控制中间件：当 enableLanDiscovery 关闭时，仅允许本机访问 /api/* 路由
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    const config = dbManager.getConfig();
+    if (config.enableLanDiscovery) {
+      return next();
+    }
+    const clientIp = req.ip || req.socket.remoteAddress || '';
+    // 规范化 IPv4-mapped IPv6 地址 (::ffff:127.0.0.1 -> 127.0.0.1)
+    const normalizedIp = clientIp.replace(/^::ffff:/, '');
+    if (normalizedIp === '127.0.0.1' || normalizedIp === '::1' || normalizedIp === 'localhost') {
+      return next();
+    }
+    console.warn(`[LAN Guard] 拒绝非本机访问: ${clientIp} -> ${req.method} ${req.path}`);
+    res.status(403).json({ error: 'LAN access is disabled. Only local access is allowed.' });
+  });
+
   // 鉴权相关路由 - 公开访问
   app.get('/api/auth/status', (_req, res) => {
     const response: AuthStatus = { enabled: isAuthEnabled() };
@@ -1202,10 +1334,10 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
     }
   });
 
-  // 鉴权中间件 - 保护所有 /api/* 路由 (除了 /api/auth/*)
+  // 鉴权中间件 - 保护所有 /api/* 路由 (除了 /api/auth/* 和 /api/lan/discover)
   app.use('/api', (req, res, next) => {
-    if (req.path.startsWith('/auth/')) {
-      next(); // /api/auth/* 路由不需要鉴权
+    if (req.path.startsWith('/auth/') || req.path === '/lan/discover') {
+      next(); // /api/auth/* 和 /api/lan/discover 路由不需要鉴权
     } else {
       authMiddleware(req, res, next);
     }
@@ -1434,6 +1566,57 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
     })
   );
 
+  // SSE 端点：实时推送规则状态变更
+  app.get(
+    '/api/rules/status/stream',
+    asyncHandler(async (req, res) => {
+      // 设置 SSE 响应头
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no', // 防止 nginx 等代理缓冲
+      });
+
+      // 连接时立即发送完整快照（init 事件）
+      const allRules = dbManager.getRules();
+      const statusMap = rulesStatusBroadcaster.getAllRuleStatuses();
+      const statusMapByRuleId = new Map(
+        statusMap.map(status => [status.ruleId, status])
+      );
+      const allStatuses = allRules.map(rule => {
+        const existingStatus = statusMapByRuleId.get(rule.id);
+        if (existingStatus) {
+          return existingStatus;
+        } else {
+          return {
+            ruleId: rule.id,
+            status: 'idle' as const,
+            timestamp: Date.now(),
+          };
+        }
+      });
+      res.write(`data: ${JSON.stringify({ type: 'init', statuses: allStatuses })}\n\n`);
+
+      // 监听状态变更，推送增量更新
+      const onChange = (data: RuleStatusData) => {
+        res.write(`data: ${JSON.stringify({ type: 'update', status: data })}\n\n`);
+      };
+      rulesStatusBroadcaster.on('statusChanged', onChange);
+
+      // 3 秒心跳，用于客户端检测连接存活状态
+      const heartbeat = setInterval(() => {
+        res.write(`data: ${JSON.stringify({ type: 'heartbeat', timestamp: Date.now() })}\n\n`);
+      }, 3000);
+
+      // 客户端断开时清理
+      req.on('close', () => {
+        rulesStatusBroadcaster.off('statusChanged', onChange);
+        clearInterval(heartbeat);
+      });
+    })
+  );
+
   // 清除规则的错误状态（广播 idle 状态给所有客户端）
   app.post(
     '/api/rules/:id/clear-status',
@@ -1611,10 +1794,284 @@ const registerRoutes = async (dbManager: FileSystemDatabaseManager, proxyServer:
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
   );
+
+  // ===================== 局域网同步相关 =====================
+
+  // GET /api/lan/discover - 远端节点暴露配置数据（不受鉴权保护，由开关控制）
+  app.get('/api/lan/discover', (_req, res) => {
+    const config = dbManager.getConfig();
+    if (!config.enableLanDiscovery) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    try {
+      // 收集 Skills
+      const installedSkills = listInstalledSkills();
+      const skills: Array<{
+        name: string;
+        description?: string;
+        targets?: string[];
+        githubUrl?: string;
+        skillPath?: string;
+        instruction?: string;
+      }> = [];
+
+      for (const skill of installedSkills) {
+        const skillItem: typeof skills[0] = {
+          name: skill.name,
+          description: skill.description,
+          targets: skill.targets,
+          githubUrl: skill.githubUrl,
+          skillPath: skill.skillPath,
+        };
+        // 尝试读取 SKILL.md 内容
+        const skillDir = path.join(getCentralSkillsDir(), skill.id);
+        const skillMdPath = path.join(skillDir, 'SKILL.md');
+        if (fs.existsSync(skillMdPath)) {
+          try {
+            skillItem.instruction = fs.readFileSync(skillMdPath, 'utf-8');
+          } catch { /* ignore */ }
+        }
+        skills.push(skillItem);
+      }
+
+      // 收集 MCPs（脱敏 headers 和 env 中的敏感信息）
+      const SENSITIVE_KEY_PATTERN = /api_key|apikey|access_token|accesstoken|auth|key|token|secret|password|private_key|privatekey|credentials/i;
+      const allMcps = dbManager.getMCPs();
+      const mcps = allMcps.map(mcp => {
+        const sanitized: Record<string, unknown> = {
+          name: mcp.name,
+          description: mcp.description,
+          type: mcp.type,
+          command: mcp.command,
+          args: mcp.args,
+          targets: mcp.targets,
+        };
+        if (mcp.url) sanitized.url = mcp.url;
+        // 脱敏 env
+        if (mcp.env) {
+          const sanitizedEnv: Record<string, string> = {};
+          for (const [key, value] of Object.entries(mcp.env)) {
+            if (SENSITIVE_KEY_PATTERN.test(key)) {
+              sanitizedEnv[key] = '***';
+            } else {
+              sanitizedEnv[key] = value;
+            }
+          }
+          sanitized.env = sanitizedEnv;
+        }
+        // 脱敏 headers
+        if (mcp.headers) {
+          const sanitizedHeaders: Record<string, string> = {};
+          for (const [key, value] of Object.entries(mcp.headers)) {
+            if (SENSITIVE_KEY_PATTERN.test(key)) {
+              sanitizedHeaders[key] = '***';
+            } else {
+              sanitizedHeaders[key] = value;
+            }
+          }
+          sanitized.headers = sanitizedHeaders;
+        }
+        return sanitized;
+      });
+
+      // 读取版本号
+      let version = 'unknown';
+      try {
+        const pkgPath = path.join(__dirname, '..', 'package.json');
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+        version = pkg.version || 'unknown';
+      } catch { /* ignore */ }
+
+      res.json({
+        node: {
+          name: os.hostname(),
+          version,
+          port: process.env.PORT ? parseInt(process.env.PORT) : 4567,
+        },
+        skills,
+        mcps,
+      });
+    } catch (error) {
+      console.error('[LAN Discover] 错误:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // GET /api/lan/scan - 获取本机局域网 IP 信息
+  app.get('/api/lan/scan', (_req, res) => {
+    const interfaces = os.networkInterfaces();
+    const port = process.env.PORT ? parseInt(process.env.PORT) : 4567;
+
+    // 收集所有非内部 IPv4 网络接口
+    const networkInterfaces: Array<{ name: string; address: string; subnet: string; netmask: string }> = [];
+    let localIp = '127.0.0.1';
+    let subnet = '127.0.0';
+
+    for (const [ifaceName, entries] of Object.entries(interfaces)) {
+      if (!entries) continue;
+      for (const entry of entries) {
+        if (entry.family === 'IPv4' && !entry.internal) {
+          const entrySubnet = entry.address.split('.').slice(0, 3).join('.');
+          networkInterfaces.push({
+            name: ifaceName,
+            address: entry.address,
+            subnet: entrySubnet,
+            netmask: entry.netmask,
+          });
+          // 兼容旧逻辑：取第一个非内部接口作为默认值
+          if (localIp === '127.0.0.1') {
+            localIp = entry.address;
+            subnet = entrySubnet;
+          }
+        }
+      }
+    }
+
+    res.json({ localIp, subnet, port, networkInterfaces });
+  });
+
+  // POST /api/lan/sync - 执行同步写入
+  app.post('/api/lan/sync', asyncHandler(async (req, res) => {
+    const { remoteNode, skills, mcps, vendor } = req.body as {
+      remoteNode: { ip: string; port: number; name: string };
+      skills: Array<{
+        name: string;
+        description?: string;
+        targets?: string[];
+        githubUrl?: string;
+        skillPath?: string;
+        instruction?: string;
+      }>;
+      mcps: Array<{
+        name: string;
+        description?: string;
+        type: 'stdio' | 'http' | 'sse';
+        command?: string;
+        args?: string[];
+        url?: string;
+        headers?: Record<string, string>;
+        env?: Record<string, string>;
+        targets?: string[];
+      }>;
+      vendor: { enabled: boolean; apiKey?: string };
+    };
+
+    const result = {
+      skillsImported: 0,
+      mcpsImported: 0,
+      vendorCreated: false,
+      vendorName: '',
+      servicesCreated: 0,
+    };
+
+    // 1. 同步 Skills
+    const centralDir = getCentralSkillsDir();
+    if (!fs.existsSync(centralDir)) {
+      fs.mkdirSync(centralDir, { recursive: true });
+    }
+    const existingSkills = listInstalledSkills();
+    const existingSkillNames = new Set(existingSkills.map(s => s.name));
+
+    for (const skill of skills) {
+      if (existingSkillNames.has(skill.name)) continue; // 防御性跳过
+
+      const dirName = sanitizeDirName(skill.name);
+      const skillDir = path.join(centralDir, dirName);
+      if (!fs.existsSync(skillDir)) {
+        fs.mkdirSync(skillDir, { recursive: true });
+      }
+
+      // 写入 skill.json
+      const skillJson = {
+        id: dirName,
+        name: skill.name,
+        description: skill.description || '',
+        targets: skill.targets || [],
+        enabledTargets: [] as string[], // 不自动选中编程工具，由用户自行配置
+        githubUrl: skill.githubUrl,
+        skillPath: skill.skillPath,
+        installedAt: Date.now(),
+      };
+      fs.writeFileSync(path.join(skillDir, 'skill.json'), JSON.stringify(skillJson, null, 2));
+
+      // 写入 SKILL.md（如果有 instruction）
+      if (skill.instruction) {
+        fs.writeFileSync(path.join(skillDir, 'SKILL.md'), skill.instruction);
+      }
+
+      result.skillsImported++;
+    }
+
+    // 2. 同步 MCPs
+    const existingMcps = dbManager.getMCPs();
+    const existingMcpNames = new Set(existingMcps.map(m => m.name));
+
+    for (const mcp of mcps) {
+      if (existingMcpNames.has(mcp.name)) continue; // 防御性跳过
+
+      await dbManager.createMCP({
+        name: mcp.name,
+        description: mcp.description,
+        type: mcp.type,
+        command: mcp.command,
+        args: mcp.args,
+        url: mcp.url,
+        headers: mcp.headers,
+        env: mcp.env,
+        targets: [], // 不自动选中编程工具，由用户自行配置
+      });
+      result.mcpsImported++;
+    }
+
+    // 3. 可选：创建供应商（将远端节点的代理路径映射为固定 API 服务）
+    if (vendor.enabled) {
+      const vendorName = `${remoteNode.name}@${remoteNode.ip}`;
+      const remoteBaseUrl = `http://${remoteNode.ip}:${remoteNode.port}`;
+
+      // 固定的代理路径到 API 服务映射
+      // 规则：Claude/Responses/Gemini 标准接口只填 baseurl，Chat Completions 需完整路径
+      const LAN_PROXY_SERVICES: Array<{ name: string; sourceType: SourceType; apiUrl: string }> = [
+        { name: 'Claude Code', sourceType: 'claude', apiUrl: `${remoteBaseUrl}/claude-code` },
+        { name: 'Codex', sourceType: 'openai', apiUrl: `${remoteBaseUrl}/codex` },
+        { name: 'Claude 标准接口', sourceType: 'claude', apiUrl: remoteBaseUrl },
+        { name: 'Responses 标准接口', sourceType: 'openai', apiUrl: remoteBaseUrl },
+        { name: 'Chat Completions 标准接口', sourceType: 'openai-chat', apiUrl: `${remoteBaseUrl}/v1/chat/completions` },
+        { name: 'Gemini 标准接口', sourceType: 'gemini', apiUrl: remoteBaseUrl },
+      ];
+
+      // 检查供应商是否已存在
+      const existingVendor = dbManager.getVendors().find(v => v.name === vendorName);
+      if (!existingVendor) {
+        const services: Omit<APIService, 'id' | 'createdAt' | 'updatedAt'>[] = LAN_PROXY_SERVICES.map(svc => ({
+          name: svc.name,
+          apiUrl: svc.apiUrl,
+          apiKey: vendor.apiKey || '',
+          sourceType: svc.sourceType,
+          enableProxy: false,
+          enableCodingPlan: false,
+        }));
+
+        await dbManager.createVendor({
+          name: vendorName,
+          description: `从局域网节点 ${remoteNode.ip}:${remoteNode.port} 同步`,
+          apiBaseUrl: remoteBaseUrl,
+          services: services as any[],
+        });
+        result.vendorCreated = true;
+        result.vendorName = vendorName;
+        result.servicesCreated = services.length;
+      }
+    }
+
+    res.json({ success: true, result });
+  }));
 
   // Skills 管理相关
   app.get('/api/skills/installed', (_req, res) => {
@@ -2063,6 +2520,7 @@ ${instruction}
         appConfig.claudeDefaultModel,
         appConfig.autocompactPctOverride
       );
+      applyWriteLocalRecords(proxyServer);
       res.json(result);
     })
   );
@@ -2082,6 +2540,7 @@ ${instruction}
         modelReasoningEffort,
         appConfig.codexDefaultModel
       );
+      applyWriteLocalRecords(proxyServer);
       res.json(result);
     })
   );
@@ -2101,6 +2560,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2121,6 +2581,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2145,6 +2606,7 @@ ${instruction}
         await proxyServer.updateConfig(latestConfig);
         updateProxyConfig(latestConfig);
         await syncConfigsOnGlobalConfigUpdate(dbManager);
+        applyWriteLocalRecords(proxyServer);
       }
       res.json(result);
     })
@@ -2791,6 +3253,7 @@ ${instruction}
 
     const result = accessKeyModule.keyManager.delete(req.params.id);
     await accessKeyModule.save();
+    removeWriteLocalRecords(req.params.id);
     res.json(result);
   }));
 
@@ -2808,6 +3271,8 @@ ${instruction}
       return;
     }
     await accessKeyModule.save();
+    // 如果该密钥有写入本地记录，重新生成后自动重写
+    applyWriteLocalRecords(proxyServer);
     res.json({ apiKey: result.apiKey });
   }));
 
@@ -2862,6 +3327,7 @@ ${instruction}
     }
     const count = accessKeyModule.keyManager.batchDelete(keyIds);
     await accessKeyModule.save();
+    for (const keyId of keyIds) removeWriteLocalRecords(keyId);
     res.json({ count });
   }));
 
@@ -2902,9 +3368,102 @@ ${instruction}
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 50));
     const startDate = req.query.startDate as string | undefined;
     const endDate = req.query.endDate as string | undefined;
+    const contentType = req.query.contentType as string | undefined;
+    const search = req.query.search as string | undefined;
 
-    const result = await accessKeyModule.keyLogger.getLogs(req.params.id, { page, pageSize, startDate, endDate });
+    const result = await accessKeyModule.keyLogger.getLogs(req.params.id, { page, pageSize, startDate, endDate, contentType, search });
     res.json(result);
+  }));
+
+  // ========== AccessKey 会话 API ==========
+
+  // 获取密钥的会话列表
+  app.get('/api/access-keys/:id/sessions', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string) || 20));
+    const targetType = req.query.targetType as string | undefined;
+    const search = req.query.search as string | undefined;
+
+    const result = await accessKeyModule.keySessionTracker.getSessions(req.params.id, {
+      page, pageSize, targetType, search,
+    });
+    res.json(result);
+  }));
+
+  // 获取密钥的会话总数
+  app.get('/api/access-keys/:id/sessions/count', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const targetType = req.query.targetType as string | undefined;
+    const count = await accessKeyModule.keySessionTracker.getSessionsCount(req.params.id, targetType);
+    res.json({ count });
+  }));
+
+  // 获取密钥的单个会话
+  app.get('/api/access-keys/:id/sessions/:sessionId', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const session = await accessKeyModule.keySessionTracker.getSession(req.params.id, req.params.sessionId);
+    if (!session) {
+      res.status(404).json({ error: '会话不存在' });
+      return;
+    }
+    res.json(session);
+  }));
+
+  // 获取密钥会话的日志
+  app.get('/api/access-keys/:id/sessions/:sessionId/logs', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const limit = Math.min(10000, Math.max(1, parseInt(req.query.limit as string) || 10000));
+    const logs = await accessKeyModule.keyLogger.getLogsBySessionId(req.params.id, req.params.sessionId, limit);
+    res.json(logs);
+  }));
+
+  // 删除密钥的单个会话
+  app.delete('/api/access-keys/:id/sessions/:sessionId', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const deleted = await accessKeyModule.keySessionTracker.deleteSession(req.params.id, req.params.sessionId);
+    if (!deleted) {
+      res.status(404).json({ error: '会话不存在' });
+      return;
+    }
+    res.json({ success: true });
+  }));
+
+  // 清空密钥的所有会话
+  app.delete('/api/access-keys/:id/sessions', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(404).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    await accessKeyModule.keySessionTracker.clearSessions(req.params.id);
+    res.json({ success: true });
   }));
 
   // Key 接入指引
@@ -2951,6 +3510,92 @@ ${instruction}
     });
   }));
 
+  // 写入本地配置（将 AccessKey 写入 Claude Code / Codex 配置文件）
+  app.post('/api/access-keys/:id/write-local', asyncHandler(async (req, res) => {
+    const accessKeyModule = proxyServer.getAccessKeyModule();
+    if (!accessKeyModule) {
+      res.status(400).json({ error: 'AccessKey 功能未启用' });
+      return;
+    }
+
+    const key = accessKeyModule.keyManager.get(req.params.id);
+    if (!key) {
+      res.status(404).json({ error: '密钥不存在' });
+      return;
+    }
+
+    const targets: string[] = req.body.targets || [];
+    if (targets.length === 0) {
+      res.status(400).json({ error: '请选择至少一个目标' });
+      return;
+    }
+
+    const homeDir = os.homedir();
+    const results: Record<string, boolean> = {};
+
+    for (const target of targets) {
+      try {
+        if (target === 'claude-code') {
+          // 写入 ~/.claude/settings.json 的 env.ANTHROPIC_AUTH_TOKEN
+          const claudeDir = path.join(homeDir, '.claude');
+          const settingsPath = path.join(claudeDir, 'settings.json');
+          if (!fs.existsSync(claudeDir)) {
+            fs.mkdirSync(claudeDir, { recursive: true });
+          }
+
+          let settings: Record<string, any> = {};
+          if (fs.existsSync(settingsPath)) {
+            try {
+              settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+            } catch { /* ignore */ }
+          }
+
+          if (!settings.env) settings.env = {};
+          settings.env.ANTHROPIC_AUTH_TOKEN = key.apiKey;
+
+          atomicWriteFile(settingsPath, JSON.stringify(settings, null, 2));
+          results['claude-code'] = true;
+        } else if (target === 'codex') {
+          // 写入 ~/.codex/auth.json 的 OPENAI_API_KEY
+          const codexDir = path.join(homeDir, '.codex');
+          const authPath = path.join(codexDir, 'auth.json');
+          if (!fs.existsSync(codexDir)) {
+            fs.mkdirSync(codexDir, { recursive: true });
+          }
+
+          let auth: Record<string, any> = {};
+          if (fs.existsSync(authPath)) {
+            try {
+              auth = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+            } catch { /* ignore */ }
+          }
+
+          auth.OPENAI_API_KEY = key.apiKey;
+          atomicWriteFile(authPath, JSON.stringify(auth, null, 2));
+          results['codex'] = true;
+        }
+      } catch (error) {
+        console.error(`Failed to write local config for ${target}:`, error);
+        results[target] = false;
+      }
+    }
+
+    // 持久化写入本地记录，确保服务重启后自动恢复
+    const successTargets = Object.entries(results)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k);
+    if (successTargets.length > 0) {
+      addWriteLocalRecord(key.id, successTargets);
+    }
+
+    res.json({ success: true, results });
+  }));
+
+  // 查询写入本地记录（供 UI 显示标注）
+  app.get('/api/write-local-records', asyncHandler(async (_req, res) => {
+    res.json(loadWriteLocalRecords());
+  }));
+
   // ============================================================
   // Policy 策略 API
   // ============================================================
@@ -2982,6 +3627,11 @@ ${instruction}
     const policy = accessKeyModule.policyManager.create(req.body);
     await accessKeyModule.save();
     res.json(policy);
+  }));
+
+  // 策略模板（必须在 /:id 之前注册，避免被当作 id 参数匹配）
+  app.get('/api/policies/templates', asyncHandler(async (_req, res) => {
+    res.json(PolicyManager.getTemplates());
   }));
 
   // 策略详情
@@ -3063,11 +3713,6 @@ ${instruction}
 
     const keys = accessKeyModule.keyManager.listByPolicyId(req.params.id);
     res.json(keys.map(k => ({ ...k, apiKey: AccessKeyManager.maskApiKey(k.apiKey) })));
-  }));
-
-  // 策略模板
-  app.get('/api/policies/templates', asyncHandler(async (_req, res) => {
-    res.json(PolicyManager.getTemplates());
   }));
 
   // ============================================================
@@ -3433,6 +4078,13 @@ const start = async () => {
     console.error('[Server] AccessKey module initialization failed:', error);
   }
 
+  // 恢复已写入本地的 AccessKey（在代理配置写入之后、AccessKey 模块初始化之后）
+  try {
+    applyWriteLocalRecords(proxyServer);
+  } catch (error) {
+    console.error('[Server] Failed to apply write-local records:', error);
+  }
+
   // Initialize proxy server and register proxy routes last
   proxyServer.initialize();
 
@@ -3534,6 +4186,9 @@ const start = async () => {
       }
 
       dbManager.close();
+
+      // 清理规则状态广播器（关闭 SSE 连接）
+      rulesStatusBroadcaster.destroy();
 
       await Promise.race([
         new Promise<void>((resolve) => {

@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { Route, Rule, APIService, ContentType, Vendor, ServiceBlacklistEntry, MCPServer, ToolInstallationStatus, CodexReasoningEffort, ClaudeEffortLevel, AppConfig, ApiPathBinding, ToolName, ToolBindings } from '../../types';
 import { useConfirm } from '../components/Confirm';
 import { toast } from '../components/Toast';
+import SyncConfigModal from '../components/SyncConfigModal';
 import { useRulesStatus } from '../hooks/useRulesStatus';
 import QuickSetupModal from '../components/QuickSetupModal';
 import openaiIcon from '../assets/openai.webp';
@@ -93,6 +94,7 @@ export default function RoutesPage() {
   const { ruleStatuses, clearRuleStatus } = useRulesStatus();
   const [routes, setRoutes] = useState<Route[]>([]);
   const [rules, setRules] = useState<Rule[]>([]);
+  const [allRules, setAllRules] = useState<Rule[]>([]); // 所有路由的规则，用于检测活跃状态
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [allServices, setAllServices] = useState<APIService[]>([]);
   const [services, setServices] = useState<APIService[]>([]);
@@ -143,6 +145,7 @@ export default function RoutesPage() {
 
   // 一键配置弹窗状态
   const [showQuickSetupModal, setShowQuickSetupModal] = useState(false);
+  const [showSyncConfigModal, setShowSyncConfigModal] = useState(false);
 
   // 配置操作loading状态
   const [isUpdatingCodexReasoning, setIsUpdatingCodexReasoning] = useState(false);
@@ -169,6 +172,7 @@ export default function RoutesPage() {
     loadToolBindings();
     loadApiPathBindings();
     checkClaudeVersion();
+    loadAllRules();
   }, []);
 
 
@@ -295,6 +299,9 @@ export default function RoutesPage() {
     const data = await api.getRules(routeId);
     setRules(data);
 
+    // 同时刷新全量规则（用于路由列表活跃状态检测）
+    loadAllRules();
+
     // 加载黑名单状态
     if (routeId) {
       try {
@@ -307,6 +314,16 @@ export default function RoutesPage() {
       } catch (error) {
         console.error('Failed to load blacklist status:', error);
       }
+    }
+  };
+
+  // 加载所有路由的规则（用于路由列表活跃状态检测）
+  const loadAllRules = async () => {
+    try {
+      const data = await api.getRules();
+      setAllRules(data);
+    } catch (error) {
+      console.error('Failed to load all rules:', error);
     }
   };
 
@@ -468,8 +485,8 @@ export default function RoutesPage() {
       routeId: selectedRoute!.id,
       contentType: formData.get('contentType') as ContentType,
       targetServiceId: useMCP ? '' : selectedService,
-      targetModel: useMCP ? undefined : (selectedModel || undefined),
-      replacedModel: selectedReplacedModel || undefined,
+      targetModel: useMCP ? undefined : (selectedModel || ''),
+      replacedModel: selectedReplacedModel || '',
       sortOrder: selectedSortOrder,
       timeout: selectedTimeout ? selectedTimeout * 1000 : undefined, // 转换为毫秒
       tokenLimit: useMCP ? undefined : (selectedTokenLimit || undefined), // k值（与Service保持一致）
@@ -876,6 +893,11 @@ export default function RoutesPage() {
     setShowRuleModal(true);
   };
 
+  // 判断路由是否有规则处于"使用中"状态
+  const isRouteActive = (routeId: string) => {
+    return allRules.some(rule => rule.routeId === routeId && ruleStatuses[rule.id]?.status === 'in_use');
+  };
+
   // 判断规则状态
   const getRuleStatus = (rule: Rule) => {
     const blacklistStatus = blacklistStatuses[rule.id];
@@ -1017,9 +1039,14 @@ export default function RoutesPage() {
           <h1>路由管理</h1>
           <p>管理API路由和路由配置</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowQuickSetupModal(true)} style={{ whiteSpace: 'nowrap' }}>
-          一键配置
-        </button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button className="btn btn-secondary" onClick={() => setShowSyncConfigModal(true)} style={{ whiteSpace: 'nowrap' }}>
+            局域网内同步配置
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowQuickSetupModal(true)} style={{ whiteSpace: 'nowrap' }}>
+            一键配置
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column' }}>
@@ -1036,7 +1063,7 @@ export default function RoutesPage() {
                 {routes.map((route) => (
                   <div
                     key={route.id}
-
+                    className={isRouteActive(route.id) ? 'route-active-glow' : undefined}
                     onClick={() => setSelectedRoute(route)}
                     style={{
                       padding: '12px',
@@ -2141,7 +2168,13 @@ export default function RoutesPage() {
                           fontFamily: 'monospace',
                           fontSize: '12px'
                         }}>[!]</code> 标记高智商请求（仅在”最近一条真实用户输入”生效）</li>
-                        <li>系统会自动忽略工具构造的 user 消息（如 tool_result），按对话上下文推断是否继续走高智商规则</li>
+                        <li>使用 <code style={{
+                          background: 'var(--bg-code-inline, #f5f5f5)',
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          fontFamily: 'monospace',
+                          fontSize: '12px'
+                        }}>[x]</code> 标记退出高智商模式，继续走普通模式</li>
                       </ul>
                     </div>
                     <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px', lineHeight: '1.6' }}>
@@ -2159,7 +2192,14 @@ export default function RoutesPage() {
                         borderRadius: '3px',
                         fontFamily: 'monospace',
                         fontSize: '12px'
-                      }}>继续正常对话（不加 [!]）</code>
+                      }}>继续正常对话（不加 [!]）</code><br />
+                      • <code style={{
+                        background: 'var(--bg-code-inline, #f5f5f5)',
+                        padding: '2px 6px',
+                        borderRadius: '3px',
+                        fontFamily: 'monospace',
+                        fontSize: '12px'
+                      }}>[x] 接下来帮我解决一个简单的问题</code>
                     </div>
                   </div>
                 )}
@@ -2680,6 +2720,15 @@ export default function RoutesPage() {
           loadAllServices();
           loadToolBindings();
           loadApiPathBindings();
+        }}
+      />
+
+      <SyncConfigModal
+        show={showSyncConfigModal}
+        onClose={() => setShowSyncConfigModal(false)}
+        onComplete={() => {
+          loadVendors();
+          loadAllServices();
         }}
       />
 

@@ -150,10 +150,15 @@ function VendorsPage() {
   const [vendorAuthType, setVendorAuthType] = useState<string>('');
   const [inheritVendorApiKey, setInheritVendorApiKey] = useState(true);
   const [inheritVendorApiBaseUrl, setInheritVendorApiBaseUrl] = useState(true);
+  const [inheritVendorAuthType, setInheritVendorAuthType] = useState(true);
 
   // 处理数据源类型变化，自动设置合适的认证方式
   const handleSourceTypeChange = (sourceType: SourceType) => {
     setCurrentSourceType(sourceType);
+
+    // 如果继承了供应商 authType，不覆盖
+    if (inheritVendorAuthType) return;
+
     let newAuthType: AuthType;
 
     if (sourceType === 'gemini' || sourceType === 'gemini-chat') {
@@ -323,6 +328,7 @@ function VendorsPage() {
     setCurrentAuthType(selectedVendor?.authType || AuthType.AUTH_TOKEN);
     setInheritVendorApiKey(!!selectedVendor?.apiKey);
     setInheritVendorApiBaseUrl(!!selectedVendor?.apiBaseUrl);
+    setInheritVendorAuthType(!!selectedVendor?.authType);
     setIsDowngradeCompatibility(false);
     setShowServiceModal(true);
   };
@@ -350,8 +356,15 @@ function VendorsPage() {
     const sourceType = service.sourceType || 'openai-chat';
     setCurrentSourceType(sourceType);
 
-    // 如果服务有明确的 authType 且不是 'auto'，使用它；否则根据 sourceType 推导
-    if (service.authType) {
+    setInheritVendorApiKey(service.inheritVendorApiKey === true);
+    setInheritVendorApiBaseUrl(service.inheritVendorApiBaseUrl === true);
+    setInheritVendorAuthType(service.inheritVendorAuthType === true);
+
+    // 如果继承了供应商 authType，用供应商的值显示；否则使用服务自身的 authType
+    if (service.inheritVendorAuthType === true) {
+      const vendorAuthType = selectedVendor?.authType || AuthType.AUTH_TOKEN;
+      setCurrentAuthType(vendorAuthType);
+    } else if (service.authType) {
       setCurrentAuthType(service.authType);
     } else {
       // 根据 sourceType 自动推导 authType
@@ -365,9 +378,6 @@ function VendorsPage() {
       }
       setCurrentAuthType(derivedAuthType);
     }
-
-    setInheritVendorApiKey(service.inheritVendorApiKey === true);
-    setInheritVendorApiBaseUrl(service.inheritVendorApiBaseUrl === true);
     setIsDowngradeCompatibility(service.isDowngradeCompatibility === true);
 
     setShowServiceModal(true);
@@ -447,6 +457,7 @@ function VendorsPage() {
     const finalApiKey = shouldInheritVendorApiKey
       ? (editingService?.apiKey || '')
       : inputApiKey;
+    const shouldInheritVendorAuthType = formData.get('inheritVendorAuthType') === 'on';
 
     // 过滤掉值为空的 modelLimits
     const finalModelLimits: Record<string, number> = {};
@@ -463,8 +474,11 @@ function VendorsPage() {
       apiKey: finalApiKey,
       inheritVendorApiKey: shouldInheritVendorApiKey,
       inheritVendorApiBaseUrl: shouldInheritVendorApiBaseUrl,
+      inheritVendorAuthType: shouldInheritVendorAuthType,
       sourceType,
-      authType: formData.get('authType') as AuthType || undefined,
+      authType: shouldInheritVendorAuthType
+        ? (editingService?.authType || undefined)
+        : (formData.get('authType') as AuthType || undefined),
       supportedModels: finalModels.length > 0 ? finalModels : undefined,
       modelLimits: Object.keys(finalModelLimits).length > 0 ? finalModelLimits : undefined,
       enableProxy: formData.get('enableProxy') === 'on',
@@ -916,20 +930,34 @@ function VendorsPage() {
                 )}
               </div>
               <div className="form-group">
-                <label>供应商API认证方式 <small>请在供应商的文档中查阅相关信息</small></label>
-                <select
-                  ref={authTypeSelectRef}
-                  name="authType"
-                  defaultValue={editingService ? editingService.authType || AuthType.AUTH_TOKEN : currentAuthType}
-                  onChange={(e) => setCurrentAuthType(e.target.value as AuthType)}
-                >
-                  {Object.keys(AUTH_TYPE).map((type) => (
-                    <option key={type} value={type}>{AUTH_TYPE[type as keyof typeof AUTH_TYPE]}</option>
-                  ))}
-                </select>
-                <small style={{ display: 'block', marginTop: '4px', color: 'var(--text-muted)' }}>
-                  {AUTH_TYPE_MESSAGE[currentAuthType] || ''}
-                </small>
+                <label>供应商API认证方式</label>
+                <label style={{ display: 'flex', alignItems: 'center', marginBottom: '8px', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    name="inheritVendorAuthType"
+                    checked={inheritVendorAuthType}
+                    onChange={(e) => setInheritVendorAuthType(e.target.checked)}
+                    style={{ marginRight: '8px', cursor: 'pointer', width: '16px', height: '16px' }}
+                  />
+                  <span>使用供应商全局配置的API认证方式</span>
+                </label>
+                {!inheritVendorAuthType && (
+                  <>
+                    <select
+                      ref={authTypeSelectRef}
+                      name="authType"
+                      defaultValue={editingService ? editingService.authType || AuthType.AUTH_TOKEN : currentAuthType}
+                      onChange={(e) => setCurrentAuthType(e.target.value as AuthType)}
+                    >
+                      {Object.keys(AUTH_TYPE).map((type) => (
+                        <option key={type} value={type}>{AUTH_TYPE[type as keyof typeof AUTH_TYPE]}</option>
+                      ))}
+                    </select>
+                    <small style={{ display: 'block', marginTop: '4px', color: 'var(--text-muted)' }}>
+                      {AUTH_TYPE_MESSAGE[currentAuthType] || ''}
+                    </small>
+                  </>
+                )}
               </div>
                <div className="form-group">
                  <label>支持的模型列表</label>

@@ -1088,7 +1088,6 @@ export class FileSystemDatabaseManager {
       enableLogging: true,
       logRetentionDays: 30,
       maxLogSize: 100000,
-      apiKey: '',
       enableFailover: true,
       failoverRecoverySeconds: DEFAULT_FAILOVER_RECOVERY_SECONDS,
       ruleGlobalTimeout: undefined,
@@ -1103,6 +1102,7 @@ export class FileSystemDatabaseManager {
       proxyUrl: '',
       proxyUsername: '',
       proxyPassword: '',
+      enableLanDiscovery: false,
     };
 
 
@@ -2433,6 +2433,9 @@ export class FileSystemDatabaseManager {
       if (service.inheritVendorApiBaseUrl !== undefined && typeof service.inheritVendorApiBaseUrl !== 'boolean') {
         return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorApiBaseUrl 必须是布尔值` };
       }
+      if (service.inheritVendorAuthType !== undefined && typeof service.inheritVendorAuthType !== 'boolean') {
+        return { valid: false, error: `供应商[${index}](${vendor.id}) 的服务[${i}] inheritVendorAuthType 必须是布尔值` };
+      }
     }
     return { valid: true };
   }
@@ -2778,6 +2781,15 @@ export class FileSystemDatabaseManager {
   }
 
   // Statistics operations
+  /**
+   * 从 AccessKey 请求同步全局统计数据（不写入日志，仅更新统计）
+   */
+  async syncStatisticsFromAccessKey(logData: Omit<RequestLog, 'id'>): Promise<void> {
+    // 构造一个带有 id 的 RequestLog 以复用 updateStatistics
+    const log = { ...logData, id: `ak-sync-${Date.now()}` } as RequestLog;
+    await this.updateStatistics(log);
+  }
+
   /**
    * 更新统计数据 - 在每次添加日志时调用
    */
