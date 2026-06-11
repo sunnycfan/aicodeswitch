@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-11: 路由「绑定会话」弹窗新增会话解绑功能
+
+### 新增
+- 路由列表页「绑定会话」弹窗的每个会话行新增「解绑」按钮，点击即可解除该会话与当前路由的绑定，无需再跳转「会话」页逐条解绑
+- 复用已有 `DELETE /api/sessions/:id/bind-route` 接口与 `api.unbindSessionRoute()`，未新增后端逻辑
+- 交互：解绑前弹出二次确认（沿用删除路由/规则的 `useConfirm` 约定），成功后乐观移除该行并使路由卡片徽标计数 -1；按行 loading 态防止重复点击
+- 布局：会话条目改为「去背景·分隔线列表」样式，标题/指标硬顶左边、「解绑」按钮硬顶右边，行间用 `var(--border-color)` 细分隔线区分（末行无分隔线）
+- 修复：绑定会话较多时列表溢出无滚动条 —— 弹窗补上 `modal--sticky-layout` 类（header/footer 固定、body 区滚动，复用 SessionDetailModal 同款布局），并移除 body 内联 `padding: '20px'` 让滚动条槽位正常生效
+- 调整：滚动列表区最大高度限制为 `460px`，避免大屏下列表区过高
+- 影响文件：`src/ui/pages/RoutesPage.tsx`
+
 ## 2026-06-11: 修复 Codex 经第三方 Responses API 报 `unknown tool type: custom`
 
 ### 修复
