@@ -2,6 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// 先同步版本号（package.json -> tauri.conf.json / Cargo.toml），须在 cargo 编译前完成
+require('./sync-version.js');
+
 const repoRoot = path.resolve(__dirname, '..');
 const srcDist = path.join(repoRoot, 'dist');
 const srcPackage = path.join(repoRoot, 'package.json');

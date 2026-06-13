@@ -48,7 +48,8 @@
     "tauri:dev": "tauri dev",
     "tauri:start": "yarn build && node tauri/prepare-resources.js && cd tauri && cargo run",
     "tauri:build": "tauri build && node tauri/move-bundle.js",
-    "tauri:icon": "tauri icon src/ui/assets/logo.png"
+    "tauri:icon": "tauri icon src/ui/assets/logo.png",
+    "version:sync": "node tauri/sync-version.js"
   },
   "standard-version": {
     "skip": {
