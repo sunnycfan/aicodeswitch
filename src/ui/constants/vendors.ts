@@ -6,6 +6,8 @@ type VendorConfig = {
         description: string;
         tags?: string[];
         link?: string;
+        apiBaseUrl?: string;
+        authType?: AuthType;
         services: {
             name: string;
             sourceType: SourceType;
@@ -24,11 +26,13 @@ export default {
         description: 'AICodingBus 是一个Token共享平台，用户可以在平台上分享和交换Token。',
         tags: ['官方推荐'],
         link: 'https://aicodingbus.24x7.to/',
+        apiBaseUrl: 'https://aicodingbus.24x7.to',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口',
                 sourceType: 'claude',
-                apiUrl: 'https://aicodingbus.24x7.to/v1',
+                apiUrl: 'https://aicodingbus.24x7.to',
                 models: '',
             },
             {
@@ -40,7 +44,7 @@ export default {
             {
                 name: 'Responses 标准接口',
                 sourceType: 'openai',
-                apiUrl: 'https://aicodingbus.24x7.to/v1',
+                apiUrl: 'https://aicodingbus.24x7.to',
                 models: '',
             },
         ],
@@ -50,6 +54,7 @@ export default {
         name: 'Minimax',
         description: '国内优秀的大模型',
         link: 'https://platform.minimaxi.com/subscribe/coding-plan?code=G6xKj7L4YN&source=link',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -69,6 +74,7 @@ export default {
         name: 'GLM',
         description: '国内优秀的大模型',
         link: 'https://www.bigmodel.cn/invite?icode=kgOTGFRH%2Ftc5Xkyu5N0wHOnfet45IvM%2BqDogImfeLyI%3D',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -100,6 +106,7 @@ export default {
         name: 'Kimi',
         description: '国内优秀大模型',
         link: 'https://www.kimi.ai/',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -121,6 +128,7 @@ export default {
         name: '火山方舟（豆包）',
         description: '字节旗下大模型平台。Coding Plan一次性支持GLM、Kimi-K2、Deepseek多个国产模型 邀请码：Y58X463P',
         link: 'https://volcengine.com/L/RcHlm6yxj0w/',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -158,6 +166,7 @@ export default {
         name: '阿里云百炼（千问）',
         description: '国内优秀大模型',
         link: 'https://help.aliyun.com/zh/model-studio/coding-plan',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -189,6 +198,7 @@ export default {
         name: 'DeepSeek',
         description: 'DeepSeek 官方 API',
         link: 'https://platform.deepseek.com',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口（付费API）',
@@ -208,6 +218,7 @@ export default {
         name: 'Mimo',
         description: '小米 Mimo 国产大模型',
         link: 'https://platform.xiaomimimo.com?ref=M8BFP3',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Claude 标准接口 | Coding Plan',
@@ -239,6 +250,7 @@ export default {
         name: 'OpenAI',
         description: 'OpenAI 官方 API',
         link: 'https://platform.openai.com',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'GPT官方接口',
@@ -252,6 +264,7 @@ export default {
         name: 'Anthropic',
         description: 'Anthropic 官方 API',
         link: 'https://www.anthropic.com',
+        authType: AuthType.API_KEY,
         services: [
             {
                 name: 'Claude官方接口',
@@ -264,6 +277,7 @@ export default {
     google: {
         name: 'Google AI',
         description: 'Gemini官方接口',
+        authType: AuthType.G_API_KEY,
         services: [
             {
                 name: 'Gemini',
@@ -277,12 +291,14 @@ export default {
         name: 'OpenRouter',
         description: '一站式 AI 模型路由平台',
         link: 'https://openrouter.ai',
+        authType: AuthType.AUTH_TOKEN,
+        apiBaseUrl: 'https://openrouter.ai/api',
         services: [
             {
                 name: 'Claude Code专属接口',
                 sourceType: 'claude',
                 apiUrl: 'https://openrouter.ai/api',
-                models: 'anthropic/claude-opus-4.6, anthropic/claude-opus-4.5, anthropic/claude-sonnet-4.6, anthropic/claude-sonnet-4.5, anthropic/claude-haiku-4.5',
+                models: 'anthropic/claude-fable-5, anthropic/claude-opus-4.8, anthropic/claude-opus-4.6, anthropic/claude-opus-4.5, anthropic/claude-sonnet-4.6, anthropic/claude-sonnet-4.5, anthropic/claude-haiku-4.5',
             },
             {
                 name: 'Responses 标准接口 (Beta)',
@@ -294,13 +310,13 @@ export default {
                 name: 'Chat Completions 标准接口',
                 sourceType: 'openai-chat',
                 apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
-                models: 'anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6, anthropic/claude-haiku-4.6, openai/gpt-5.3-codex, openai/gpt-5.4, openai/gpt-5.5, openai/gpt-5.4-mini, google/gemini-3-flash-preview, google/gemini-3-pro-preview',
+                models: 'openai/gpt-5.5, openai/gpt-5.4, openai/gpt-5.4-mini, openai/gpt-5.3-codex, google/gemini-3-flash-preview, google/gemini-3-pro-preview',
             },
             {
                 name: 'Claude 标准接口',
                 sourceType: 'claude',
                 apiUrl: 'https://openrouter.ai/api',
-                models: 'anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6, anthropic/claude-haiku-4.6, openai/gpt-5.3-codex, openai/gpt-5.4, openai/gpt-5.5, openai/gpt-5.4-mini, google/gemini-3-flash-preview, google/gemini-3-pro-preview',
+                models: 'anthropic/claude-fable-5, anthropic/claude-opus-4.8, anthropic/claude-opus-4.6, anthropic/claude-sonnet-4.6, anthropic/claude-haiku-4.6',
                 authType: AuthType.AUTH_TOKEN,
             }
         ],
@@ -311,6 +327,7 @@ export default {
         description: '优秀的模型厂商，拥有多种模型，提供免费 API 使用',
         tags: ['永久免费'],
         link: 'https://platform.agnes-ai.com',
+        authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Chat Completions 标准接口（免费）',

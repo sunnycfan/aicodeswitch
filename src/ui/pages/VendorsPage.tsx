@@ -552,10 +552,11 @@ function VendorsPage() {
   // 处理一键配置提交
   const handleQuickSetupSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
 
-    const vendorKey = formData.get('vendorKey') as string;
-    const apiKey = formData.get('apiKey') as string;
+    // 供应商选择器是自定义组件（不写入 FormData），API Key 已受控于 state，
+    // 因此直接读取 state 而非 FormData，避免 vendorKey 取不到而误报"请填写完整信息"
+    const vendorKey = quickSetupVendorKey;
+    const apiKey = quickSetupApiKey;
 
     if (!vendorKey || !apiKey) {
       toast.warning('请填写完整信息');
@@ -579,6 +580,8 @@ function VendorsPage() {
         name: vendorConfig.name,
         description: vendorConfig.description,
         apiKey,
+        authType: vendorConfig.authType ?? AuthType.AUTH_TOKEN,
+        ...(vendorConfig.apiBaseUrl ? { apiBaseUrl: vendorConfig.apiBaseUrl } : {}),
         sortOrder: 0,  // 添加默认排序值
         services: []
       });

@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-06-13: vendors.ts 顶级字段统一为 apiBaseUrl
+
+### 重构
+- 将 `vendors.ts` 中供应商**顶级** `apiUrl` 字段统一重命名为 `apiBaseUrl`，与数据模型 `Vendor.apiBaseUrl` 对齐；服务级字段保持 `apiUrl`（与 `APIService.apiUrl` 一致）
+- 同步更新一键配置消费代码：`vendorConfig.apiUrl` → `vendorConfig.apiBaseUrl`
+- 两层字段各自对齐各自数据模型，消除顶级字段名与模型字段名不一致带来的映射
+- 影响文件：`src/ui/constants/vendors.ts`、`src/ui/components/QuickSetupModal.tsx`、`src/ui/pages/VendorsPage.tsx`
+
+## 2026-06-13: 一键配置供应商时使用预设的 API Base URL
+
+### 优化
+- 一键配置创建供应商时，读取 `vendors.ts` 中各供应商顶级的 `apiUrl`，存在时作为供应商的 `apiBaseUrl` 字段写入（仅当该值存在时设置，缺省则不影响）
+- 注意：预设字段名为 `apiUrl`，供应商数据模型对应字段为 `apiBaseUrl`，二者已做映射
+- 影响文件：`src/ui/components/QuickSetupModal.tsx`、`src/ui/pages/VendorsPage.tsx`
+
+## 2026-06-13: 一键配置供应商时使用预设的认证方式
+
+### 优化
+- 一键配置创建供应商时，读取 `vendors.ts` 中各供应商顶级的 `authType` 作为供应商认证方式（`authorization` / `x-api-key` / `x-goog-api-key`），不再统一硬编码为 `AUTH_TOKEN`
+- 例如：Anthropic 走 `x-api-key`、Google AI 走 `x-goog-api-key`、其余默认 `authorization`
+- 字段缺省时回退到 `AUTH_TOKEN`，保证兼容
+- 影响文件：`src/ui/components/QuickSetupModal.tsx`、`src/ui/pages/VendorsPage.tsx`
+
+## 2026-06-13: 修复供应商「一键配置」点击确认报「请填写完整信息」
+
+### 修复
+- 供应商「一键配置」提交时通过 `FormData` 读取 `vendorKey`，但供应商选择器为自定义组件 `<VendorSelector>`，其值不会写入 `FormData`，导致 `vendorKey` 恒为空、校验永远失败并弹出「请填写完整信息」
+- 改为直接读取已存在的受控 state（`quickSetupVendorKey` / `quickSetupApiKey`），不再依赖 `FormData`
+- 影响文件：`src/ui/pages/VendorsPage.tsx`
+
 ## 2026-06-13: 对齐 Claude Code 官方 Modes 文案，调整权限模式提示
 
 ### 优化

@@ -184,7 +184,8 @@ export default function QuickSetupModal({ show, onClose, onComplete }: QuickSetu
           name: vendorConfig.name,
           description: vendorConfig.description,
           apiKey,
-          authType: AuthType.AUTH_TOKEN,
+          authType: vendorConfig.authType ?? AuthType.AUTH_TOKEN,
+          ...(vendorConfig.apiBaseUrl ? { apiBaseUrl: vendorConfig.apiBaseUrl } : {}),
           sortOrder: 0,
           services: [],
         });
