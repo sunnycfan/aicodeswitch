@@ -1,6 +1,6 @@
 [package]
 name = "aicodeswitch"
-version = "2.1.0"
+version = "5.2.0"
 description = "AI Code Switch - API Proxy Manager"
 authors = ["tangshuang"]
 license = "GPL-3.0"

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-06-13: 新增 Tauri 构建版本号自动同步机制
+
+### 新增
+- 新增 `tauri/sync-version.js`：以 `package.json` 的 version 为唯一真相源，自动同步到 `tauri/tauri.conf.json`（顶层 version）与 `tauri/Cargo.toml`（`[package]` version）
+- 集成进 `tauri/prepare-resources.js`（`tauri:build` 的 beforeBuildCommand），cargo 编译前自动完成同步——本地 `npm run tauri:build` 不再产出错误版本号的安装包（避免 Windows 因版本号不升反降拒绝覆盖升级）
+- 新增 `npm run version:sync` 供手动触发
+- 采用正则精确替换，仅当值变化时才写入，不产生格式 / git diff 噪音；Cargo.toml 仅匹配行首 `version =`，不误伤依赖项 `{ version = "x" }`
+- 影响文件：`tauri/sync-version.js`（新增）、`tauri/prepare-resources.js`、`package.json`
+
+## 2026-06-13: 同步 Tauri 应用版本号至 5.2.0
+
+### 修复
+- `tauri/tauri.conf.json` 与 `tauri/Cargo.toml` 的版本号此前停留在 `2.1.0`，与 `package.json`（`5.2.0`）严重不同步
+- 本地 `npm run tauri:build` 生成的安装包版本号取自 `tauri.conf.json`，过低会导致 Windows 拒绝覆盖升级已安装的更高版本（表现为"安装后没更新"）
+- 统一同步为 `5.2.0`（CI 构建本就会从 package.json 同步，本次让本地构建也一致）
+- 影响文件：`tauri/tauri.conf.json`、`tauri/Cargo.toml`
+
 ## 2026-06-13: vendors.ts 顶级字段统一为 apiBaseUrl
 
 ### 重构

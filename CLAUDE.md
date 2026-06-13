@@ -813,9 +813,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    This will:
    - Build the React UI (`npm run build:ui`)
    - Build the Node.js server (`npm run build:server`)
+   - **Sync version** (`prepare-resources.js` → `sync-version.js`): sync `package.json` version to `tauri/tauri.conf.json` and `tauri/Cargo.toml` before Rust compile
    - Compile the Rust code in release mode
    - Bundle the application with all resources
    - Create platform-specific installers
+
+   > **Version Sync**: `package.json` is the single source of truth for the version. `tauri/sync-version.js` syncs it to `tauri.conf.json` (top-level `version`) and `Cargo.toml` (`[package] version`) via precise regex (only writes when the value differs; never touches dependency `{ version = "x" }`). It runs automatically inside `prepare-resources.js` (so `tauri:build` is always in sync before cargo compile), and can be triggered manually with `npm run version:sync`. This prevents installer version mismatches that cause Windows to reject overwrite upgrades.
 
 #### Build Output
 
