@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-14: 新增 aicos status 命令
+
+### 新增
+- 新增 `aicos status` CLI 命令，用于查看服务运行状态及监听地址
+- 综合检测：优先读取 `~/.aicodeswitch/server.pid` 判断进程存活，并以端口检测（lsof/netstat）兜底，兼容 PID 文件丢失但服务仍在监听的情况
+- 运行中：展示绿色状态框，含 Status / Host / Port / URL / PID / 进程名 / 日志路径
+- 未运行：展示灰色状态框，含配置的 Host / Port / URL（标注 not listening），并提示 `aicos start`
+- 影响文件：`bin/status.js`（新增）、`bin/cli.js`（注册命令 + 帮助文案）
+
 ## 2026-06-13: 将 sourceTypeToFormat 迁出 conversions 模块
 
 ### 重构
