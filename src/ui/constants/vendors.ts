@@ -334,13 +334,13 @@ export default {
         name: 'Agnes',
         description: '优秀的模型厂商，拥有多种模型，提供免费 API 使用',
         tags: ['永久免费'],
-        link: 'https://platform.agnes-ai.com',
+        link: 'https://platform.agnes-ai.cn',
         authType: AuthType.AUTH_TOKEN,
         services: [
             {
                 name: 'Chat Completions 标准接口（免费）',
                 sourceType: 'openai-chat',
-                apiUrl: 'https://apihub.agnes-ai.com/v1/chat/completions',
+                apiUrl: 'https://apihub.agnes-ai.cn/v1/chat/completions',
                 models: 'agnes-2.0-flash',
                 authType: AuthType.AUTH_TOKEN,
             },
