@@ -6,7 +6,7 @@
  * 配合 APIService.enableCodingPlan 实现编程套餐限制。
  */
 
-import type { Format } from './conversions/types';
+import type { Format } from 'aitoken-conversions/types';
 
 export interface CodingCheckResult {
   isCoding: boolean;

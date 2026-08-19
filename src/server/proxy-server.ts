@@ -21,9 +21,9 @@ import {
   getServerToolSupport,
   sanitizeRequestBody,
   isOfficialOpenAiApi,
-} from './conversions/index';
-import type { Format } from './conversions/types';
-import { StreamConverterAdapter } from './conversions/stream-converter-adapter';
+} from 'aitoken-conversions';
+import type { Format } from 'aitoken-conversions/types';
+import { StreamConverterAdapter } from 'aitoken-conversions/stream-converter-adapter';
 import type { AppConfig, Rule, APIService, Route, SourceType, ToolType, ToolName, TokenUsage, ContentType, RequestLog, ApiPath, ApiPathBinding } from '../types';
 import { AuthType } from '../types';
 import {
@@ -44,7 +44,7 @@ import {
   flattenClaudeToolBlocksForCompact,
   normalizeClaudeCompactRequestBody,
   stripClaudeCompactResponseContent,
-} from './conversions/compact';
+} from 'aitoken-conversions/compact';
 import { isCodingToolRequest } from './coding-plan';
 import { applyCodingPlanHeaders } from './coding-plan-headers';
 import { isAuthEnabled } from './auth';

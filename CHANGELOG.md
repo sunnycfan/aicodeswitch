@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-20: conversions 引擎外置为 aitoken-conversions 包依赖
+
+### 变更
+- 移除内置的 `src/server/conversions/`（57 个 TS 文件），格式转换引擎改为依赖独立 npm 包 `aitoken-conversions`（`^0.1.0`，由 AITokenBus monorepo 维护，GPL-3.0，双格式 ESM/CJS 发布）。
+- 消费方导入改写为包形式：`proxy-server.ts`（`aitoken-conversions` / `.../types` / `.../stream-converter-adapter` / `.../compact`）、`source-type-mapping.ts` 与 `coding-plan.ts`（`.../types`）、`utils.ts`（`.../compact`）。
+- 引擎后续维护与迭代在 AITokenBus 仓库的 `packages/conversions` 进行。
+
 ## 2026-07-20: 修复新版 body-parser 启动崩溃
 
 ### 修复

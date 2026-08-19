@@ -1,4 +1,4 @@
-import type { Format } from './conversions/types';
+import type { Format } from 'aitoken-conversions/types';
 
 /**
  * 将 SourceType 字符串映射为上游 API 的 Format 类型。
