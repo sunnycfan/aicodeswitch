@@ -4,7 +4,7 @@ export {
   isClaudeCompactRequest as isCompactRequest,
   isLastClaudeMessageCompact as isLastMessageCompact,
   isCodexCompactRequest,
-} from './conversions/compact';
+} from 'aitoken-conversions/compact';
 
 export function checkPortUsable(port: number): Promise<boolean> {
   return new Promise((resolve) => {

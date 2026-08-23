@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import type { TargetType, SourceType, AuthType } from '../types';
 import { AuthType as AuthTypeEnum } from '../types';
-import toml from '@iarna/toml';
+import { parseToml as parseTomlHealed } from './config-merge';
 
 /**
  * 原始配置信息
@@ -22,11 +22,11 @@ export interface OriginalConfig {
 }
 
 /**
- * TOML 解析器（使用 @iarna/toml 库）
+ * TOML 解析器（复用 config-merge 的自愈实现：数字键对象还原为数组）
  */
 const parseToml = (content: string): Record<string, any> => {
   try {
-    return toml.parse(content);
+    return parseTomlHealed(content);
   } catch (error) {
     console.warn('Failed to parse TOML file:', error);
     return {}; // 返回空对象以保持兼容性
