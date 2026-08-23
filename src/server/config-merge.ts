@@ -166,13 +166,54 @@ export const mergeJsonConfig = (
 };
 
 /**
+ * 自愈历史 bug 造成的数字键对象
+ * 旧版 deepSet 曾把数组序列化成 `[notify] 0=.. 1=..` 形式的数字键 table，
+ * 且 parse→merge→stringify 链路会原样保留该坏结构。
+ * 这里在解析后把「键全为从 0 开始的连续整数」的对象还原为数组，
+ * 使后续写入自动修复文件（新版 Codex 的 notify 等数组字段即受益于此）。
+ * @param value 解析出的任意值
+ * @returns 修复后的值
+ */
+const healNumericKeyedObjects = (value: any): any => {
+  if (Array.isArray(value)) {
+    return value.map(healNumericKeyedObjects);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  const keys = Object.keys(value);
+  const healed: Record<string, any> = {};
+  let healedChanged = false;
+  for (const key of keys) {
+    const healedValue = healNumericKeyedObjects(value[key]);
+    healed[key] = healedValue;
+    if (healedValue !== value[key]) {
+      healedChanged = true;
+    }
+  }
+
+  // 空对象或包含非数字/不连续键的对象不是历史坏结构，保持原样
+  if (keys.length === 0) {
+    return healed;
+  }
+  const indices = keys.map((key) => Number(key));
+  if (indices.some((num, idx) => !Number.isInteger(num) || num !== idx)) {
+    return healedChanged ? healed : value;
+  }
+
+  // 键为 0..n-1 连续整数 → 还原为数组
+  return indices.map((idx) => healed[String(idx)]);
+};
+
+/**
  * 解析 TOML 配置文件
  * @param content TOML 内容
  * @returns 解析后的对象
  */
 export const parseToml = (content: string): Record<string, any> => {
   try {
-    return toml.parse(content);
+    return healNumericKeyedObjects(toml.parse(content));
   } catch (error) {
     throw new Error(`Failed to parse TOML: ${error}`);
   }

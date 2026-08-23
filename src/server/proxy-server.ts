@@ -3230,6 +3230,29 @@ export class ProxyServer {
     return result;
   }
 
+  /**
+   * Codex Responses Lite 协议兼容处理。
+   * 新版 Codex（GPT-5.6 起）对 Responses 上游启用内部 Lite 协议：请求携带
+   * x-openai-internal-codex-responses-lite 头，且协议要求请求体 parallel_tool_calls 必须为 false。
+   * 代理会把该头部原样转发，但 responses→responses 降级兼容（sanitizeBody）会剥离顶层
+   * parallel_tool_calls（火山方舟等第三方提供商不认该字段），导致上游校验失败：
+   * "X-OpenAI-Internal-Codex-Responses-Lite requires `parallel_tool_calls` to be false."
+   * 因此在最终请求体上补回 false（Lite 模式下 Codex 本就发送 false，此处为剥离后的还原兜底）。
+   */
+  private applyResponsesLiteCompat(req: Request, requestBody: any, targetIsResponses: boolean): any {
+    if (!targetIsResponses || !requestBody || typeof requestBody !== 'object' || Array.isArray(requestBody)) {
+      return requestBody;
+    }
+    const liteHeader = req.headers['x-openai-internal-codex-responses-lite'];
+    if (!liteHeader) {
+      return requestBody;
+    }
+    if (requestBody.parallel_tool_calls !== false) {
+      requestBody.parallel_tool_calls = false;
+    }
+    return requestBody;
+  }
+
   private isStreamRequested(req: Request, body: any, targetType?: ToolType, sourceType?: SourceType) {
     const accept = typeof req.headers.accept === 'string' ? req.headers.accept : '';
     if (body?.stream === true || accept.includes('text/event-stream')) {
@@ -4527,6 +4550,8 @@ export class ProxyServer {
       const sanitizeBody = clientFormat === 'responses' && sourceTypeToFormat(sourceType) === 'responses' && !isOfficialOpenAiApi(effectiveApiUrl || '');
       const transformedRequestBody = this.transformRequestToUpstream(targetType, sourceType, payloadForTransform, rule.targetModel as string, providerConfig, serverToolConfig, sanitizeBody);
       requestBody = transformedRequestBody ?? this.cloneRequestBody(originalToolRequestBody) ?? {};
+      // Responses Lite 协议兼容：头部原样转发时补回被降级清理剥离的 parallel_tool_calls=false
+      requestBody = this.applyResponsesLiteCompat(req, requestBody, sourceTypeToFormat(sourceType) === 'responses');
 
       // 对最终即将发送到上游的 Claude compact 请求再做一次兜底清理，
       // 避免中间转换/覆盖步骤重新引入未配对的 tool_use。
@@ -5506,6 +5531,8 @@ export class ProxyServer {
 
     const transformedRequestBody = this.transformRequestByFormat(clientFormat, sourceType, payloadForTransform, rule.targetModel as string, providerConfig, serverToolConfig, sanitizeBody);
     requestBody = transformedRequestBody ?? this.cloneRequestBody(requestBody) ?? {};
+    // Responses Lite 协议兼容：头部原样转发时补回被降级清理剥离的 parallel_tool_calls=false
+    requestBody = this.applyResponsesLiteCompat(req, requestBody, sourceTypeToFormat(sourceType) === 'responses');
 
     // Compact final sanitize
     if (rule.contentType === 'compact' && clientFormat === 'claude' && Array.isArray(requestBody?.messages)) {

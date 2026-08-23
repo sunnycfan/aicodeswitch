@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-23: 修复新版 Codex Responses Lite 协议请求被代理破坏导致上游 400
+
+### 修复
+- 背景：新版 Codex（GPT-5.6 起）对 Responses 上游启用内部 Lite 协议：请求携带 `x-openai-internal-codex-responses-lite` 头，协议要求请求体 `parallel_tool_calls` 必须为 `false`（官方已知限制：Lite 模式禁用顶层并行工具调用）。
+- 根因：代理把该头部原样转发，但 responses→responses 降级兼容（`sanitizeBody`，为火山方舟等第三方 Responses 提供商剥离非标准顶层字段）会删掉 `parallel_tool_calls`——头还在、字段没了，上游校验报 `X-OpenAI-Internal-Codex-Responses-Lite requires parallel_tool_calls to be false`。
+- 修复：`proxy-server.ts` 新增 `applyResponsesLiteCompat`，在两条转发路径（`proxyRequest` 标准 `/v1` 路径 + `proxyRequestForApiPath` API path 路径）的最终请求体上：检测到 lite 头且目标格式为 Responses 时补回 `parallel_tool_calls: false`（Lite 模式下 Codex 本就发送 false，属剥离后的还原兜底；异常 true 亦纠正）。门控保证不影响其他场景：无 lite 头不注入、非 Responses 目标（如 Claude 上游）不注入未知字段。
+- 客户端移植副本 `client/src/switch/server/proxy-server.ts` 同步本修复（无新增定制点）。
+
+### 新增
+- `scripts/verify-responses-lite-compat.ts`：用真实转换管线（`aitoken-conversions` `transformRequest`）复现「剥离 → 补回」全链路并断言门控边界，`npx tsx scripts/verify-responses-lite-compat.ts` 运行，8 项断言全过。
+
+## 2026-08-23: 修复 Codex config.toml 数组字段被写成数字键 table 导致 Codex 报错
+
+### 修复
+- 根因：2026-06-13 之前的旧版 `deepSet`（`config-merge.ts`）在重建合并结构时无条件创建普通对象，把 Codex 数组字段（如新版 Codex 的 `notify = [程序, "turn-ended"]`）逐元素写入对象，序列化后变成 `[notify] 0=.. 1=..` 数字键 table。`ce824a6` 修复了成因，但未做自愈——文件一旦成为坏结构，后续 parse→merge→stringify 会永远原样保留，导致 Codex 报 `invalid type: map, expected a sequence in notify` 拒绝启动/更新模型设置。
+- 修复：`parseToml`（`src/server/config-merge.ts`）与 CLI 侧 `parseToml`（`bin/utils/config-helpers.js`）在解析后自愈——把「键全为从 0 开始的连续整数」的对象递归还原为数组（嵌套结构同样处理），使下一次任何配置写入自动把文件修复为 Codex 期望的数组形式。正常命名 table、非 0 起始/不连续数字键的对象不受影响。
+- 写入链路审计收口：全部 5 条 config.toml 写入链路（服务端 `writeCodexConfig` / `restoreCodexConfig` / `writeMCPConfig` / `removeMCPConfig` + CLI `aicos restore`）均经自愈 `parseToml` 解析；唯一旁路 `original-config-reader.ts` 的私有 `parseToml`（只读兜底，不写文件）改为复用 `config-merge` 的自愈实现，消灭第二个解析入口。
+- 客户端移植副本 `client/src/switch/server/` 同步本修复（`config-merge.ts` 自愈 + `original-config-reader.ts` 统一），与上游一致、无新增定制点。
+
+### 新增
+- `scripts/verify-codex-toml-heal.ts`：用真实模块（上游 + 客户端副本）对 4 条写入链路做端到端断言（坏结构修复 / 正常数组不破坏 / 命名 table 不误伤 / MCP 增删），`npx tsx scripts/verify-codex-toml-heal.ts` 运行，20 项断言全过。
+
 ## 2026-08-20: conversions 引擎外置为 aitoken-conversions 包依赖
 
 ### 变更
